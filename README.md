@@ -1,32 +1,34 @@
 # PromptPack
 
-Interactive TUI tool for bundling project files into a single `code.txt` file optimized for AI-assisted code modification. The AI returns bash commands that can be copy-pasted directly into the terminal to apply changes to multiple files at once.
+Interactive TUI tool for bundling project files into single -code.txt- or -ctags.txt- files optimized for AI-assisted code modification. Supports both direct file context (code.txt) and Universal Ctags analysis (ctags.txt) for different AI workflow needs.
 
-## The Workflow
+## Features
 
-1. **Select files** with the interactive TUI
-2. **Generate code.txt** with project context
-3. **Send to any AI** (Claude, GPT, DeepSeek, etc.)
-4. **Copy-paste the response** directly into your terminal
-5. **All files are patched** in one go
-
-## Why PromptPack?
-
-✅ **AI-Agnostic**: Works with any LLM (Claude, GPT, DeepSeek, Qwen, etc.)  
-✅ **Multi-file patches**: Modify 10+ files with a single copy-paste  
-✅ **Exact replacements**: Python heredoc scripts ensure precise text replacement  
-✅ **Zero configuration**: AI receives instructions and code structure automatically  
-✅ **Persistent selections**: Your file choices are saved for quick regeneration
+- Interactive TUI - Navigate and select files with keyboard controls  
+- Dual Output Formats - Generate -code.txt- for direct context or -ctags.txt- for code analysis  
+- Persistent Selections - Automatically saves marked files in -~/.promptpack-  
+- Token Analysis - Calculate token counts and model compatibility  
+- Smart Filtering - Automatically excludes binary and hidden files  
+- Quick Regeneration - Recreate files from saved selections  
+- Batch File Addition - Add multiple files via command line  
+- Tree Visualization - Project structure display with file sizes  
+- Partial Directory Marks - Visual indicators for partially selected directories  
 
 ## Installation
+
 ```bash
-# Clone and make executable
-git clone <your-repo-url>
-cd promptpack
+# Clone repository
+git clone https://github.com/drfuera/PromptPack.git
+cd PromptPack
+
+# Make executable
 chmod +x promptpack.py
 
-# Install dependency
+# Install Python dependencies
 pip install tiktoken
+
+# Install Universal Ctags (required)
+sudo apt install universal-ctags
 
 # Optional: Add to PATH
 sudo ln -s $(pwd)/promptpack.py /usr/local/bin/promptpack
@@ -34,89 +36,75 @@ sudo ln -s $(pwd)/promptpack.py /usr/local/bin/promptpack
 
 ## Usage
 
-### Interactive Mode - Select Files
+### Interactive Mode (TUI)
 ```bash
 ./promptpack.py
 ```
 
 **Controls:**
-- `↑↓`: Navigate tree
-- `←→`: Collapse/Expand directories
-- `Space`: Mark/unmark files
-- `Enter`: Generate code.txt
-- `q`: Quit
+- -↑/↓- - Navigate up/down
+- -←/→- - Collapse/Expand directories
+- -Space- - Mark/unmark files/directories
+- -F1- - Generate -code.txt- with marked files
+- -F2- - Generate -ctags.txt- with marked files
+- -q/Q- - Quit
 
-Mark the files relevant to your current task. Your selections are automatically saved.
-
-### Quick Mode - Regenerate from Saved Selections
+### Quick Mode (Regenerate from Saved Selections)
 ```bash
+# Regenerate code.txt from ~/.promptpack
 ./promptpack.py -q
+
+# Regenerate ctags.txt from ~/.promptpack
+# (Run in interactive mode and press F2)
 ```
 
-Instantly regenerates `code.txt` with your previously marked files. Perfect when you just need to refresh the context for a follow-up prompt.
-
-## How It Works
-
-### 1. Generate code.txt
+### Add Files via Command Line
 ```bash
-./promptpack.py
-# Mark your files, press Enter
+# Add specific files to promptpack and generate code.txt
+./promptpack.py -a file1.py file2.js path/to/file3.html
+
+# Multiple files with wildcards (using shell expansion)
+./promptpack.py -a src/*.py tests/*.py
 ```
 
-### 2. Send to AI
+## Output Formats
 
-Open `code.txt` and send it to any AI with your request:
-```
-The API endpoint should validate email format before saving.
-Fix the timeout issue in the websocket handler.
-```
+### 1. code.txt
+Contains full source code of selected files with instructions for AI to respond with bash heredoc scripts for precise file modifications.
 
-### 3. Copy-Paste the Response
+**Structure:**
+- Instructions for AI patch generation
+- Project tree structure
+- Full source files with headers (-- ./path/to/file.py-)
 
-The AI returns executable bash commands:
+**AI Response Format:**
+The AI returns executable bash commands using Python heredoc scripts:
 ```bash
 python3 <<'EOF'
 try:
-    with open('api/validators.py', 'r') as f:
+    with open("relative/path", "r") as f:
         content = f.read()
-    content = content.replace('def validate_email(email):\n    return True', 
-                              'def validate_email(email):\n    import re\n    pattern = r\'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$\'\n    return re.match(pattern, email) is not None')
-    with open('api/validators.py', 'w') as f:
+    content = content.replace("exact old text", "exact new text")
+    with open("relative/path", "w") as f:
         f.write(content)
 except Exception:
     raise SystemExit(1)
 EOF
-[ $? -eq 0 ] && echo -e "✅ api/validators.py" || echo -e "🔴 api/validators.py"
-
-python3 <<'EOF'
-try:
-    with open('websocket/handler.py', 'r') as f:
-        content = f.read()
-    content = content.replace('timeout=30', 'timeout=60')
-    with open('websocket/handler.py', 'w') as f:
-        f.write(content)
-except Exception:
-    raise SystemExit(1)
-EOF
-[ $? -eq 0 ] && echo -e "✅ websocket/handler.py" || echo -e "🔴 websocket/handler.py"
+[ $? -eq 0 ] && echo -e "✅ relative/path" || echo -e "🔴 relative/path"
 ```
 
-Copy-paste this entire block into your terminal - both files are patched instantly.
+### 2. ctags.txt
+Contains Universal Ctags analysis of selected files for AI understanding of code structure, symbols, and relationships.
 
-## Output Format
-
-`code.txt` includes:
-
-1. **Instructions** - Tells AI to respond with bash heredoc scripts
-2. **Project tree** - Visual structure of your codebase
-3. **Source files** - All marked files with headers (`### ./path/to/file.py`)
-
-The AI uses the project tree to understand file locations and the source code to generate exact text replacements.
+**Structure:**
+- Instructions for AI to request specific files
+- Project tree structure
+- Ctags output for each file with symbol definitions
 
 ## Token Analysis
 
-After generation, see token counts and model compatibility:
-```
+After generation, PromptPack displays token analysis:
+```bash
 ✅ code.txt created!
 
 Included 12 files
@@ -132,86 +120,133 @@ Model capacity:
 ✅   8.5%    Qwen       (128k context)
 ```
 
+## File Selection Persistence
+
+Marked files are saved in -~/.promptpack- using absolute paths. Each project maintains its own selection set within the file. The format automatically filters paths to only include files from the current working directory.
+
+### Managing Selections
+- **Automatic**: Files marked in TUI are automatically saved
+- **Manual Addition**: Use -a- flag to add specific files
+- **Cross-Project**: File stores selections for multiple projects
+
+## Visual Indicators in TUI
+
+- -[✓]- - Fully marked file or directory (green)
+- -[◐]- - Partially marked directory (yellow)
+- -[ ]- - Unmarked
+- -▶- - Collapsed directory
+- -▼- - Expanded directory
+- File sizes shown for all items
+
+## Workflow Examples
+
+### Example 1: Multi-file Refactoring
+```bash
+# 1. Select files interactively
+./promptpack.py
+# Mark: models/user.py, models/auth.py, api/endpoints.py
+
+# 2. Generate context
+Press F1 to create code.txt
+
+# 3. Send to AI with request
+"Change all database calls from sync to async using asyncpg"
+
+# 4. Copy-paste AI response into terminal
+# All files are modified simultaneously
+```
+
+### Example 2: Code Analysis with Ctags
+```bash
+# 1. Select files for analysis
+./promptpack.py
+# Mark: src/*.py
+
+# 2. Generate ctags analysis
+Press F2 to create ctags.txt
+
+# 3. Send to AI
+"Analyze the codebase and identify potential security issues"
+
+# 4. AI can request specific files using:
+# promptpack -a file1.py file2.py
+```
+
+### Example 3: Quick Batch Addition
+```bash
+# Add all Python files in src and tests
+./promptpack.py -a src/*.py tests/*.py
+
+# code.txt is automatically created
+# Token analysis shown immediately
+```
+
 ## Advanced Features
 
-### Persistent Selections
+### Directory Operations
+- Space on a directory toggles all files within
+- Partial marks show as -[◐]- when some children are marked
+- Directory sizes include all contained files
 
-Marked files are saved in `~/.promptpack` with absolute paths. Each project maintains its own selection set.
+### Smart File Filtering
+- Binary files automatically excluded
+- Hidden files (starting with -.-) skipped
+- Permission errors handled gracefully
+
+### Patch Management
+The AI instructions include -#reset- command for reverting changes:
 ```bash
-# Mark files for feature A
-./promptpack.py
-# ... mark files, press Enter
-
-# Work on feature A
-# ... multiple AI interactions
-
-# Quickly regenerate context
-./promptpack.py -q
+If we use command #reset this implies that all changes have been reverted back to the original state.
+You will disregard all changes made by patches created during the chat session.
 ```
 
-### Smart Filtering
-
-- **Text files only**: Binary files are automatically excluded
-- **No hidden files**: Files starting with `.` are skipped
-- **Permission handling**: Gracefully skips inaccessible directories
-
-### Visual Indicators
-
-- `[✓]` Marked file or fully marked directory
-- `[◐]` Partially marked directory
-- `[ ]` Unmarked
-- `▶/▼` Collapsed/Expanded directory
-- File sizes displayed for all items
-
-## Real-World Example
-```bash
-# Working on authentication system
-./promptpack.py
-# Mark: auth/login.py, auth/session.py, models/user.py, api/auth.py
-
-# Generate code.txt
-# Send to AI: "Add rate limiting to login endpoint"
-
-# AI responds with 3 heredoc scripts modifying different files
-# Copy-paste the entire response into terminal
-# All files patched in 2 seconds
-
-# Later: Add another feature
-./promptpack.py -q  # Regenerate with same files
-# New prompt: "Add 2FA support"
-# Repeat
-```
-
-## Why Heredoc Format?
-
-Traditional AI code responses are hard to apply:
-- ❌ Partial code snippets require manual integration
-- ❌ "Replace lines 45-67" is error-prone
-- ❌ Multiple files need multiple copy-pastes
-
-With PromptPack:
-- ✅ Complete file modifications
-- ✅ Exact text replacement (no line numbers)
-- ✅ Multiple files in one copy-paste
-- ✅ Immediate feedback (✅/🔴 status)
-- ✅ Works in any terminal
+### Cross-Platform Compatibility
+- Works on Linux, macOS, and WSL
+- UTF-8 encoding support
+- Path normalization for different OSes
 
 ## Use Cases
 
-- **Refactoring**: Update patterns across multiple files
-- **Bug fixes**: Fix related issues in several modules
-- **Feature addition**: Modify multiple components at once
-- **Code modernization**: Update syntax/patterns throughout codebase
-- **API changes**: Update all endpoint handlers simultaneously
+1. **Large Refactoring** - Update patterns across 10+ files simultaneously
+2. **API Version Updates** - Modify all endpoint handlers in one operation
+3. **Security Patching** - Apply security fixes to multiple vulnerable files
+4. **Library Migration** - Replace deprecated library calls throughout codebase
+5. **Code Analysis** - Understand complex codebases using ctags analysis
+6. **Feature Addition** - Add new functionality across multiple components
+7. **Bug Fix Coordination** - Fix related issues in several modules at once
 
-## Tips
+## Tips & Best Practices
 
-1. **Start small**: Mark only files relevant to current task
-2. **Use quick mode**: Regenerate context for follow-up questions
-3. **Check tokens**: Ensure you're within your model's limits
-4. **Directory marking**: Space on a directory marks all files inside
-5. **Trust the format**: AI learns the heredoc pattern from code.txt instructions
+1. **Start Small**: Begin with 3-5 core files for initial context
+2. **Use Token Analysis**: Ensure you-re within your AI model-s context window
+3. **Leverage Persistence**: Use -q- flag for follow-up questions
+4. **Combine Approaches**: Use -ctags.txt- for analysis, then -code.txt- for modifications
+5. **Check Output**: Always review AI-generated patches before execution
+6. **Directory Strategy**: Mark directories when working on entire modules
+7. **Backup First**: Ensure you have version control or backups before applying patches
+
+## Troubleshooting
+
+**"Universal Ctags is not installed!"**
+```bash
+sudo apt install universal-ctags  # Ubuntu/Debian
+brew install universal-ctags      # macOS
+```
+
+**File not appearing in TUI**
+- File may be binary (non-text)
+- File may be hidden (starts with -.-)
+- Check file permissions
+
+**Token count discrepancies**
+- Different tokenizers may give slightly different counts
+- tiktoken-s cl100k_base encoding is used (same as GPT-4)
 
 ## License
 
 CC BY
+
+## Acknowledgments
+
+Special thanks to Jesus. Always Jesus. All the time. All the way.
+God bless you!
