@@ -16,9 +16,18 @@ import curses
 from pathlib import Path
 import tiktoken
 import argparse
+import shutil
+import subprocess
 
 PROMPTPACK_FILE = Path.home() / '.promptpack'
 TEXT_CHECK_BYTES = 8192
+
+def check_ctags():
+    if not shutil.which('ctags'):
+        print("❌ Error: Universal Ctags is not installed!")
+        print("\nPlease install it with:")
+        print("  sudo apt install universal-ctags")
+        sys.exit(1)
 
 class TreeNode:
     def __init__(self, path, is_dir=False, parent=None):
@@ -260,13 +269,47 @@ def calculate_total_tokens(marked_files):
             pass
     return total_tokens
 
+def write_project_tree(out, root):
+    """Skriv ut projektstruktur med tree-kommandot om det finns, annars manuellt"""
+    # Försök använda tree-kommandot först
+    try:
+        # Kör tree-kommandot (exkludera dolda filer)
+        result = subprocess.run(
+            ['tree', '--noreport', '--charset=utf8', '.'],
+            capture_output=True,
+            text=True,
+            cwd=Path.cwd()
+        )
+        if result.returncode == 0:
+            out.write(result.stdout)
+            return
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    
+    # Fallback: skapa träd manuellt
+    def write_tree_manual(node, prefix="", is_last=True):
+        if node.parent is None:
+            out.write(f"{node.name}/\n")
+        else:
+            connector = "└── " if is_last else "├── "
+            out.write(f"{prefix}{connector}{node.name}{'/' if node.is_dir else ''}\n")
+        
+        if node.is_dir:
+            children = [c for c in node.children]
+            for idx, child in enumerate(children):
+                extension = "    " if is_last else "│   "
+                new_prefix = prefix + extension if node.parent else ""
+                write_tree_manual(child, new_prefix, idx == len(children) - 1)
+    
+    write_tree_manual(root)
+
 def draw_tree(stdscr, root, selected_idx, scroll_offset):
     stdscr.clear()
     height, width = stdscr.getmaxyx()
     
     visible_nodes = flatten_visible_tree(root)
     
-    title = "↑↓: Navigate | ←→: Collapse/Expand | Space: Mark | Enter: Create code.txt | q/Q: Quit"
+    title = "↑↓: Navigate | ←→: Collapse/Expand | Space: Mark | F1: code.txt | F2: ctags.txt | q/Q: Quit"
     stdscr.addstr(0, 0, title[:width-1], curses.A_REVERSE)
     
     display_height = height - 2
@@ -341,7 +384,7 @@ def create_code_file(root):
     marked_files = sorted(marked_files, key=lambda x: str(x))
     
     with open('code.txt', 'w', encoding='utf-8') as out:
-        out.write("""The following instructions apply to future code unless otherwise requested:
+        out.write("""The following instructions apply if command #patch is given:
 Analyze the attached text document with collected source code which is only a compilation, not a target file.
 Interpretation of target file should be done via headers in the form ### ./relative/path.
 
@@ -349,9 +392,10 @@ If a file exists in the project structure below but is not included in this docu
 
 Return Python commands (bash heredoc format) that make exact text replacements in the files.
 For each file to be changed, create a Python script that:
-1. Reads the entire file to a string
-2. Uses .replace() to replace exact text strings
-3. Writes back the entire content
+1. Reads the entire file to a string.
+2. Uses .replace() to replace exact text strings.
+3. Writes back the entire content.
+4. Number every #patch incrementally starting with #1.
 
 Format:
 ```bash
@@ -410,26 +454,21 @@ Important:
 - All heredoc/command in one code block
 - Text in replace() must match original EXACTLY (including all spaces and newlines)
 
+Additional notes:
+If we use command #reset this implies that all changes hav been reverted back to the original state.
+You will disregard all changes made by patches created during the chat session and fall back and start working from the source found in code.txt again.
+
+Fallback:
+If you find yourself not being able to solve an issue, trying multiple times and coming to the conclusion that you're stuck do not write a patch to restore the code back to the state of code.txt.
+Instead let user know that you want to #reset the code and if there are any patches produced in the conversation that are of importance/use, number each patch and instruct user to apply them after resetting the code, for example;
+We're not getting anywhere, please #reset the code and apply #patch 2, 9, 12, 13 and 22. Let me know when you are ready and we can proceed.
+
 ## Project Structure
 """)
         
-        def write_tree(node, prefix="", is_last=True):
-            if node.parent is None:
-                out.write(f"{node.name}/\n")
-            else:
-                connector = "└── " if is_last else "├── "
-                out.write(f"{prefix}{connector}{node.name}{'/' if node.is_dir else ''}\n")
                 
-            if node.is_dir and node.expanded:
-                children = [c for c in node.children]
-                for idx, child in enumerate(children):
-                    extension = "    " if is_last else "│   "
-                    new_prefix = prefix + extension if node.parent else ""
-                    write_tree(child, new_prefix, idx == len(children) - 1)
-        
-        write_tree(root)
+        write_project_tree(out, root)
         out.write("\n")
-        
         for file_path in marked_files:
             rel_path = file_path.relative_to(Path.cwd())
             out.write(f"\n### ./{rel_path}\n\n")
@@ -438,6 +477,55 @@ Important:
                     out.write(f.read())
             except Exception as e:
                 out.write(f"# Error reading file: {e}\n")
+    
+    return True
+
+def create_ctags_file(root):
+    marked_files = get_marked_files(root)
+    
+    if not marked_files:
+        return False
+    
+    marked_files = sorted(marked_files, key=lambda x: str(x))
+    
+    with open('ctags.txt', 'w', encoding='utf-8') as out:
+        out.write("""These are all the files of the project listed with Universal Ctags.
+Understand the user request, what files are available and what they contain.
+Draw conclusions what you need from the project to achieve the users goals.
+Once you know what files you need, let the user prepare the package of files for you.
+```bash
+promptpack -a requiredfile.ext requiredfile2.ext path/requiredfile3.ext
+```
+
+Note: In the interactive mode, press F1 for code.txt or F2 for ctags.txt
+
+Here is the complete structure of the project and all the relevant files.
+Some files might not be included in the ctags list so you need to draw conclusions on what files do what based on their file names and what the user wants to achieve. If there are any files not listed in the ctags list but you suspect you also need them, please include them in the 'promptpack -a' command.
+If you for some reason later on find you need additional files from the project, you can always ask the user for a new 'promptpack -a' with the additional files you require.
+
+## Project Structure
+""")
+
+                
+        write_project_tree(out, root)
+        out.write("\n")
+        for file_path in marked_files:
+            try:
+                rel_path = file_path.relative_to(Path.cwd())
+                result = subprocess.run(
+                    ['ctags', '-x', str(rel_path)],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                if result.stdout:
+                    out.write(f"\n### {rel_path}\n")
+                    out.write(result.stdout)
+            except subprocess.CalledProcessError:
+                pass
+            except Exception as e:
+                out.write(f"\n### {file_path.relative_to(Path.cwd())}\n")
+                out.write(f"# Error running ctags: {e}\n")
     
     return True
 
@@ -468,19 +556,27 @@ def main(stdscr):
             scroll_offset = selected_idx - display_height + 1
         
         draw_tree(stdscr, root, selected_idx, scroll_offset)
-        
         key = stdscr.getch()
         
+
         if key == ord('q') or key == ord('Q'):
             return None
-        elif key == ord('\n') or key == 10:
+        elif key == curses.KEY_F1:  # F1 för code.txt
             marked_files = get_marked_files(root)
             if marked_files:
                 save_promptpack(marked_files)
                 create_code_file(root)
-                return len(marked_files)
+                return ('code', len(marked_files))
             else:
-                return 0
+                return ('code', 0)
+        elif key == curses.KEY_F2:  # F2 för ctags.txt
+            marked_files = get_marked_files(root)
+            if marked_files:
+                save_promptpack(marked_files)
+                create_ctags_file(root)
+                return ('ctags', len(marked_files))
+            else:
+                return ('ctags', 0)
         elif key == curses.KEY_UP:
             selected_idx = max(0, selected_idx - 1)
         elif key == curses.KEY_DOWN:
@@ -503,12 +599,98 @@ def main(stdscr):
                 save_promptpack(marked_files)
 
 if __name__ == "__main__":
+    check_ctags()
+    
     parser = argparse.ArgumentParser(description='Interactive directory navigator')
     parser.add_argument('-q', '--quick', action='store_true', 
                         help='Create code.txt directly from .promptpack without interactive mode')
+    parser.add_argument('-a', '--add', nargs='+', metavar='FILE',
+                        help='Add specified files to .promptpack and create code.txt')
     args = parser.parse_args()
     
-    if args.quick:
+    if args.add:
+        cwd = Path.cwd().resolve()
+        new_files = set()
+        
+        for file_str in args.add:
+            file_path = Path(file_str).resolve()
+            if not file_path.exists():
+                print(f"❌ File not found: {file_str}")
+                continue
+            if not file_path.is_file():
+                print(f"❌ Not a file: {file_str}")
+                continue
+            if not is_text_file(file_path):
+                print(f"❌ Not a text file: {file_str}")
+                continue
+            new_files.add(file_path)
+        
+        if not new_files:
+            print("❌ No valid files to add!")
+            sys.exit(1)
+        
+        existing_paths = set()
+        if PROMPTPACK_FILE.exists():
+            with open(PROMPTPACK_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        path = Path(line)
+                        if path.exists():
+                            existing_paths.add(path.resolve())
+        
+        all_paths = existing_paths | new_files
+        with open(PROMPTPACK_FILE, 'w', encoding='utf-8') as f:
+            for path in sorted(all_paths):
+                f.write(f"{path}\n")
+        
+        print(f"✅ Added {len(new_files)} file(s) to .promptpack")
+        
+        root = build_tree(".", load_marks=False)
+        if not root:
+            print("❌ Could not read directory structure!")
+            sys.exit(1)
+        
+        mark_from_promptpack(root, new_files)
+        marked_files = get_marked_files(root)
+        
+        if not marked_files:
+            print("❌ No valid files found!")
+            sys.exit(1)
+        
+        create_code_file(root)
+        
+        try:
+            with open('code.txt', 'r', encoding='utf-8') as f:
+                content = f.read()
+            total_tokens = calculate_tokens(content)
+            file_size = len(content)
+            
+            print(f"✅ code.txt created!")
+            print(f"\nIncluded {len(marked_files)} files")
+            print(f"File size: {file_size:,} bytes")
+            print(f"Tokensize: {total_tokens:,} tokens")
+            print(f"\nModel capacity:")
+            
+            models = {
+                'DeepSeek': 128000,
+                'Grok': 128000,
+                'GPT-4': 32768,
+                'GPT-5': 128000,
+                'Claude': 200000,
+                'Qwen': 128000
+            }
+            
+            for model, max_tokens in models.items():
+                pct = (total_tokens / max_tokens) * 100
+                status = '✅' if total_tokens <= max_tokens else '🔴'
+                print(f"{status} {pct:5.1f}%\t{model}")
+                
+        except Exception as e:
+            print(f"❌ Error reading code.txt: {e}")
+            sys.exit(1)
+    
+    elif args.quick:
         promptpack_paths = load_promptpack()
         
         if not promptpack_paths:
@@ -562,17 +744,21 @@ if __name__ == "__main__":
         result = curses.wrapper(main)
         
         if result is not None:
-            if result == 0:
+            file_type, file_count = result
+            
+            if file_count == 0:
                 print("❌ No files marked!")
             else:
+                filename = f"{file_type}.txt"
                 try:
-                    with open('code.txt', 'r', encoding='utf-8') as f:
+                    with open(filename, 'r', encoding='utf-8') as f:
                         content = f.read()
-                    total_tokens = calculate_tokens(content)
-                    file_size = len(content)
                     
-                    print(f"✅ code.txt created!")
-                    print(f"\nIncluded {result} files")
+                    file_size = len(content)
+                    total_tokens = calculate_tokens(content)
+                    
+                    print(f"✅ {filename} created!")
+                    print(f"\nIncluded {file_count} files")
                     print(f"File size: {file_size:,} bytes")
                     print(f"Tokensize: {total_tokens:,} tokens")
                     print(f"\nModel capacity:")
@@ -592,4 +778,4 @@ if __name__ == "__main__":
                         print(f"{status} {pct:5.1f}%\t{model}")
                         
                 except Exception as e:
-                    print(f"❌ Error reading code.txt: {e}")
+                    print(f"❌ Error reading {filename}: {e}")
