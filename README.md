@@ -1,252 +1,297 @@
 # PromptPack
 
-Interactive TUI tool for bundling project files into single -code.txt- or -ctags.txt- files optimized for AI-assisted code modification. Supports both direct file context (code.txt) and Universal Ctags analysis (ctags.txt) for different AI workflow needs.
+**Interactive file packer for AI-assisted development workflows**
+
+PromptPack helps you prepare your codebase for AI conversations by creating structured compilations of your source files. It includes an interactive TUI for file selection, patch management for tracking changes, and seamless integration with clipboard tools.
 
 ## Features
 
-- Interactive TUI - Navigate and select files with keyboard controls  
-- Dual Output Formats - Generate -code.txt- for direct context or -ctags.txt- for code analysis  
-- Persistent Selections - Automatically saves marked files in -~/.promptpack-  
-- Token Analysis - Calculate token counts and model compatibility  
-- Smart Filtering - Automatically excludes binary and hidden files  
-- Quick Regeneration - Recreate files from saved selections  
-- Batch File Addition - Add multiple files via command line  
-- Tree Visualization - Project structure display with file sizes  
-- Partial Directory Marks - Visual indicators for partially selected directories  
+- 🌳 **Interactive Tree Browser** - Navigate and select files with an intuitive curses-based interface
+- 📦 **Smart File Packing** - Generate code.txt with complete file contents and project structure
+- 🏷️ **Ctags Integration** - Create ctags.txt with symbol definitions for better code understanding
+- 🔧 **Patch Management** - Track, apply, revert, and reapply code changes with full history
+- 💾 **Persistent Selection** - Save file selections in .promptpack for quick regeneration
+- 📋 **Clipboard Integration** - Copy file contents and patch results directly to clipboard
+- 📊 **Token Counting** - Estimate token usage for different AI models (GPT-4, Claude, DeepSeek, etc.)
 
 ## Installation
 
+### Prerequisites
+
+- Python 3.6+
+- Universal Ctags
+- tiktoken (pip install tiktoken)
+- Clipboard tool: xclip, xsel, or pbcopy
+
+### Install Universal Ctags
+
+#### Ubuntu/Debian
 ```bash
-# Clone repository
-git clone https://github.com/drfuera/PromptPack.git
-cd PromptPack
-
-# Make executable
-chmod +x promptpack.py
-
-# Install Python dependencies
-pip install tiktoken
-
-# Install Universal Ctags (required)
 sudo apt install universal-ctags
+```
 
-# Optional: Add to PATH
-sudo ln -s $(pwd)/promptpack.py /usr/local/bin/promptpack
+#### macOS
+```bash
+brew install universal-ctags
+```
+
+### Install Python Dependencies
+
+```bash
+pip install tiktoken
+```
+
+### Download and Setup
+
+```bash
+wget https://raw.githubusercontent.com/drfuera/PromptPack/main/promptpack.py
+chmod +x promptpack.py
+```
+
+Optionally, move to PATH:
+```bash
+sudo mv promptpack.py /usr/local/bin/promptpack
 ```
 
 ## Usage
 
-### Interactive Mode (TUI)
+### Interactive Mode
+
+Launch the TUI browser to select files:
+
 ```bash
-./promptpack.py
+python3 promptpack.py
 ```
 
-**Controls:**
-- -↑/↓- - Navigate up/down
-- -←/→- - Collapse/Expand directories
-- -Space- - Mark/unmark files/directories
-- -F1- - Generate -code.txt- with marked files
-- -F2- - Generate -ctags.txt- with marked files
-- -q/Q- - Quit
+**Navigation:**
+- ↑↓: Move cursor
+- ←→: Collapse/expand directories
+- Space: Mark/unmark files
+- F1: Generate code.txt
+- F2: Generate ctags.txt
+- F12: View patch history
+- q: Quit
 
-### Quick Mode (Regenerate from Saved Selections)
+### Quick Mode
+
+Generate code.txt from previously saved .promptpack:
+
 ```bash
-# Regenerate code.txt from ~/.promptpack
-./promptpack.py -q
-
-# Regenerate ctags.txt from ~/.promptpack
-# (Run in interactive mode and press F2)
+promptpack -q
 ```
 
-### Add Files via Command Line
+### Add Files Directly
+
+Add specific files to .promptpack and generate code.txt:
+
 ```bash
-# Add specific files to promptpack and generate code.txt
-./promptpack.py -a file1.py file2.js path/to/file3.html
-
-# Multiple files with wildcards (using shell expansion)
-./promptpack.py -a src/*.py tests/*.py
+promptpack -a file1.py file2.py src/main.py
 ```
-
-## Output Formats
-
-### 1. code.txt
-Contains full source code of selected files with instructions for AI to respond with bash heredoc scripts for precise file modifications.
-
-**Structure:**
-- Instructions for AI patch generation
-- Project tree structure
-- Full source files with headers (-- ./path/to/file.py-)
-
-**AI Response Format:**
-The AI returns executable bash commands using Python heredoc scripts:
-```bash
-python3 <<'EOF'
-try:
-    with open("relative/path", "r") as f:
-        content = f.read()
-    content = content.replace("exact old text", "exact new text")
-    with open("relative/path", "w") as f:
-        f.write(content)
-except Exception:
-    raise SystemExit(1)
-EOF
-[ $? -eq 0 ] && echo -e "✅ relative/path" || echo -e "🔴 relative/path"
-```
-
-### 2. ctags.txt
-Contains Universal Ctags analysis of selected files for AI understanding of code structure, symbols, and relationships.
-
-**Structure:**
-- Instructions for AI to request specific files
-- Project tree structure
-- Ctags output for each file with symbol definitions
-
-## Token Analysis
-
-After generation, PromptPack displays token analysis:
-```bash
-✅ code.txt created!
-
-Included 12 files
-File size: 45,231 bytes
-Tokensize: 10,847 tokens
-
-Model capacity:
-✅   8.5%    DeepSeek   (128k context)
-✅   8.5%    Grok       (128k context)
-✅  33.1%    GPT-4      (32k context)
-✅   8.5%    GPT-5      (128k context)
-✅   5.4%    Claude     (200k context)
-✅   8.5%    Qwen       (128k context)
-```
-
-## File Selection Persistence
-
-Marked files are saved in -~/.promptpack- using absolute paths. Each project maintains its own selection set within the file. The format automatically filters paths to only include files from the current working directory.
-
-### Managing Selections
-- **Automatic**: Files marked in TUI are automatically saved
-- **Manual Addition**: Use -a- flag to add specific files
-- **Cross-Project**: File stores selections for multiple projects
-
-## Visual Indicators in TUI
-
-- -[✓]- - Fully marked file or directory (green)
-- -[◐]- - Partially marked directory (yellow)
-- -[ ]- - Unmarked
-- -▶- - Collapsed directory
-- -▼- - Expanded directory
-- File sizes shown for all items
-
-## Workflow Examples
-
-### Example 1: Multi-file Refactoring
-```bash
-# 1. Select files interactively
-./promptpack.py
-# Mark: models/user.py, models/auth.py, api/endpoints.py
-
-# 2. Generate context
-Press F1 to create code.txt
-
-# 3. Send to AI with request
-"Change all database calls from sync to async using asyncpg"
-
-# 4. Copy-paste AI response into terminal
-# All files are modified simultaneously
-```
-
-### Example 2: Code Analysis with Ctags
-```bash
-# 1. Select files for analysis
-./promptpack.py
-# Mark: src/*.py
-
-# 2. Generate ctags analysis
-Press F2 to create ctags.txt
-
-# 3. Send to AI
-"Analyze the codebase and identify potential security issues"
-
-# 4. AI can request specific files using:
-# promptpack -a file1.py file2.py
-```
-
-### Example 3: Quick Batch Addition
-```bash
-# Add all Python files in src and tests
-./promptpack.py -a src/*.py tests/*.py
-
-# code.txt is automatically created
-# Token analysis shown immediately
-```
-
-## Advanced Features
-
-### Directory Operations
-- Space on a directory toggles all files within
-- Partial marks show as -[◐]- when some children are marked
-- Directory sizes include all contained files
-
-### Smart File Filtering
-- Binary files automatically excluded
-- Hidden files (starting with -.-) skipped
-- Permission errors handled gracefully
 
 ### Patch Management
-The AI instructions include -#reset- command for reverting changes:
+
+Apply a patch (modify a file):
+
 ```bash
-If we use command #reset this implies that all changes have been reverted back to the original state.
-You will disregard all changes made by patches created during the chat session.
+promptpack -p "path/to/file.py" "Fix bug in parser" "old code here" "new code here"
 ```
 
-### Cross-Platform Compatibility
-- Works on Linux, macOS, and WSL
-- UTF-8 encoding support
-- Path normalization for different OSes
+**Rules:**
+- Description max 10 words
+- Old text must match EXACTLY (including whitespace)
+- Old text must be unique in the file (appear only once)
 
-## Use Cases
+View patch history and revert/reapply changes:
 
-1. **Large Refactoring** - Update patterns across 10+ files simultaneously
-2. **API Version Updates** - Modify all endpoint handlers in one operation
-3. **Security Patching** - Apply security fixes to multiple vulnerable files
-4. **Library Migration** - Replace deprecated library calls throughout codebase
-5. **Code Analysis** - Understand complex codebases using ctags analysis
-6. **Feature Addition** - Add new functionality across multiple components
-7. **Bug Fix Coordination** - Fix related issues in several modules at once
+```bash
+Press F12 in interactive mode
+```
 
-## Tips & Best Practices
+### Read Files to Clipboard
 
-1. **Start Small**: Begin with 3-5 core files for initial context
-2. **Use Token Analysis**: Ensure you-re within your AI model-s context window
-3. **Leverage Persistence**: Use -q- flag for follow-up questions
-4. **Combine Approaches**: Use -ctags.txt- for analysis, then -code.txt- for modifications
-5. **Check Output**: Always review AI-generated patches before execution
-6. **Directory Strategy**: Mark directories when working on entire modules
-7. **Backup First**: Ensure you have version control or backups before applying patches
+Read entire file:
+
+```bash
+promptpack -r path/to/file.py
+```
+
+Read specific lines (with line numbers):
+
+```bash
+promptpack -n 10,20 path/to/file.py
+```
+
+Copy clipboard buffer and clear:
+
+```bash
+promptpack -c
+```
+
+## AI Workflow Integration
+
+### Generated Files
+
+**code.txt** - Complete source code with:
+- Project tree structure
+- Full file contents with headers (### ./path/to/file)
+- Instructions for #patch command usage
+
+**ctags.txt** - Symbol definitions with:
+- Project structure
+- Function/class/variable definitions
+- File organization overview
+
+### Using with AI Models
+
+1. **Select Files**: Use interactive mode or -a to mark relevant files
+2. **Generate Pack**: Press F1 for code.txt or F2 for ctags.txt
+3. **Upload to AI**: Share the generated file with your AI assistant
+4. **Apply Patches**: Use the AI's patch commands to modify code
+
+### Patch Command Format for AI
+
+When working with AI assistants, they can generate patches using:
+
+```bash
+promptpack -p "relative/path" "Short description" "exact old text" "exact new text"
+promptpack -p "relative/path" "Short description" "exact old text" "exact new text"
+promptpack -c
+```
+
+The -c flag at the end copies all results to clipboard and cleans up temporary files.
+
+### Debugging with AI
+
+View file contents:
+```bash
+promptpack -r relative/path
+promptpack -c
+```
+
+View specific lines:
+```bash
+promptpack -n 10,20 relative/path
+promptpack -n 66,80 relative/path
+promptpack -c
+```
+
+## File Format
+
+### .promptpack
+
+Stores absolute paths of selected files (one per line):
+```bash
+/home/user/project/src/main.py
+/home/user/project/src/utils.py
+/home/user/project/tests/test_main.py
+```
+
+### patch.json
+
+Tracks all patches with full history:
+```bash
+[
+  {
+    "id": 1,
+    "timestamp": "2025-12-22T10:30:00",
+    "filepath": "/path/to/file.py",
+    "description": "Fix parser bug",
+    "old_text": "original code",
+    "new_text": "fixed code",
+    "applied": true
+  }
+]
+```
+
+## Tips and Best Practices
+
+1. **Start with ctags.txt** for large projects - gives AI an overview before diving into full code
+2. **Use patch management** - track all changes for easy rollback
+3. **Mark incrementally** - start with core files, add more as needed
+4. **Check token counts** - ensure your pack fits within model limits
+5. **Use -q for repetition** - quickly regenerate after updating .promptpack
+6. **Leverage clipboard integration** - streamline your workflow with -c flag
+
+## Model Token Limits
+
+PromptPack shows capacity for:
+
+- **Claude**: 200,000 tokens
+- **DeepSeek**: 128,000 tokens
+- **Grok**: 128,000 tokens
+- **GPT-5**: 128,000 tokens (expected)
+- **Qwen**: 128,000 tokens
+- **GPT-4**: 32,768 tokens
+
+## Examples
+
+### Scenario 1: New Project Analysis
+
+```bash
+# Launch interactive mode
+python3 promptpack.py
+
+# Navigate and mark key files
+# Press F2 to generate ctags.txt
+
+# Share ctags.txt with AI to get project overview
+```
+
+### Scenario 2: Bug Fix with Patches
+
+```bash
+# Generate code.txt with relevant files
+promptpack -a src/parser.py src/lexer.py tests/test_parser.py
+
+# Work with AI, apply suggested patches
+promptpack -p "src/parser.py" "Fix token handling" "old code" "new code"
+promptpack -c
+
+# Review patch history if needed
+python3 promptpack.py
+# Press F12 in TUI
+```
+
+### Scenario 3: Iterative Development
+
+```bash
+# Initial setup
+promptpack -a main.py utils.py
+
+# Make changes, regenerate quickly
+promptpack -q
+
+# Add more files as project grows
+promptpack -a tests/test_utils.py
+```
 
 ## Troubleshooting
 
-**"Universal Ctags is not installed!"**
-```bash
-sudo apt install universal-ctags  # Ubuntu/Debian
-brew install universal-ctags      # macOS
-```
+**"ctags not found"**
+- Install universal-ctags (not exuberant-ctags)
 
-**File not appearing in TUI**
-- File may be binary (non-text)
-- File may be hidden (starts with -.-)
-- Check file permissions
+**"Could not copy to clipboard"**
+- Install xclip (Linux), xsel (Linux), or ensure pbcopy works (macOS)
 
-**Token count discrepancies**
-- Different tokenizers may give slightly different counts
-- tiktoken-s cl100k_base encoding is used (same as GPT-4)
+**"Old text not found in file"**
+- Ensure exact match including all whitespace and newlines
+- Use promptpack -r to view current file contents
+
+**"Old text appears N times"**
+- Text must be unique in file
+- Make the old_text more specific to match only once
+
+## Credits
+
+By Andrej Fuera
+
+Romans 8:28
+"And we know that in all things God works for the good of those who love him, who have been called according to his purpose."
+
+Special thanks to Jesus. Always Jesus. All the time. All the way.
+
+God bless you!
 
 ## License
 
 CC BY
-
-## Acknowledgments
-
-Special thanks to Jesus. Always Jesus. All the time. All the way.
-God bless you!
