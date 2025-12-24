@@ -321,9 +321,6 @@ def apply_patch(filepath, description, old_text, new_text):
         error_msg = f"[{filepath}] Description too long ({len(words)} words, max 10)"
         return False, error_msg
     
-    if "'''" in old_text or '"""' in old_text or "'''" in new_text or '"""' in new_text:
-        error_msg = f"Text contains triple quotes (''' or \"\"\") which causes syntax errors"
-        return False, error_msg
     
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -762,7 +759,7 @@ Interpretation of target file should be done via headers in the form ### ./relat
 
 If a file exists in the project structure below but is not included in this document, and you need to see it to complete the task, ask for that file before proceeding and it will be given to you.
 
-Return patch commands using the promptpack -p format that make exact text replacements in files.
+Return patch commands using the promptpack -p format with stdin that make exact text replacements in files.
 For each change needed, use the promptpack patch command.
 Number every #patch incrementally starting with #1.
 
@@ -774,14 +771,25 @@ Rules:
 - Description must be max 10 words
 - Old_text must match EXACTLY (including all whitespace and newlines)
 - Old_text must be unique in the file (appear only once)
-- Use \n for newlines in the command line arguments
-- No escaping needed - promptpack handles all special characters safely
+- Use ---SPLIT--- to separate old and new text
+- stdin handles all special characters safely (quotes, newlines, etc.)
 
 Format for patching files:
 ```bash
-promptpack -p "relative/path" "Short description" "exact old text" "exact new text"
-promptpack -p "relative/path" "Short description" "exact old text" "exact new text"
-promptpack -p "relative/path" "Short description" "exact old text" "exact new text"
+cat <<'PATCH1' | promptpack -p "relative/path" "Short description"
+exact old text here
+with all whitespace preserved
+---SPLIT---
+exact new text here
+with all whitespace preserved
+PATCH1
+
+cat <<'PATCH2' | promptpack -p "relative/path" "Short description"
+another old text
+---SPLIT---
+another new text
+PATCH2
+
 promptpack -c
 ```
 
@@ -826,6 +834,8 @@ Important:
 Additional notes:
 If we use command #reset this implies that all changes hav been reverted back to the original state.
 You will disregard all changes made by patches created during the chat session and fall back and start working from the source found in code.txt again.
+
+If we use the command #undo this implies that the last patch was reverted and undone, falling back to code before the patch was applied.
 
 Fallback:
 If you find yourself not being able to solve an issue, trying multiple times and coming to the conclusion that you're stuck do not write a patch to restore the code back to the state of code.txt.
@@ -981,8 +991,9 @@ if __name__ == "__main__":
                         help='Create code.txt directly from .promptpack without interactive mode')
     parser.add_argument('-a', '--add', nargs='+', metavar='FILE',
                         help='Add specified files to .promptpack and create code.txt')
-    parser.add_argument('-p', '--patch', nargs=4, metavar=('FILE', 'DESC', 'OLD', 'NEW'),
-                        help='Apply patch: file path, description (max 10 words), old text, new text')
+
+    parser.add_argument('-p', '--patch', nargs=2, metavar=('FILE', 'DESC'),
+                        help='Apply patch reading old/new text from stdin (format: OLD_TEXT\n---SPLIT---\nNEW_TEXT)')
     parser.add_argument('-r', '--read', metavar='FILE',
                         help='Read file and copy to clipboard')
     parser.add_argument('-n', '--lines', nargs=2, metavar=('RANGE', 'FILE'),
@@ -1008,19 +1019,6 @@ if __name__ == "__main__":
             print("❌ clipboard.tmp not found")
             sys.exit(1)
     
-    if args.patch:
-        filepath, description, old_text, new_text = args.patch
-        success, message = apply_patch(filepath, description, old_text, new_text)
-        
-        if success:
-            print(f"✅ {message}")
-            if copy_clipboard_tmp_to_clipboard():
-                pass
-            sys.exit(0)
-        else:
-            print(f"❌ {message}")
-            sys.exit(1)
-    
     if args.read:
         success, message = read_file_to_clipboard(args.read)
         print(message)
@@ -1035,6 +1033,32 @@ if __name__ == "__main__":
         if success and copy_clipboard_tmp_to_clipboard():
             pass
         sys.exit(0 if success else 1)
+    
+    if args.patch:
+        filepath, description = args.patch
+        
+        # Read from stdin
+        stdin_content = sys.stdin.read()
+        
+        # Split on ---SPLIT---
+        parts = stdin_content.split('---SPLIT---')
+        if len(parts) != 2:
+            print("❌ Error: stdin must contain OLD_TEXT---SPLIT---NEW_TEXT")
+            sys.exit(1)
+        
+        old_text = parts[0]
+        new_text = parts[1]
+        
+        success, message = apply_patch(filepath, description, old_text, new_text)
+        
+        if success:
+            print(f"✅ {message}")
+            if copy_clipboard_tmp_to_clipboard():
+                pass
+            sys.exit(0)
+        else:
+            print(f"❌ {message}")
+            sys.exit(1)
     
     check_ctags()
     
