@@ -1,297 +1,300 @@
 # PromptPack
 
-**Interactive file packer for AI-assisted development workflows**
+**An intelligent code packaging tool for AI-assisted development**
 
-PromptPack helps you prepare your codebase for AI conversations by creating structured compilations of your source files. It includes an interactive TUI for file selection, patch management for tracking changes, and seamless integration with clipboard tools.
+PromptPack helps you efficiently share your codebase with AI assistants by intelligently selecting, packaging, and patching files. It features an interactive TUI, automatic token counting, and intelligent whitespace-aware patching.
 
-## Features
+---
 
-- 🌳 **Interactive Tree Browser** - Navigate and select files with an intuitive curses-based interface
-- 📦 **Smart File Packing** - Generate code.txt with complete file contents and project structure
-- 🏷️ **Ctags Integration** - Create ctags.txt with symbol definitions for better code understanding
-- 🔧 **Patch Management** - Track, apply, revert, and reapply code changes with full history
-- 💾 **Persistent Selection** - Save file selections in .promptpack for quick regeneration
-- 📋 **Clipboard Integration** - Copy file contents and patch results directly to clipboard
-- 📊 **Token Counting** - Estimate token usage for different AI models (GPT-4, Claude, DeepSeek, etc.)
+## ✨ Features
 
-## Installation
+### 📦 Code Packaging
+- **Interactive File Selection**: Navigate your project structure with an intuitive TUI
+- **Smart Filtering**: Automatically excludes binary files and hidden directories
+- **Token Counting**: Real-time token estimation for various AI models (Claude, GPT-4, DeepSeek, etc.)
+- **Persistent Selection**: Save your file selections in `.promptpack` for reuse
 
-### Prerequisites
+### 🧩 Intelligent Patching
+- **Whitespace-Agnostic Matching**: Patches work even when AI gets indentation wrong
+- **Format Preservation**: Maintains your file's original indentation and formatting
+- **Atomic Operations**: All patches are tracked in `patch.json` with full history
+- **Safe Replacements**: Ensures old text appears exactly once before applying changes
+- **Undo/Redo Support**: Revert or reapply any patch via F12 history viewer
+
+### 🛠️ Development Tools
+- **File Reading**: Extract specific line ranges with `-n` flag
+- **Clipboard Integration**: Automatic clipboard copying via `xclip`, `xsel`, or `pbcopy`
+- **Project Tree Export**: Generate project structure with `tree` command integration
+- **CTags Support**: Generate symbol listings for quick code navigation
+
+---
+
+## 📋 Requirements
 
 - Python 3.6+
-- Universal Ctags
-- tiktoken (pip install tiktoken)
-- Clipboard tool: xclip, xsel, or pbcopy
+- Universal Ctags: `sudo apt install universal-ctags`
+- Clipboard tool (optional): `xclip`, `xsel`, or `pbcopy`
 
-### Install Universal Ctags
-
-#### Ubuntu/Debian
-```bash
-sudo apt install universal-ctags
-```
-
-#### macOS
-```bash
-brew install universal-ctags
-```
-
-### Install Python Dependencies
-
+**Python Dependencies:**
 ```bash
 pip install tiktoken
 ```
 
-### Download and Setup
+---
 
+## 🚀 Installation
 ```bash
-wget https://raw.githubusercontent.com/drfuera/PromptPack/main/promptpack.py
+git clone https://github.com/drfuera/PromptPack.git
+cd PromptPack
 chmod +x promptpack.py
+sudo ln -s $(pwd)/promptpack.py /usr/local/bin/promptpack
 ```
 
-Optionally, move to PATH:
-```bash
-sudo mv promptpack.py /usr/local/bin/promptpack
-```
+---
 
-## Usage
+## 📖 Usage
 
 ### Interactive Mode
 
-Launch the TUI browser to select files:
-
+Launch the TUI file selector:
 ```bash
-python3 promptpack.py
+promptpack
 ```
 
-**Navigation:**
-- ↑↓: Move cursor
-- ←→: Collapse/expand directories
-- Space: Mark/unmark files
-- F1: Generate code.txt
-- F2: Generate ctags.txt
-- F12: View patch history
-- q: Quit
+**Keyboard Shortcuts:**
+- `↑↓`: Navigate files/folders
+- `←→`: Collapse/expand folders
+- `Space`: Mark/unmark files
+- `F1`: Generate `code.txt` with selected files
+- `F2`: Generate `ctags.txt` with symbol index
+- `F12`: View patch history
+- `q`: Quit
 
 ### Quick Mode
 
-Generate code.txt from previously saved .promptpack:
-
+Generate `code.txt` from existing `.promptpack` selections:
 ```bash
 promptpack -q
 ```
 
-### Add Files Directly
+### Add Files
 
-Add specific files to .promptpack and generate code.txt:
-
+Add specific files to `.promptpack` and generate `code.txt`:
 ```bash
-promptpack -a file1.py file2.py src/main.py
+promptpack -a file1.py src/file2.js utils/helper.py
 ```
 
-### Patch Management
+---
 
-Apply a patch (modify a file):
+## 🔧 Patching Files
 
+### Apply a Patch
 ```bash
-promptpack -p "path/to/file.py" "Fix bug in parser" "old code here" "new code here"
+cat <<'PATCH' | promptpack -p "relative/path/file.py" "Short description"
+old text here
+with exact formatting
+---SPLIT---
+new text here
+with new formatting
+PATCH
 ```
 
-**Rules:**
-- Description max 10 words
-- Old text must match EXACTLY (including whitespace)
-- Old text must be unique in the file (appear only once)
+**Important Patch Rules:**
+- Description must be **max 10 words**
+- Old text must appear **exactly once** in the file
+- Old text doesn't need exact whitespace - intelligent matching will find it!
+- Use `---SPLIT---` to separate old and new text
+- Supports all special characters (quotes, newlines, etc.)
 
-View patch history and revert/reapply changes:
-
+### Example: Multiple Patches
 ```bash
-Press F12 in interactive mode
+cat <<'PATCH' | promptpack -p "app.py" "Add logging import"
+import os
+import sys
+---SPLIT---
+import os
+import sys
+import logging
+PATCH
+
+cat <<'PATCH' | promptpack -p "app.py" "Update function signature"
+def process(data):
+    return data
+---SPLIT---
+def process(data, verbose=False):
+    if verbose:
+        logging.info(f"Processing {len(data)} items")
+    return data
+PATCH
+
+promptpack -c
 ```
 
-### Read Files to Clipboard
+The final `promptpack -c` copies all results to clipboard and cleans up temporary files.
 
-Read entire file:
+---
 
+## 📄 Reading Files
+
+### Read Entire File
 ```bash
 promptpack -r path/to/file.py
-```
-
-Read specific lines (with line numbers):
-
-```bash
-promptpack -n 10,20 path/to/file.py
-```
-
-Copy clipboard buffer and clear:
-
-```bash
 promptpack -c
 ```
 
-## AI Workflow Integration
-
-### Generated Files
-
-**code.txt** - Complete source code with:
-- Project tree structure
-- Full file contents with headers (### ./path/to/file)
-- Instructions for #patch command usage
-
-**ctags.txt** - Symbol definitions with:
-- Project structure
-- Function/class/variable definitions
-- File organization overview
-
-### Using with AI Models
-
-1. **Select Files**: Use interactive mode or -a to mark relevant files
-2. **Generate Pack**: Press F1 for code.txt or F2 for ctags.txt
-3. **Upload to AI**: Share the generated file with your AI assistant
-4. **Apply Patches**: Use the AI's patch commands to modify code
-
-### Patch Command Format for AI
-
-When working with AI assistants, they can generate patches using:
-
+### Read Specific Lines
 ```bash
-promptpack -p "relative/path" "Short description" "exact old text" "exact new text"
-promptpack -p "relative/path" "Short description" "exact old text" "exact new text"
+promptpack -n 50,100 path/to/file.py
 promptpack -c
 ```
 
-The -c flag at the end copies all results to clipboard and cleans up temporary files.
+**Auto-adjustment:** If you request lines beyond the file length (e.g., 96-130 when file has 125 lines), the range automatically adjusts to maintain the requested line count (becomes 91-125).
 
-### Debugging with AI
+---
 
-View file contents:
+## 🗂️ Generated Files
+
+### `code.txt`
+Complete compilation of selected files with:
+- Project structure tree
+- File headers with relative paths
+- Full source code content
+- Instructions for AI on how to patch files
+
+### `ctags.txt`
+Symbol index of selected files with:
+- Function/class definitions
+- Method signatures
+- Variable declarations
+- Line numbers for quick navigation
+
+### `.promptpack`
+Stores absolute paths of marked files for reuse across sessions.
+
+### `patch.json`
+Tracks all applied patches with:
+- Patch ID and timestamp
+- File path and description
+- Old and new text content
+- Applied/unapplied status
+
+---
+
+## 🎯 Whitespace-Agnostic Patching
+
+PromptPack intelligently handles whitespace mismatches:
+
+**Your File:**
+```python
+def hello():
+    print("Hello")    # 4 spaces
+    return True
+```
+
+**AI's Patch (wrong indentation):**
+```python
+def hello():
+  print("Hello")      # 2 spaces
+  return True
+```
+
+**Result:** ✅ Patch applies successfully and **preserves your 4-space indentation**!
+
+This solves a common problem where AI assistants copy code with incorrect indentation but you want to maintain your project's formatting standards.
+
+---
+
+## 📊 Token Counting
+
+PromptPack shows real-time token usage for:
+
+| Model | Context Window |
+|-------|----------------|
+| Claude | 200,000 tokens |
+| GPT-4 | 32,768 tokens |
+| GPT-5 | 128,000 tokens |
+| DeepSeek | 128,000 tokens |
+| Grok | 128,000 tokens |
+| Qwen | 128,000 tokens |
+
+Status indicators show if your package fits:
+- ✅ Green: Fits within context
+- 🔴 Red: Exceeds context limit
+
+---
+
+## 🔄 Patch Management
+
+### View History
+Press `F12` in interactive mode to view all patches with:
+- Patch ID and timestamp
+- Applied/unapplied status
+- File path and description
+- Toggle patches with `Space`
+
+### Command Line History
 ```bash
-promptpack -r relative/path
+# Patches are automatically tracked in patch.json
+cat patch.json | jq '.'
+```
+
+---
+
+## 💡 Workflow Example
+```bash
+# 1. Select files interactively
+promptpack
+# Press Space on files you need, F1 to generate code.txt
+
+# 2. Share code.txt with AI assistant
+# AI analyzes and suggests changes
+
+# 3. Apply AI's suggested patches
+cat <<'PATCH' | promptpack -p "src/main.py" "Fix bug in parser"
+if data == None:
+    return False
+---SPLIT---
+if data is None:
+    return []
+PATCH
+
+# 4. Copy results to clipboard
 promptpack -c
+
+# 5. Review changes, iterate as needed
 ```
 
-View specific lines:
-```bash
-promptpack -n 10,20 relative/path
-promptpack -n 66,80 relative/path
-promptpack -c
-```
+---
 
-## File Format
+## 🎨 Icons in Output
 
-### .promptpack
+- 🧩 - Patch successfully applied
+- ✨ - New file created
+- ✅ - Operation succeeded
+- ❌ - Operation failed
+- 🔴 - Context limit exceeded
 
-Stores absolute paths of selected files (one per line):
-```bash
-/home/user/project/src/main.py
-/home/user/project/src/utils.py
-/home/user/project/tests/test_main.py
-```
+---
 
-### patch.json
+## 📜 License
 
-Tracks all patches with full history:
-```bash
-[
-  {
-    "id": 1,
-    "timestamp": "2025-12-22T10:30:00",
-    "filepath": "/path/to/file.py",
-    "description": "Fix parser bug",
-    "old_text": "original code",
-    "new_text": "fixed code",
-    "applied": true
-  }
-]
-```
+This project is dedicated to the glory of God.
 
-## Tips and Best Practices
+**Romans 8:28**  
+*"And we know that in all things God works for the good of those who love him, who have been called according to his purpose."*
 
-1. **Start with ctags.txt** for large projects - gives AI an overview before diving into full code
-2. **Use patch management** - track all changes for easy rollback
-3. **Mark incrementally** - start with core files, add more as needed
-4. **Check token counts** - ensure your pack fits within model limits
-5. **Use -q for repetition** - quickly regenerate after updating .promptpack
-6. **Leverage clipboard integration** - streamline your workflow with -c flag
+---
 
-## Model Token Limits
+## 👨‍💻 Author
 
-PromptPack shows capacity for:
+**Andrej Fuera**
 
-- **Claude**: 200,000 tokens
-- **DeepSeek**: 128,000 tokens
-- **Grok**: 128,000 tokens
-- **GPT-5**: 128,000 tokens (expected)
-- **Qwen**: 128,000 tokens
-- **GPT-4**: 32,768 tokens
-
-## Examples
-
-### Scenario 1: New Project Analysis
-
-```bash
-# Launch interactive mode
-python3 promptpack.py
-
-# Navigate and mark key files
-# Press F2 to generate ctags.txt
-
-# Share ctags.txt with AI to get project overview
-```
-
-### Scenario 2: Bug Fix with Patches
-
-```bash
-# Generate code.txt with relevant files
-promptpack -a src/parser.py src/lexer.py tests/test_parser.py
-
-# Work with AI, apply suggested patches
-promptpack -p "src/parser.py" "Fix token handling" "old code" "new code"
-promptpack -c
-
-# Review patch history if needed
-python3 promptpack.py
-# Press F12 in TUI
-```
-
-### Scenario 3: Iterative Development
-
-```bash
-# Initial setup
-promptpack -a main.py utils.py
-
-# Make changes, regenerate quickly
-promptpack -q
-
-# Add more files as project grows
-promptpack -a tests/test_utils.py
-```
-
-## Troubleshooting
-
-**"ctags not found"**
-- Install universal-ctags (not exuberant-ctags)
-
-**"Could not copy to clipboard"**
-- Install xclip (Linux), xsel (Linux), or ensure pbcopy works (macOS)
-
-**"Old text not found in file"**
-- Ensure exact match including all whitespace and newlines
-- Use promptpack -r to view current file contents
-
-**"Old text appears N times"**
-- Text must be unique in file
-- Make the old_text more specific to match only once
-
-## Credits
-
-By Andrej Fuera
-
-Romans 8:28
-"And we know that in all things God works for the good of those who love him, who have been called according to his purpose."
-
-Special thanks to Jesus. Always Jesus. All the time. All the way.
-
+Special thanks to Jesus. Always Jesus. All the time. All the way.  
 God bless you!
 
-## License
+---
 
-CC BY
+## 🔗 Links
+
+- **GitHub**: [https://github.com/drfuera/PromptPack](https://github.com/drfuera/PromptPack)
+- **Issues**: [Report bugs or request features](https://github.com/drfuera/PromptPack/issues)
