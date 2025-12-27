@@ -328,6 +328,7 @@ def apply_patch(filepath, description, old_text, new_text):
 
     filepath = Path(filepath).resolve()
     
+
     if not filepath.exists():
         rel_path = Path(filepath).relative_to(Path.cwd())
         error_msg = f"File not found: {rel_path}"
@@ -336,41 +337,39 @@ def apply_patch(filepath, description, old_text, new_text):
     words = description.split()
     if len(words) > 10:
         rel_path = filepath.relative_to(Path.cwd())
-        error_msg = f"[{rel_path}] Description too long ({len(words)} words, max 10)"
+        error_msg = f"[{rel_path}]\t\t'Description too long ({len(words)} words, max 10)'"
         return False, error_msg
     
     
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             original_content = f.read()
-        
-
-
-
         # Try exact match first
+        used_flexible_whitespace = False
         if old_text in original_content:
             count = original_content.count(old_text)
             if count > 1:
                 rel_path = filepath.relative_to(Path.cwd())
-                error_msg = f"[{rel_path}] '{description}': Old text appears {count} times in file (must be unique)"
+                error_msg = f"[{rel_path}]\t\t'{description}': Old text appears {count} times in file (must be unique)"
                 return False, error_msg
             actual_old_text = old_text
-
         else:
-            # Try whitespace-agnostic matching
+            used_flexible_whitespace = True
+# Try whitespace-agnostic matching
             # Replace whitespace BEFORE escaping special chars
             pattern = re.sub(r'\s+', '\x00WHITESPACE\x00', old_text)
             pattern = re.escape(pattern)
             pattern = pattern.replace('\x00WHITESPACE\x00', r'\s+')
             matches = list(re.finditer(pattern, original_content))
             
+
             if len(matches) == 0:
                 rel_path = filepath.relative_to(Path.cwd())
-                error_msg = f"[{rel_path}] '{description}': Old text not found in file (even with flexible whitespace)"
+                error_msg = f"[{rel_path}]\t\t'{description}': Old text not found in file (even with flexible whitespace)"
                 return False, error_msg
             elif len(matches) > 1:
                 rel_path = filepath.relative_to(Path.cwd())
-                error_msg = f"[{rel_path}] '{description}': Old text appears {len(matches)} times in file (must be unique)"
+                error_msg = f"[{rel_path}]\t\t'{description}': Old text appears {len(matches)} times in file (must be unique)"
                 return False, error_msg
             
             # Use the actual text from file (with correct whitespace)
@@ -401,16 +400,19 @@ def apply_patch(filepath, description, old_text, new_text):
 
 
 
+
         rel_path = filepath.relative_to(Path.cwd())
-        success_msg = f"🧩 {rel_path}\t\t{description}: Applied successfully"
+        flex_indicator = " (flexible whitespace)" if used_flexible_whitespace else ""
+        success_msg = f"🧩 {rel_path}\t\t{description}: Applied successfully{flex_indicator}"
         append_to_clipboard_tmp(success_msg)
         return True, success_msg
         
 
 
+
     except Exception as e:
         rel_path = filepath.relative_to(Path.cwd())
-        error_msg = f"[{rel_path}] '{description}': Error: {e}"
+        error_msg = f"[{rel_path}]\t\t'{description}': Error: {e}"
         return False, error_msg
 
 def unapply_patch(patch_id):
