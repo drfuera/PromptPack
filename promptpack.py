@@ -10,6 +10,8 @@
 	God bless you!
 """
 #!/usr/bin/env python3
+
+
 import os
 import sys
 import curses
@@ -22,6 +24,8 @@ import json
 from datetime import datetime
 import subprocess
 import shutil
+import re
+import re
 
 PROMPTPACK_FILE = Path.home() / '.promptpack'
 PATCH_HISTORY_FILE = Path('patch.json')
@@ -192,19 +196,28 @@ def read_lines_to_clipboard(line_range, filepath):
     try:
         start, end = map(int, line_range.split(','))
         
+
         with open(filepath, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
-        if start < 1 or end > len(lines) or start > end:
+        # Auto-adjust if end exceeds file length
+        if end > len(lines):
+            overflow = end - len(lines)
+            start = max(1, start - overflow)
+            end = len(lines)
+        
+        if start < 1 or start > end:
             error_msg = f"Invalid range {start},{end} (file has {len(lines)} lines)"
             return False, error_msg
         
-        header = f"\n------ {filepath} ------\n\n"
+
+        rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+        header = f"\n------ {rel_path} ------\n\n"
         selected_with_numbers = header
         for i, line in enumerate(lines[start-1:end], start=start):
             selected_with_numbers += f"{i}: {line}"
         
-        success_msg = f"✅ Read lines {start}-{end} from {filepath}"
+        success_msg = f"✅ Read lines {start}-{end} from {rel_path}"
         append_to_clipboard_tmp(selected_with_numbers)
         return True, success_msg
             
@@ -223,11 +236,13 @@ def read_file_to_clipboard(filepath):
         error_msg = f"File not found: {filepath}"
         return False, error_msg
     
+
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        success_msg = f"✅ Read {len(content)} bytes from {filepath}"
+        rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+        success_msg = f"✅ Read {len(content)} bytes from {rel_path}"
         append_to_clipboard_tmp(content)
         return True, success_msg
             
@@ -310,15 +325,18 @@ def apply_patch(filepath, description, old_text, new_text):
     Applicera en patch och spara i historiken
     Returns: (success: bool, message: str)
     """
+
     filepath = Path(filepath).resolve()
     
     if not filepath.exists():
-        error_msg = f"File not found: {filepath}"
+        rel_path = Path(filepath).relative_to(Path.cwd())
+        error_msg = f"File not found: {rel_path}"
         return False, error_msg
     
     words = description.split()
     if len(words) > 10:
-        error_msg = f"[{filepath}] Description too long ({len(words)} words, max 10)"
+        rel_path = filepath.relative_to(Path.cwd())
+        error_msg = f"[{rel_path}] Description too long ({len(words)} words, max 10)"
         return False, error_msg
     
     
@@ -326,16 +344,39 @@ def apply_patch(filepath, description, old_text, new_text):
         with open(filepath, 'r', encoding='utf-8') as f:
             original_content = f.read()
         
-        if old_text not in original_content:
-            error_msg = f"[{filepath}] Old text not found in file"
-            return False, error_msg
+
+
+
+        # Try exact match first
+        if old_text in original_content:
+            count = original_content.count(old_text)
+            if count > 1:
+                rel_path = filepath.relative_to(Path.cwd())
+                error_msg = f"[{rel_path}] '{description}': Old text appears {count} times in file (must be unique)"
+                return False, error_msg
+            actual_old_text = old_text
+
+        else:
+            # Try whitespace-agnostic matching
+            # Replace whitespace BEFORE escaping special chars
+            pattern = re.sub(r'\s+', '\x00WHITESPACE\x00', old_text)
+            pattern = re.escape(pattern)
+            pattern = pattern.replace('\x00WHITESPACE\x00', r'\s+')
+            matches = list(re.finditer(pattern, original_content))
+            
+            if len(matches) == 0:
+                rel_path = filepath.relative_to(Path.cwd())
+                error_msg = f"[{rel_path}] '{description}': Old text not found in file (even with flexible whitespace)"
+                return False, error_msg
+            elif len(matches) > 1:
+                rel_path = filepath.relative_to(Path.cwd())
+                error_msg = f"[{rel_path}] '{description}': Old text appears {len(matches)} times in file (must be unique)"
+                return False, error_msg
+            
+            # Use the actual text from file (with correct whitespace)
+            actual_old_text = matches[0].group(0)
         
-        count = original_content.count(old_text)
-        if count > 1:
-            error_msg = f"[{filepath}] Old text appears {count} times in file (must be unique)"
-            return False, error_msg
-        
-        new_content = original_content.replace(old_text, new_text)
+        new_content = original_content.replace(actual_old_text, new_text)
         
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(new_content)
@@ -356,12 +397,20 @@ def apply_patch(filepath, description, old_text, new_text):
         history.append(patch_entry)
         save_patch_history(history)
         
-        success_msg = f"Patch #{patch_id} applied successfully"
+
+
+
+
+        rel_path = filepath.relative_to(Path.cwd())
+        success_msg = f"🧩 {rel_path}\t\t{description}: Applied successfully"
         append_to_clipboard_tmp(success_msg)
         return True, success_msg
         
+
+
     except Exception as e:
-        error_msg = f"[{filepath}] Error: {e}"
+        rel_path = filepath.relative_to(Path.cwd())
+        error_msg = f"[{rel_path}] '{description}': Error: {e}"
         return False, error_msg
 
 def unapply_patch(patch_id):
@@ -380,12 +429,14 @@ def unapply_patch(patch_id):
     if not patch:
         return False, f"Patch #{patch_id} not found"
     
+
     if not patch['applied']:
         return False, f"Patch #{patch_id} is already unapplied"
     
     filepath = Path(patch['filepath'])
     if not filepath.exists():
-        return False, f"File not found: {filepath}"
+        rel_path = Path(patch['filepath']).relative_to(Path.cwd())
+        return False, f"File not found: {rel_path}"
     
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -427,12 +478,14 @@ def reapply_patch(patch_id):
     if not patch:
         return False, f"Patch #{patch_id} not found"
     
+
     if patch['applied']:
         return False, f"Patch #{patch_id} is already applied"
     
     filepath = Path(patch['filepath'])
     if not filepath.exists():
-        return False, f"File not found: {filepath}"
+        rel_path = Path(patch['filepath']).relative_to(Path.cwd())
+        return False, f"File not found: {rel_path}"
     
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -776,21 +829,33 @@ Rules:
 
 Format for patching files:
 ```bash
-cat <<'PATCH1' | promptpack -p "relative/path" "Short description"
+cat <<'PATCH' | promptpack -p "relative/path" "Short description"
 exact old text here
 with all whitespace preserved
 ---SPLIT---
 exact new text here
 with all whitespace preserved
-PATCH1
+PATCH
 
-cat <<'PATCH2' | promptpack -p "relative/path" "Short description"
-another old text
+cat <<'PATCH' | promptpack -p "relative/path" "Short description"
+exact old text here
+with all whitespace preserved
 ---SPLIT---
-another new text
-PATCH2
+exact new text here
+with all whitespace preserved
+PATCH
 
 promptpack -c
+```
+
+
+If the file is completely new. Create it with:
+```bash
+cat <<'EOF' > relative/path
+code goes here
+EOF
+
+[ $? -eq 0 ] && echo -e "✨ relative/path created successfully" || echo -e "❌ error creating relative/path"
 ```
 
 Viewing complete file contents for debugging:
@@ -1005,9 +1070,9 @@ if __name__ == "__main__":
     if args.clear:
         if CLIPBOARD_TMP_FILE.exists():
             if copy_clipboard_tmp_to_clipboard():
+
                 try:
                     CLIPBOARD_TMP_FILE.unlink()
-                    print("✅ Removed clipboard.tmp")
                     sys.exit(0)
                 except Exception as e:
                     print(f"✅ File copied but could not remove: {e}")
@@ -1043,7 +1108,7 @@ if __name__ == "__main__":
         # Split on ---SPLIT---
         parts = stdin_content.split('---SPLIT---')
         if len(parts) != 2:
-            print("❌ Error: stdin must contain OLD_TEXT---SPLIT---NEW_TEXT")
+            print(f"❌ [{filepath}] '{description}': Error: stdin must contain OLD_TEXT---SPLIT---NEW_TEXT")
             sys.exit(1)
         
         old_text = parts[0]
