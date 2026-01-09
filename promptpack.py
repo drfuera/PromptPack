@@ -2,7 +2,7 @@
 	https://github.com/drfuera/PromptPack
 
 	By Andrej Fuera
-	
+
 	Romans 8:28
 	"And we know that in all things God works for the good of those who love him, who have been called according to his purpose."
 
@@ -10,7 +10,6 @@
 	God bless you!
 """
 #!/usr/bin/env python3
-
 
 import os
 import sys
@@ -22,15 +21,58 @@ import shutil
 import subprocess
 import json
 from datetime import datetime
-import subprocess
-import shutil
-import re
+import ast
 import re
 
 PROMPTPACK_FILE = Path.home() / '.promptpack'
 PATCH_HISTORY_FILE = Path('patch.json')
 CLIPBOARD_TMP_FILE = Path('clipboard.tmp')
 TEXT_CHECK_BYTES = 8192
+
+def tidy_file(filepath):
+    """Remove whitespace-only lines and reduce multiple empty lines to max 1"""
+    filepath = Path(filepath)
+
+    if not filepath.exists():
+        return False, f"File not found: {filepath}"
+
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        # Count original whitespace
+        original_whitespace = sum(len(line) - len(line.rstrip()) for line in lines)
+        original_lines = len(lines)
+
+        tidied = []
+        prev_empty = False
+        removed_lines = 0
+
+        for line in lines:
+            stripped = line.rstrip()  # Remove trailing whitespace
+
+            if not stripped:  # Line is empty or whitespace-only
+                if not prev_empty:  # Only add ONE empty line
+                    tidied.append('')
+                    prev_empty = True
+                else:
+                    removed_lines += 1
+            else:
+                tidied.append(stripped)
+                prev_empty = False
+
+        # Write back with newlines
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(tidied))
+            if tidied and tidied[-1]:  # Add final newline if file is not empty
+                f.write('\n')
+
+        rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+        stats = f"Removed {removed_lines} duplicate empty lines, {original_whitespace} trailing whitespace chars"
+        return True, f"✅ Tidied {rel_path} | {stats}"
+
+    except Exception as e:
+        return False, f"Error tidying file: {e}"
 
 def check_ctags():
     if not shutil.which('ctags'):
@@ -49,7 +91,7 @@ class TreeNode:
         self.expanded = False
         self.marked = False
         self.size = 0
-        
+
     def calculate_size(self):
         if not self.is_dir:
             try:
@@ -59,7 +101,7 @@ class TreeNode:
         else:
             self.size = sum(child.calculate_size() for child in self.children)
         return self.size
-    
+
     def format_size(self):
         size = self.size
         for unit in ['B', 'K', 'M', 'G']:
@@ -67,14 +109,14 @@ class TreeNode:
                 return f"{size:4.0f}{unit}"
             size /= 1024.0
         return f"{size:4.0f}T"
-    
+
     def has_partial_marks(self):
         if not self.is_dir:
             return False
-        
+
         marked_count = 0
         total_count = 0
-        
+
         def count_marks(node):
             nonlocal marked_count, total_count
             if not node.is_dir:
@@ -84,21 +126,21 @@ class TreeNode:
             else:
                 for child in node.children:
                     count_marks(child)
-        
+
         count_marks(self)
         return 0 < marked_count < total_count
-        
+
     def toggle_expand(self):
         if self.is_dir:
             self.expanded = not self.expanded
-            
+
     def toggle_mark(self):
         self.marked = not self.marked
         if self.is_dir and self.marked:
             self._mark_all_children(True)
         elif self.is_dir and not self.marked:
             self._mark_all_children(False)
-    
+
     def _mark_all_children(self, mark_state):
         for child in self.children:
             child.marked = mark_state
@@ -123,31 +165,31 @@ def is_text_file(file_path):
 def load_promptpack():
     if not PROMPTPACK_FILE.exists():
         return set()
-    
+
     try:
         cwd = Path.cwd().resolve()
         paths = set()
-        
+
         with open(PROMPTPACK_FILE, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                
+
                 path = Path(line)
-                
+
                 if path.is_absolute():
                     abs_path = path.resolve()
                 else:
                     continue
-                
+
                 try:
                     abs_path.relative_to(cwd)
                     if abs_path.exists():
                         paths.add(abs_path)
                 except (ValueError, OSError):
                     pass
-        
+
         return paths
     except:
         return set()
@@ -155,7 +197,7 @@ def load_promptpack():
 def save_promptpack(marked_files):
     try:
         cwd = Path.cwd().resolve()
-        
+
         existing_other_projects = set()
         if PROMPTPACK_FILE.exists():
             with open(PROMPTPACK_FILE, 'r', encoding='utf-8') as f:
@@ -163,64 +205,62 @@ def save_promptpack(marked_files):
                     line = line.strip()
                     if not line:
                         continue
-                    
+
                     path = Path(line)
                     if not path.is_absolute():
                         continue
-                    
+
                     abs_path = path.resolve()
-                    
+
                     try:
                         abs_path.relative_to(cwd)
                     except ValueError:
                         if abs_path.exists():
                             existing_other_projects.add(str(abs_path))
-        
+
         all_paths = existing_other_projects | {str(f.resolve()) for f in marked_files}
-        
+
         with open(PROMPTPACK_FILE, 'w', encoding='utf-8') as f:
             for path in sorted(all_paths):
                 f.write(f"{path}\n")
-                
+
     except Exception as e:
         pass
 
 def read_lines_to_clipboard(line_range, filepath):
-    """Läs specifika rader och kopiera till clipboard"""
+    """Read specific lines and copy to clipboard"""
     filepath = Path(filepath)
-    
+
     if not filepath.exists():
         error_msg = f"File not found: {filepath}"
         return False, error_msg
-    
+
     try:
         start, end = map(int, line_range.split(','))
-        
 
         with open(filepath, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        
+
         # Auto-adjust if end exceeds file length
         if end > len(lines):
             overflow = end - len(lines)
             start = max(1, start - overflow)
             end = len(lines)
-        
+
         if start < 1 or start > end:
             error_msg = f"Invalid range {start},{end} (file has {len(lines)} lines)"
             return False, error_msg
-        
 
         rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
-        header = f"\n------ {rel_path} ------\n\n"
+        header = f"\n------ {rel_path} ------\n"
         selected_with_numbers = header
         for i, line in enumerate(lines[start-1:end], start=start):
             selected_with_numbers += f"{i}: {line}"
-        
+
         success_msg = f"✅ Read lines {start}-{end} from {rel_path}"
         append_to_clipboard_tmp(selected_with_numbers)
         return True, success_msg
-            
+
     except ValueError:
         error_msg = f"Invalid range format: {line_range} (use: start,end)"
         return False, error_msg
@@ -228,30 +268,91 @@ def read_lines_to_clipboard(line_range, filepath):
         error_msg = f"Error reading file: {e}"
         return False, error_msg
 
-def read_file_to_clipboard(filepath):
-    """Läs fil och kopiera till clipboard"""
+def search_and_read_lines(search_string, offset_range, filepath):
+    """Search for string and show lines with offset"""
     filepath = Path(filepath)
-    
+
     if not filepath.exists():
         error_msg = f"File not found: {filepath}"
         return False, error_msg
-    
+
+    try:
+        # Parse offset range (e.g., "10,30" means 10 lines before, 30 lines after)
+        before, after = map(int, offset_range.split(','))
+        before = abs(before)  # Make sure it's positive
+
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        # Find all occurrences of search_string
+        match_lines = []
+        for i, line in enumerate(lines, start=1):
+            if search_string in line:
+                match_lines.append(i)
+
+        if not match_lines:
+            error_msg = f"String '{search_string}' not found in {filepath}"
+            append_to_clipboard_tmp(error_msg)
+            return False, error_msg
+
+        # Use first match but note if not unique
+        match_line = match_lines[0]
+        is_unique = len(match_lines) == 1
+
+        # Calculate start and end lines (before is negative offset, after is positive)
+        start = max(1, match_line - before)
+        end = min(len(lines), match_line + after)
+
+        rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+
+        uniqueness_info = "" if is_unique else f" | Search string is not unique, has {len(match_lines)} hits"
+        header = f"\n------ {rel_path} (found '{search_string}' at line {match_line}{uniqueness_info}) ------\n"
+        selected_with_numbers = header
+
+        for i, line in enumerate(lines[start-1:end], start=start):
+            selected_with_numbers += f"{i}: {line}"
+
+        # Add other hit locations if not unique
+        if not is_unique:
+            selected_with_numbers += "\n"
+            for idx, hit_line in enumerate(match_lines[1:], start=2):
+                selected_with_numbers += f"Hit line number #{idx}: {hit_line}\n"
+
+        uniqueness_note = "" if is_unique else f" (not unique: {len(match_lines)} occurrences)"
+        success_msg = f"✅ Found '{search_string}' at line {match_line}{uniqueness_note}, showing lines {start}-{end} from {rel_path}"
+        append_to_clipboard_tmp(selected_with_numbers)
+        return True, success_msg
+
+    except ValueError:
+        error_msg = f"Invalid offset format: {offset_range} (use: before,after, e.g., 10,30)"
+        return False, error_msg
+    except Exception as e:
+        error_msg = f"Error searching file: {e}"
+        return False, error_msg
+
+def read_file_to_clipboard(filepath):
+    """Read file and copy to clipboard"""
+    filepath = Path(filepath)
+
+    if not filepath.exists():
+        error_msg = f"File not found: {filepath}"
+        return False, error_msg
 
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
-        
+
         rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
         success_msg = f"✅ Read {len(content)} bytes from {rel_path}"
         append_to_clipboard_tmp(content)
         return True, success_msg
-            
+
     except Exception as e:
         error_msg = f"Error reading file: {e}"
         return False, error_msg
 
 def append_to_clipboard_tmp(message):
-    """Lägg till meddelande till clipboard.tmp"""
+    """Append message to clipboard.tmp"""
     try:
         with open(CLIPBOARD_TMP_FILE, 'a', encoding='utf-8') as f:
             f.write(message + '\n')
@@ -261,28 +362,28 @@ def append_to_clipboard_tmp(message):
         return False
 
 def copy_clipboard_tmp_to_clipboard():
-    """Kopiera innehållet av clipboard.tmp till clipboard"""
+    """Copy contents of clipboard.tmp to clipboard"""
     try:
         if not CLIPBOARD_TMP_FILE.exists():
             return False
-        
+
         with open(CLIPBOARD_TMP_FILE, 'r', encoding='utf-8') as f:
             content = f.read()
-        
+
         return copy_to_clipboard(content)
     except Exception as e:
         print(f"Warning: Could not read clipboard.tmp: {e}")
         return False
 
 def copy_to_clipboard(text):
-    """Kopiera text till clipboard"""
+    """Copy text to clipboard"""
     try:
         if shutil.which('xclip'):
-            subprocess.run(['xclip', '-selection', 'clipboard'], 
+            subprocess.run(['xclip', '-selection', 'clipboard'],
                          input=text.encode(), check=True)
             return True
         elif shutil.which('xsel'):
-            subprocess.run(['xsel', '--clipboard', '--input'], 
+            subprocess.run(['xsel', '--clipboard', '--input'],
                          input=text.encode(), check=True)
             return True
         elif shutil.which('pbcopy'):
@@ -293,7 +394,7 @@ def copy_to_clipboard(text):
     return False
 
 def load_patch_history():
-    """Ladda patch historik från JSON"""
+    """Load patch history from JSON"""
     if not PATCH_HISTORY_FILE.exists():
         return []
     try:
@@ -304,7 +405,7 @@ def load_patch_history():
         return []
 
 def save_patch_history(history):
-    """Spara patch historik till JSON"""
+    """Save patch history to JSON"""
     try:
         with open(PATCH_HISTORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(history, f, indent=2, ensure_ascii=False)
@@ -314,33 +415,112 @@ def save_patch_history(history):
         return False
 
 def get_next_patch_id():
-    """Få nästa lediga patch ID"""
+    """Get next available patch ID"""
     history = load_patch_history()
     if not history:
         return 1
     return max(p['id'] for p in history) + 1
 
+def fix_indentation_errors(content):
+
+    """
+    Fixes ONLY indentation errors by analyzing Python structure.
+    Does NOT change code logic, ONLY whitespace at the beginning of lines.
+    Returns: (fixed_content: str, was_fixed: bool)
+    """
+
+    lines = content.splitlines(keepends=True)
+    fixed_lines = []
+    indent_stack = [0]  # Stack to keep track of indent levels
+
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+
+        # Keep empty lines and comments as-is
+        if not stripped or stripped.startswith('#'):
+            fixed_lines.append(line)
+            continue
+
+        # Count current indent
+        current_indent = len(line) - len(stripped)
+
+        # Check if previous line ended with :
+        if fixed_lines:
+            prev_line = fixed_lines[-1].rstrip()
+            if prev_line.endswith(':'):
+                # Expect increased indent
+                expected_indent = indent_stack[-1] + 4
+                indent_stack.append(expected_indent)
+            else:
+                # Check if we should decrease indent (dedent)
+                # If current indent is less than stack, pop
+                while len(indent_stack) > 1 and current_indent < indent_stack[-1]:
+                    indent_stack.pop()
+
+                expected_indent = indent_stack[-1]
+        else:
+            expected_indent = 0
+
+        # Apply correct indent
+        fixed_line = ' ' * expected_indent + stripped
+        fixed_lines.append(fixed_line)
+
+    fixed_content = ''.join(fixed_lines)
+    return fixed_content, fixed_content != content
+
+def validate_and_fix_python_syntax(filepath, content):
+    """
+    Validates Python syntax and fixes indentation errors automatically.
+    Returns: (fixed_content: str, was_fixed: bool, error_msg: str)
+    """
+
+    if not str(filepath).endswith('.py'):
+        return content, False, ""
+
+    # Test original first
+    try:
+        ast.parse(content)
+        return content, False, ""
+    except IndentationError:
+        # Try to fix indentation errors
+        try:
+            fixed_content, was_fixed = fix_indentation_errors(content)
+
+            # Verify that the fix works
+            ast.parse(fixed_content)
+            return fixed_content, True, ""
+
+        except (IndentationError, SyntaxError) as e:
+            return content, False, f"Could not auto-fix: {e.msg}"
+    except SyntaxError as e:
+        return content, False, f"SyntaxError at line {e.lineno}: {e.msg}"
+    except Exception as e:
+        return content, False, ""
+
 def apply_patch(filepath, description, old_text, new_text):
     """
-    Applicera en patch och spara i historiken
+    Apply a patch and save in history
     Returns: (success: bool, message: str)
     """
 
     filepath = Path(filepath).resolve()
-    
 
     if not filepath.exists():
         rel_path = Path(filepath).relative_to(Path.cwd())
         error_msg = f"File not found: {rel_path}"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
-    
+
     words = description.split()
     if len(words) > 10:
+
         rel_path = filepath.relative_to(Path.cwd())
-        error_msg = f"[{rel_path}]\t\t'Description too long ({len(words)} words, max 10)'"
+        file_col = f"{rel_path}".ljust(40)
+        desc_col = f"{description}".ljust(50)
+        error_msg = f"❌ {file_col} {desc_col} Description too long ({len(words)} words, max 10)"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
-    
-    
+
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             original_content = f.read()
@@ -348,11 +528,16 @@ def apply_patch(filepath, description, old_text, new_text):
         used_flexible_whitespace = False
         if old_text in original_content:
             count = original_content.count(old_text)
+
             if count > 1:
                 rel_path = filepath.relative_to(Path.cwd())
-                error_msg = f"[{rel_path}]\t\t'{description}': Old text appears {count} times in file (must be unique)"
+                file_col = f"{rel_path}".ljust(40)
+                desc_col = f"{description}".ljust(50)
+                error_msg = f"❌ {file_col} {desc_col} Old text appears {count} times in file (must be unique)"
+                append_to_clipboard_tmp(error_msg)
                 return False, error_msg
             actual_old_text = old_text
+
         else:
             used_flexible_whitespace = True
 # Try whitespace-agnostic matching
@@ -361,28 +546,50 @@ def apply_patch(filepath, description, old_text, new_text):
             pattern = re.escape(pattern)
             pattern = pattern.replace('\x00WHITESPACE\x00', r'\s+')
             matches = list(re.finditer(pattern, original_content))
-            
 
             if len(matches) == 0:
+
                 rel_path = filepath.relative_to(Path.cwd())
-                error_msg = f"[{rel_path}]\t\t'{description}': Old text not found in file (even with flexible whitespace)"
+                file_col = f"{rel_path}".ljust(40)
+                desc_col = f"{description}".ljust(50)
+                error_msg = f"❌ {file_col} {desc_col} Old text not found in file (even with flexible whitespace)"
+                append_to_clipboard_tmp(error_msg)
                 return False, error_msg
+
             elif len(matches) > 1:
+
                 rel_path = filepath.relative_to(Path.cwd())
-                error_msg = f"[{rel_path}]\t\t'{description}': Old text appears {len(matches)} times in file (must be unique)"
+                file_col = f"{rel_path}".ljust(40)
+                desc_col = f"{description}".ljust(50)
+                error_msg = f"❌ {file_col} {desc_col} Old text appears {len(matches)} times in file (must be unique)"
+                append_to_clipboard_tmp(error_msg)
+
                 return False, error_msg
-            
+
             # Use the actual text from file (with correct whitespace)
             actual_old_text = matches[0].group(0)
-        
+
         new_content = original_content.replace(actual_old_text, new_text)
-        
+
+        # Validate and auto-fix Python syntax
+        validated_content, was_fixed, error_msg = validate_and_fix_python_syntax(filepath, new_content)
+
+        # If validation failed, abort the patch
+
+        if error_msg:
+            rel_path = filepath.relative_to(Path.cwd())
+            file_col = f"{rel_path}".ljust(40)
+            desc_col = f"{description}".ljust(30)
+            full_error = f"❌ {file_col} {desc_col} {error_msg}"
+            append_to_clipboard_tmp(full_error)
+            return False, full_error
+
         with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        
+            f.write(validated_content)
+
         history = load_patch_history()
         patch_id = get_next_patch_id()
-        
+
         patch_entry = {
             'id': patch_id,
             'timestamp': datetime.now().isoformat(),
@@ -392,123 +599,132 @@ def apply_patch(filepath, description, old_text, new_text):
             'new_text': new_text,
             'applied': True
         }
-        
+
         history.append(patch_entry)
         save_patch_history(history)
-        
-
-
-
-
 
         rel_path = filepath.relative_to(Path.cwd())
-        flex_indicator = " (flexible whitespace)" if used_flexible_whitespace else ""
-        success_msg = f"🧩 {rel_path}\t\t{description}: Applied successfully{flex_indicator}"
-        append_to_clipboard_tmp(success_msg)
+
+        # Format output with column alignment
+        icon = "🔧" if was_fixed else "🧩"
+        file_col = f"{rel_path}".ljust(40)
+
+        indicators = []
+        if used_flexible_whitespace:
+            indicators.append("flexible whitespace")
+        if was_fixed:
+            indicators.append("indentation auto-fixed")
+
+        indicator_str = f" ({', '.join(indicators)})" if indicators else ""
+        desc_col = f"{description}".ljust(50)
+
+        success_msg = f"{icon} {file_col} {desc_col} Applied successfully{indicator_str}"
         return True, success_msg
-        
-
-
 
     except Exception as e:
         rel_path = filepath.relative_to(Path.cwd())
-        error_msg = f"[{rel_path}]\t\t'{description}': Error: {e}"
+        error_msg = f"{rel_path}\t\t'{description}': Error: {e}"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
 def unapply_patch(patch_id):
     """
-    Reversa en patch
+    Reverse a patch
     Returns: (success: bool, message: str)
     """
     history = load_patch_history()
-    
+
     patch = None
     for p in history:
         if p['id'] == patch_id:
             patch = p
             break
-    
+
     if not patch:
         return False, f"Patch #{patch_id} not found"
-    
 
     if not patch['applied']:
         return False, f"Patch #{patch_id} is already unapplied"
-    
+
     filepath = Path(patch['filepath'])
     if not filepath.exists():
         rel_path = Path(patch['filepath']).relative_to(Path.cwd())
         return False, f"File not found: {rel_path}"
-    
+
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
-        
+
         if patch['new_text'] not in content:
             return False, f"Cannot unpatch: new text not found in file"
-        
+
         content = content.replace(patch['new_text'], patch['old_text'])
-        
+
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
-        
+
         patch['applied'] = False
+        patch['unpatch_error'] = False
         save_patch_history(history)
-        
+
         success_msg = f"Patch #{patch_id} unapplied successfully"
         copy_to_clipboard(success_msg)
         return True, success_msg
-        
+
     except Exception as e:
+        patch['unpatch_error'] = True
+        save_patch_history(history)
         error_msg = f"Error: {e}"
         copy_to_clipboard(error_msg)
         return False, error_msg
 
 def reapply_patch(patch_id):
     """
-    Återapplicera en patch
+    Reapply a patch
     Returns: (success: bool, message: str)
     """
     history = load_patch_history()
-    
+
     patch = None
     for p in history:
         if p['id'] == patch_id:
             patch = p
             break
-    
+
     if not patch:
         return False, f"Patch #{patch_id} not found"
-    
 
     if patch['applied']:
         return False, f"Patch #{patch_id} is already applied"
-    
+
     filepath = Path(patch['filepath'])
     if not filepath.exists():
         rel_path = Path(patch['filepath']).relative_to(Path.cwd())
         return False, f"File not found: {rel_path}"
-    
+
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
-        
+
         if patch['old_text'] not in content:
             return False, f"Cannot reapply: old text not found in file"
-        
+
         content = content.replace(patch['old_text'], patch['new_text'])
-        
+
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
-        
+
         patch['applied'] = True
+        patch['unpatch_error'] = False
         save_patch_history(history)
-        
+
         success_msg = f"Patch #{patch_id} reapplied successfully"
         copy_to_clipboard(success_msg)
         return True, success_msg
-        
+
     except Exception as e:
+        patch['unpatch_error'] = True
+        save_patch_history(history)
         error_msg = f"Error: {e}"
         copy_to_clipboard(error_msg)
         return False, error_msg
@@ -522,78 +738,78 @@ def mark_from_promptpack(root, promptpack_paths):
         else:
             for child in node.children:
                 mark_node(child)
-            
+
             file_children = [child for child in node.children if not child.is_dir]
-            
+
             if file_children:
                 all_marked = all(child.marked for child in file_children)
                 if all_marked:
                     node.marked = True
-    
+
     mark_node(root)
 
 def build_tree(root_path, load_marks=True):
     root_path = Path(root_path).resolve()
-    
+
     if not root_path.exists():
         return None
-    
+
     root = TreeNode(root_path, is_dir=True)
     root.expanded = True
-    
+
     def populate(node):
         if not node.is_dir:
             return
-        
+
         try:
             entries = sorted(node.path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
             for entry in entries:
                 if entry.name.startswith('.'):
                     continue
-                
+
                 if entry.is_file() and not is_text_file(entry):
                     continue
-                
+
                 child = TreeNode(entry, is_dir=entry.is_dir(), parent=node)
                 node.children.append(child)
                 if child.is_dir:
                     populate(child)
         except PermissionError:
             pass
-    
+
     populate(root)
     root.calculate_size()
-    
+
     if load_marks:
         promptpack_paths = load_promptpack()
         if promptpack_paths:
             mark_from_promptpack(root, promptpack_paths)
-    
+
     return root
 
 def flatten_visible_tree(root):
     visible = []
-    
+
     def traverse(node, depth=0):
         visible.append((node, depth))
         if node.is_dir and node.expanded:
             for child in node.children:
                 traverse(child, depth + 1)
-    
+
     traverse(root)
     return visible
 
 def get_marked_files(node, result=None):
     if result is None:
         result = []
-    
+
     if not node.is_dir and node.marked:
         result.append(node.path)
-    
+
     if node.is_dir:
         for child in node.children:
             get_marked_files(child, result)
-    
+
     return result
 
 def calculate_total_tokens(marked_files):
@@ -608,10 +824,10 @@ def calculate_total_tokens(marked_files):
     return total_tokens
 
 def write_project_tree(out, root):
-    """Skriv ut projektstruktur med tree-kommandot om det finns, annars manuellt"""
-    # Försök använda tree-kommandot först
+    """Write project structure using tree command if available, otherwise manually"""
+    # Try using tree command first
     try:
-        # Kör tree-kommandot (exkludera dolda filer)
+        # Run tree command (exclude hidden files)
         result = subprocess.run(
             ['tree', '--noreport', '--charset=utf8', '.'],
             capture_output=True,
@@ -621,31 +837,32 @@ def write_project_tree(out, root):
         if result.returncode == 0:
             out.write(result.stdout)
             return
+
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
-    
-    # Fallback: skapa träd manuellt
+
+    # Fallback: create tree manually
     def write_tree_manual(node, prefix="", is_last=True):
         if node.parent is None:
             out.write(f"{node.name}/\n")
         else:
             connector = "└── " if is_last else "├── "
             out.write(f"{prefix}{connector}{node.name}{'/' if node.is_dir else ''}\n")
-        
+
         if node.is_dir:
             children = [c for c in node.children]
             for idx, child in enumerate(children):
                 extension = "    " if is_last else "│   "
                 new_prefix = prefix + extension if node.parent else ""
                 write_tree_manual(child, new_prefix, idx == len(children) - 1)
-    
+
     write_tree_manual(root)
 
 def show_patch_history(stdscr):
-    """Visa patch historik och tillåt unpatch/repatch"""
+    """Show patch history and allow unpatch/repatch"""
     curses.curs_set(0)
     history = load_patch_history()
-    
+
     if not history:
         stdscr.clear()
         stdscr.addstr(0, 0, "No patches in history", curses.A_BOLD)
@@ -653,105 +870,108 @@ def show_patch_history(stdscr):
         stdscr.refresh()
         stdscr.getch()
         return
-    
+
     selected = 0
     scroll = 0
-    
+
     while True:
         stdscr.clear()
         height, width = stdscr.getmaxyx()
-        
-        title = "Patch History - ↑↓: Navigate | Space: Toggle | q: Back"
+
+        title = "Patch History - ↑↓: Navigate | PgUp/PgDn: Jump | Delete: Toggle | q: Back"
         stdscr.addstr(0, 0, title.ljust(width-1)[:width-1], curses.A_REVERSE)
-        
+
         header = f"{'ID':<5} {'Status':<10} {'Date':<20} {'Description':<60} {'File'}"
         try:
             stdscr.addstr(1, 0, header[:width-1], curses.A_BOLD)
         except curses.error:
             pass
-        
+
         display_height = height - 3
         for i in range(display_height):
             idx = scroll + i
             if idx >= len(history):
                 break
-            
+
             patch = history[idx]
             status = "✓ Applied " if patch['applied'] else "○ Unapplied"
             date = patch['timestamp'][:19].replace('T', ' ')
             desc = patch['description'][:60]
             filepath = Path(patch['filepath']).name
-            
+
             line = f"{patch['id']:<5} {status:<10} {date:<20} {desc:<60} {filepath}"
-            
+
             attr = curses.A_REVERSE if idx == selected else curses.A_NORMAL
-            if patch['applied']:
-                attr |= curses.color_pair(1)
-            
+            if patch.get('unpatch_error', False):
+                attr |= curses.color_pair(3)  # Red for errors
+            elif patch['applied']:
+                attr |= curses.color_pair(1)  # Green for applied
+
             try:
                 stdscr.addstr(i + 2, 0, line[:width-1], attr)
             except curses.error:
                 pass
-        
+
         stdscr.refresh()
         key = stdscr.getch()
-        
+
         if key == ord('q') or key == ord('Q'):
             break
         elif key == curses.KEY_UP:
             selected = max(0, selected - 1)
             if selected < scroll:
                 scroll = selected
+
         elif key == curses.KEY_DOWN:
             selected = min(len(history) - 1, selected + 1)
             if selected >= scroll + display_height:
                 scroll = selected - display_height + 1
-        elif key == ord(' '):
+        elif key == curses.KEY_PPAGE:  # Page Up
+            selected = max(0, selected - display_height)
+            scroll = max(0, scroll - display_height)
+        elif key == curses.KEY_NPAGE:  # Page Down
+            selected = min(len(history) - 1, selected + display_height)
+            if selected >= scroll + display_height:
+                scroll = selected - display_height + 1
+        elif key == curses.KEY_DC:  # Delete key
             patch = history[selected]
-            
+
             stdscr.clear()
             stdscr.addstr(0, 0, "Processing...", curses.A_BOLD)
             stdscr.refresh()
-            
+
             if patch['applied']:
                 success, msg = unapply_patch(patch['id'])
             else:
                 success, msg = reapply_patch(patch['id'])
-            
+
             history = load_patch_history()
-            
-            stdscr.clear()
-            color = curses.color_pair(1) if success else curses.color_pair(2)
-            stdscr.addstr(0, 0, msg, color | curses.A_BOLD)
-            stdscr.addstr(2, 0, "Press any key to continue...")
-            stdscr.refresh()
-            stdscr.getch()
 
 def draw_tree(stdscr, root, selected_idx, scroll_offset):
     stdscr.clear()
     height, width = stdscr.getmaxyx()
-    
+
     visible_nodes = flatten_visible_tree(root)
-    
+
     title = "↑↓: Navigate | ←→: Expand | Space: Mark | F1: code | F2: ctags | F12: patches | q: Quit"
     stdscr.addstr(0, 0, title.ljust(width-1)[:width-1], curses.A_REVERSE)
-    
+
     display_height = height - 2
     for i in range(display_height):
         line_idx = scroll_offset + i
         if line_idx >= len(visible_nodes):
             break
-        
+
         node, depth = visible_nodes[line_idx]
-        
+
         size_str = node.format_size()
         indent = "  " * depth
-        
+
         if node.is_dir:
             icon = "▶ " if not node.expanded else "▼ "
         else:
             icon = "  "
-        
+
         if node.marked:
             mark = "[✓] "
             mark_color = curses.color_pair(1)
@@ -761,25 +981,25 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset):
         else:
             mark = "[ ] "
             mark_color = curses.A_NORMAL
-        
+
         line_prefix = f"{size_str} {indent}{icon}"
         line_suffix = node.name
-        
+
         full_line = f"{line_prefix}{mark}{line_suffix}"
         if len(full_line) > width - 1:
             line_suffix = line_suffix[:width - len(line_prefix) - len(mark) - 4] + "..."
-        
+
         base_attr = curses.A_REVERSE if line_idx == selected_idx else curses.A_NORMAL
-        
+
         try:
             stdscr.addstr(i + 1, 0, line_prefix, base_attr)
-            
+
             col = len(line_prefix)
             if base_attr == curses.A_REVERSE:
                 stdscr.addstr(i + 1, col, mark, mark_color | curses.A_REVERSE)
             else:
                 stdscr.addstr(i + 1, col, mark, mark_color)
-            
+
             col += len(mark)
             name_attr = base_attr
             if node.marked:
@@ -787,26 +1007,26 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset):
             stdscr.addstr(i + 1, col, line_suffix, name_attr)
         except curses.error:
             pass
-    
+
     marked_files = get_marked_files(root)
     total_tokens = calculate_total_tokens(marked_files)
-    
+
     status = f"Marked: {len(marked_files)} files | Tokensize: {total_tokens:,} tokens"
     try:
         stdscr.addstr(height - 1, 0, status[:width-1], curses.A_REVERSE)
     except curses.error:
         pass
-    
+
     stdscr.refresh()
 
 def create_code_file(root):
     marked_files = get_marked_files(root)
-    
+
     if not marked_files:
         return False
-    
+
     marked_files = sorted(marked_files, key=lambda x: str(x))
-    
+
     with open('code.txt', 'w', encoding='utf-8') as out:
         out.write("""The following instructions apply if command #patch is given:
 Analyze the attached text document with collected source code which is only a compilation, not a target file.
@@ -816,20 +1036,24 @@ If a file exists in the project structure below but is not included in this docu
 
 Return patch commands using the promptpack -p format with stdin that make exact text replacements in files.
 For each change needed, use the promptpack patch command.
-Number every #patch incrementally starting with #1.
 
-Always put all promptpack commands in same bash as 'promptpack -c' depends on it.
-Each command is run separately and we temporarily store the result of them.
-By ensuring 'promptpack -c' is added to the end of each bash window, we make sure all result date is copied to clipboard and the tmp file is removed.
+IMPORTANT FOR AI:
+- ALL files below contain COMPLETE and CURRENT source code
+- DO NOT ask for line numbers or file contents - you already have everything
+- If you need to reference specific code, search within this document
+- Only use promptpack -r/-n/-s if you need files NOT included in this code.txt or if they have substantially changed and you need a refresher
+- Always put all promptpack commands in same bash as 'promptpack -c' depends on it.
+- Each command is run separately and we temporarily store the result of them.
+- By ensuring 'promptpack -c' is added to the end of each bash window using promptpack command, we make sure all result date is copied to clipboard and the tmp file is removed.
 
-Rules:
+RULES:
 - Description must be max 10 words
 - Old_text must match EXACTLY (including all whitespace and newlines)
 - Old_text must be unique in the file (appear only once)
 - Use ---SPLIT--- to separate old and new text
 - stdin handles all special characters safely (quotes, newlines, etc.)
 
-Format for patching files:
+FORMAT FOR PATCHING FILES:
 ```bash
 cat <<'PATCH' | promptpack -p "relative/path" "Short description"
 exact old text here
@@ -850,8 +1074,7 @@ PATCH
 promptpack -c
 ```
 
-
-If the file is completely new. Create it with:
+CREATE NEW FILES WITH:
 ```bash
 cat <<'EOF' > relative/path
 code goes here
@@ -860,59 +1083,90 @@ EOF
 [ $? -eq 0 ] && echo -e "✨ relative/path created successfully" || echo -e "❌ error creating relative/path"
 ```
 
-Viewing complete file contents for debugging:
+VIEW COMPLETE FILES:
 ```bash
+# This is the preferred way if you already have code.txt if you require any additional files that you already do not have.
+# code.txt always contains overhead, which you already have if you are reading this.
 promptpack -r relative/path
 promptpack -r relative/path
 promptpack -c
 ```
 
-Or specific lines (with line numbers):
+READ SPECIFIC LINES (with search):
 ```bash
+# You should always ask for as many files/search strings as you know you need.
+# Search for _function_to_search_for and grab all lines 10 rows before the function match and 20 rows after it.
+promptpack -s "_function_to_search_for" 10,20 relative/path
+
+# Search for _anotherFunction_to_search_for and grab all lines 60 rows before the function match and 20 rows after it.
+promptpack -s "_anoterFunction_to_search_for" 60,20 relative/path
+promptpack -c
+```
+
+READ SPECIFIC LINEES (with line numbers):
+```bash
+# You should always ask for as many files/lines as you know you need.
 promptpack -n 10,20 relative/path
-promptpack -n 66,80 relative/path
 promptpack -n 190,250 relative/path
 promptpack -c
 ```
 
-Format for directory creation:
+DIRECTORY CREATION:
 ```bash
 mkdir -p relative/path/to/folder
 ```
 
-For removal (soft-delete):
+REMOVAL OF FILES (soft-delete):
 ```bash
 mv relative/path relative/path_deleted
 ```
 
-If tree structure is needed:
-```bash
-tree
-```
-
-Important:
+IMPORTANT:
 - Use promptpack -p for all file changes
 - Description max 10 words
 - old_text must match EXACTLY (including all whitespace)
 - old_text must be unique (appear only once in file)
-- All patches in one code block
-- Number patches: #patch 1, #patch 2, etc.
+- All patches in one bash/code block
+- Before asking for a file, always first check if you already got it with
+- When asking for lines from a files, batch as many as you know you need
 
-Additional notes:
+ADDITIONAL NOTES:
 If we use command #reset this implies that all changes hav been reverted back to the original state.
 You will disregard all changes made by patches created during the chat session and fall back and start working from the source found in code.txt again.
-
 If we use the command #undo this implies that the last patch was reverted and undone, falling back to code before the patch was applied.
 
-Fallback:
+FALLBACK:
 If you find yourself not being able to solve an issue, trying multiple times and coming to the conclusion that you're stuck do not write a patch to restore the code back to the state of code.txt.
 Instead let user know that you want to #reset the code and if there are any patches produced in the conversation that are of importance/use, number each patch and instruct user to apply them after resetting the code, for example;
 We're not getting anywhere, please #reset the code and apply #patch 2, 9, 12, 13 and 22. Let me know when you are ready and we can proceed.
 
+ENDING:
+If the command #done is given it tells you that the conversation is very near its limit and context window is running out.
+We don't want to loose work so we need to wrap up!
+You need to summarize the whole conversation in the users language and title it "PROMPTPACK Summary":
+Start by describing what the project is, what the issue is and what goals its trying to achieve.
+If the current session was started with a "PROMPTPACK Summary" you need to first include the list of previously summarized conversations.
+Do not summarize the conversation history from previous summary, as this is already summarized.
+After adding the previous chat history, continue summarizing every message in this current conversation between you and the user.
+All summarized conversation history should be one unified log as if it were one long conversation.
+All summary should aid AI to not go in circles trying to find the goal. Example:
+User: Implement dynamic shadows in this OpenGL 3D engine.
+AI:   Used X and Y to do Z.
+
+User: Shadows are not visible.
+AI:   Bug: Z-coordinate was negative (`-(world.offset_y * sx)`), which created a double negation. Fixed by removing the minus sign.
+
+User: Still having same issue.
+AI:   Discovered that worldOffset was set in shadow_renderer.py but NEVER used in shadow_pass.vert. Added the offset to the vertex shader.
+
+Summarize what files you have been working with and their relative path.
+Create a promptpack -a command with all the files the next session needs to start with in order to pick up where we leave this conversation.
+End with notes and thoughts that are specially important to you for this session that can help the next conversation to get a head start.
+Never end summary thinking that issues are corrected. Always assume that when #done is called, we are only wrapping up in order to be able to continue in new context window.
+
 ## Project Structure
 """)
-        
-                
+
         write_project_tree(out, root)
         out.write("\n")
         for file_path in marked_files:
@@ -923,17 +1177,17 @@ We're not getting anywhere, please #reset the code and apply #patch 2, 9, 12, 13
                     out.write(f.read())
             except Exception as e:
                 out.write(f"# Error reading file: {e}\n")
-    
+
     return True
 
 def create_ctags_file(root):
     marked_files = get_marked_files(root)
-    
+
     if not marked_files:
         return False
-    
+
     marked_files = sorted(marked_files, key=lambda x: str(x))
-    
+
     with open('ctags.txt', 'w', encoding='utf-8') as out:
         out.write("""These are all the files of the project listed with Universal Ctags.
 Understand the user request, what files are available and what they contain.
@@ -953,7 +1207,6 @@ If you for some reason later on find you need additional files from the project,
 ## Project Structure
 """)
 
-                
         write_project_tree(out, root)
         for file_path in marked_files:
             try:
@@ -978,38 +1231,38 @@ If you for some reason later on find you need additional files from the project,
             except Exception as e:
                 out.write(f"\n### {file_path.relative_to(Path.cwd())}\n")
                 out.write(f"# Error running ctags: {e}\n")
-    
+
     return True
 
 def main(stdscr):
     curses.curs_set(0)
     stdscr.keypad(True)
-    
+
     curses.start_color()
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_GREEN, -1)
     curses.init_pair(2, curses.COLOR_YELLOW, -1)
-    
+    curses.init_pair(3, curses.COLOR_RED, -1)
+
     root = build_tree(".")
     if not root:
         return None
-    
+
     selected_idx = 0
     scroll_offset = 0
-    
+
     while True:
         height, width = stdscr.getmaxyx()
         visible_nodes = flatten_visible_tree(root)
-        
+
         display_height = height - 2
         if selected_idx < scroll_offset:
             scroll_offset = selected_idx
         elif selected_idx >= scroll_offset + display_height:
             scroll_offset = selected_idx - display_height + 1
-        
+
         draw_tree(stdscr, root, selected_idx, scroll_offset)
         key = stdscr.getch()
-        
 
         if key == ord('q') or key == ord('Q'):
             return None
@@ -1054,7 +1307,7 @@ def main(stdscr):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Interactive directory navigator')
-    parser.add_argument('-q', '--quick', action='store_true', 
+    parser.add_argument('-q', '--quick', action='store_true',
                         help='Create code.txt directly from .promptpack without interactive mode')
     parser.add_argument('-a', '--add', nargs='+', metavar='FILE',
                         help='Add specified files to .promptpack and create code.txt')
@@ -1065,10 +1318,20 @@ if __name__ == "__main__":
                         help='Read file and copy to clipboard')
     parser.add_argument('-n', '--lines', nargs=2, metavar=('RANGE', 'FILE'),
                         help='Read specific lines (e.g., 10,20) and copy to clipboard')
+
+    parser.add_argument('-s', '--search', nargs=3, metavar=('STRING', 'OFFSET', 'FILE'),
+                        help='Search for string and read lines with offset (e.g., "_function" "10,30" file.py means 10 before, 30 after)')
+    parser.add_argument('-t', '--tidy', metavar='FILE',
+                        help='Remove whitespace-only lines and reduce multiple empty lines to max 1')
     parser.add_argument('-c', '--clear', action='store_true',
                         help='Copy clipboard.tmp to clipboard and remove the file')
     args = parser.parse_args()
-    
+
+    if args.tidy:
+        success, message = tidy_file(args.tidy)
+        print(message)
+        sys.exit(0 if success else 1)
+
     if args.clear:
         if CLIPBOARD_TMP_FILE.exists():
             if copy_clipboard_tmp_to_clipboard():
@@ -1085,54 +1348,55 @@ if __name__ == "__main__":
         else:
             print("❌ clipboard.tmp not found")
             sys.exit(1)
-    
+
     if args.read:
         success, message = read_file_to_clipboard(args.read)
         print(message)
-        if success and copy_clipboard_tmp_to_clipboard():
-            pass
         sys.exit(0 if success else 1)
-    
+
     if args.lines:
         line_range, filepath = args.lines
         success, message = read_lines_to_clipboard(line_range, filepath)
         print(message)
-        if success and copy_clipboard_tmp_to_clipboard():
-            pass
         sys.exit(0 if success else 1)
-    
+
+    if args.search:
+        search_string, offset_range, filepath = args.search
+        success, message = search_and_read_lines(search_string, offset_range, filepath)
+        print(message)
+
+        sys.exit(0 if success else 1)
+
     if args.patch:
         filepath, description = args.patch
-        
+
         # Read from stdin
         stdin_content = sys.stdin.read()
-        
+
         # Split on ---SPLIT---
         parts = stdin_content.split('---SPLIT---')
         if len(parts) != 2:
             print(f"❌ [{filepath}] '{description}': Error: stdin must contain OLD_TEXT---SPLIT---NEW_TEXT")
             sys.exit(1)
-        
+
         old_text = parts[0]
         new_text = parts[1]
-        
+
         success, message = apply_patch(filepath, description, old_text, new_text)
-        
+
         if success:
             print(f"✅ {message}")
-            if copy_clipboard_tmp_to_clipboard():
-                pass
             sys.exit(0)
         else:
             print(f"❌ {message}")
             sys.exit(1)
-    
+
     check_ctags()
-    
+
     if args.add:
         cwd = Path.cwd().resolve()
         new_files = set()
-        
+
         for file_str in args.add:
             file_path = Path(file_str).resolve()
             if not file_path.exists():
@@ -1145,11 +1409,11 @@ if __name__ == "__main__":
                 print(f"❌ Not a text file: {file_str}")
                 continue
             new_files.add(file_path)
-        
+
         if not new_files:
             print("❌ No valid files to add!")
             sys.exit(1)
-        
+
         existing_paths = set()
         if PROMPTPACK_FILE.exists():
             with open(PROMPTPACK_FILE, 'r', encoding='utf-8') as f:
@@ -1159,40 +1423,40 @@ if __name__ == "__main__":
                         path = Path(line)
                         if path.exists():
                             existing_paths.add(path.resolve())
-        
+
         all_paths = existing_paths | new_files
         with open(PROMPTPACK_FILE, 'w', encoding='utf-8') as f:
             for path in sorted(all_paths):
                 f.write(f"{path}\n")
-        
+
         print(f"✅ Added {len(new_files)} file(s) to .promptpack")
-        
+
         root = build_tree(".", load_marks=False)
         if not root:
             print("❌ Could not read directory structure!")
             sys.exit(1)
-        
+
         mark_from_promptpack(root, new_files)
         marked_files = get_marked_files(root)
-        
+
         if not marked_files:
             print("❌ No valid files found!")
             sys.exit(1)
-        
+
         create_code_file(root)
-        
+
         try:
             with open('code.txt', 'r', encoding='utf-8') as f:
                 content = f.read()
             total_tokens = calculate_tokens(content)
             file_size = len(content)
-            
+
             print(f"✅ code.txt created!")
             print(f"\nIncluded {len(marked_files)} files")
             print(f"File size: {file_size:,} bytes")
             print(f"Tokensize: {total_tokens:,} tokens")
             print(f"\nModel capacity:")
-            
+
             models = {
                 'DeepSeek': 128000,
                 'Grok': 128000,
@@ -1201,49 +1465,49 @@ if __name__ == "__main__":
                 'Claude': 200000,
                 'Qwen': 128000
             }
-            
+
             for model, max_tokens in models.items():
                 pct = (total_tokens / max_tokens) * 100
                 status = '✅' if total_tokens <= max_tokens else '🔴'
                 print(f"{status} {pct:5.1f}%\t{model}")
-                
+
         except Exception as e:
             print(f"❌ Error reading code.txt: {e}")
             sys.exit(1)
-    
+
     elif args.quick:
         promptpack_paths = load_promptpack()
-        
+
         if not promptpack_paths:
             print("❌ No files in .promptpack!")
             sys.exit(1)
-        
+
         root = build_tree(".", load_marks=False)
         if not root:
             print("❌ Could not read directory structure!")
             sys.exit(1)
-        
+
         mark_from_promptpack(root, promptpack_paths)
-        
+
         marked_files = get_marked_files(root)
         if not marked_files:
             print("❌ No valid files found from .promptpack!")
             sys.exit(1)
-        
+
         create_code_file(root)
-        
+
         try:
             with open('code.txt', 'r', encoding='utf-8') as f:
                 content = f.read()
             total_tokens = calculate_tokens(content)
             file_size = len(content)
-            
+
             print(f"✅ code.txt created!")
             print(f"\nIncluded {len(marked_files)} files")
             print(f"File size: {file_size:,} bytes")
             print(f"Tokensize: {total_tokens:,} tokens")
             print(f"\nModel capacity:")
-            
+
             models = {
                 'DeepSeek': 128000,
                 'Grok': 128000,
@@ -1252,21 +1516,21 @@ if __name__ == "__main__":
                 'Claude': 200000,
                 'Qwen': 128000
             }
-            
+
             for model, max_tokens in models.items():
                 pct = (total_tokens / max_tokens) * 100
                 status = '✅' if total_tokens <= max_tokens else '🔴'
                 print(f"{status} {pct:5.1f}%\t{model}")
-                
+
         except Exception as e:
             print(f"❌ Error reading code.txt: {e}")
             sys.exit(1)
     else:
         result = curses.wrapper(main)
-        
+
         if result is not None:
             file_type, file_count = result
-            
+
             if file_count == 0:
                 print("❌ No files marked!")
             else:
@@ -1274,16 +1538,16 @@ if __name__ == "__main__":
                 try:
                     with open(filename, 'r', encoding='utf-8') as f:
                         content = f.read()
-                    
+
                     file_size = len(content)
                     total_tokens = calculate_tokens(content)
-                    
+
                     print(f"✅ {filename} created!")
                     print(f"\nIncluded {file_count} files")
                     print(f"File size: {file_size:,} bytes")
                     print(f"Tokensize: {total_tokens:,} tokens")
                     print(f"\nModel capacity:")
-                    
+
                     models = {
                         'DeepSeek': 128000,
                         'Grok': 128000,
@@ -1292,11 +1556,11 @@ if __name__ == "__main__":
                         'Claude': 200000,
                         'Qwen': 128000
                     }
-                    
+
                     for model, max_tokens in models.items():
                         pct = (total_tokens / max_tokens) * 100
                         status = '✅' if total_tokens <= max_tokens else '🔴'
                         print(f"{status} {pct:5.1f}%\t{model}")
-                        
+
                 except Exception as e:
                     print(f"❌ Error reading {filename}: {e}")
