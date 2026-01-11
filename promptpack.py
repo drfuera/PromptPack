@@ -29,50 +29,71 @@ PATCH_HISTORY_FILE = Path('patch.json')
 CLIPBOARD_TMP_FILE = Path('clipboard.tmp')
 TEXT_CHECK_BYTES = 8192
 
-def tidy_file(filepath):
+
+def tidy_file(pattern):
     """Remove whitespace-only lines and reduce multiple empty lines to max 1"""
-    filepath = Path(filepath)
+    import glob
+    
+    # Expand wildcard pattern
+    matches = glob.glob(pattern, recursive=False)
+    
+    if not matches:
+        return False, f"No files found matching pattern: {pattern}"
+    
+    results = []
+    success_count = 0
+    error_count = 0
+    
+    for filepath in matches:
+        filepath = Path(filepath)
+        
+        if not filepath.is_file():
+            continue
+            
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
 
-    if not filepath.exists():
-        return False, f"File not found: {filepath}"
+            # Count original whitespace
+            original_whitespace = sum(len(line) - len(line.rstrip()) for line in lines)
+            original_lines = len(lines)
 
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+            tidied = []
+            prev_empty = False
+            removed_lines = 0
 
-        # Count original whitespace
-        original_whitespace = sum(len(line) - len(line.rstrip()) for line in lines)
-        original_lines = len(lines)
+            for line in lines:
+                stripped = line.rstrip()  # Remove trailing whitespace
 
-        tidied = []
-        prev_empty = False
-        removed_lines = 0
-
-        for line in lines:
-            stripped = line.rstrip()  # Remove trailing whitespace
-
-            if not stripped:  # Line is empty or whitespace-only
-                if not prev_empty:  # Only add ONE empty line
-                    tidied.append('')
-                    prev_empty = True
+                if not stripped:  # Line is empty or whitespace-only
+                    if not prev_empty:  # Only add ONE empty line
+                        tidied.append('')
+                        prev_empty = True
+                    else:
+                        removed_lines += 1
                 else:
-                    removed_lines += 1
-            else:
-                tidied.append(stripped)
-                prev_empty = False
+                    tidied.append(stripped)
+                    prev_empty = False
 
-        # Write back with newlines
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(tidied))
-            if tidied and tidied[-1]:  # Add final newline if file is not empty
-                f.write('\n')
+            # Write back with newlines
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(tidied))
+                if tidied and tidied[-1]:  # Add final newline if file is not empty
+                    f.write('\n')
 
-        rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
-        stats = f"Removed {removed_lines} duplicate empty lines, {original_whitespace} trailing whitespace chars"
-        return True, f"✅ Tidied {rel_path} | {stats}"
+            rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+            stats = f"Removed {removed_lines} duplicate empty lines, {original_whitespace} trailing whitespace chars"
+            results.append(f"✅ Tidied {rel_path} | {stats}")
+            success_count += 1
 
-    except Exception as e:
-        return False, f"Error tidying file: {e}"
+        except Exception as e:
+            results.append(f"❌ Error tidying {filepath}: {e}")
+            error_count += 1
+    
+    summary = f"\n✅ Tidied {success_count} file(s)" + (f", ❌ {error_count} error(s)" if error_count > 0 else "")
+    full_message = '\n'.join(results) + summary
+    
+    return error_count == 0, full_message
 
 def check_ctags():
     if not shutil.which('ctags'):
@@ -268,12 +289,24 @@ def read_lines_to_clipboard(line_range, filepath):
         error_msg = f"Error reading file: {e}"
         return False, error_msg
 
+
 def search_and_read_lines(search_string, offset_range, filepath):
     """Search for string and show lines with offset"""
     filepath = Path(filepath)
 
     if not filepath.exists():
         error_msg = f"File not found: {filepath}"
+        return False, error_msg
+
+
+    # Validate search string - allow safe characters including spaces and common symbols
+    allowed_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_- #.,:;()[]{}+=*/<>!?@\'\"')
+    invalid_chars = [c for c in search_string if c not in allowed_chars]
+    
+    if invalid_chars:
+        unique_invalid = ''.join(sorted(set(invalid_chars)))
+        error_msg = f"❌ Invalid characters in search string: '{unique_invalid}' (allowed: a-zA-Z0-9_- #.,:;()[]{{}}+=*/<>!?@'\")"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
     try:
@@ -330,6 +363,7 @@ def search_and_read_lines(search_string, offset_range, filepath):
         error_msg = f"Error searching file: {e}"
         return False, error_msg
 
+
 def read_file_to_clipboard(filepath):
     """Read file and copy to clipboard"""
     filepath = Path(filepath)
@@ -343,8 +377,11 @@ def read_file_to_clipboard(filepath):
             content = f.read()
 
         rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+        header = f"\n------ {rel_path} ------\n"
+        content_with_header = header + content
+        
         success_msg = f"✅ Read {len(content)} bytes from {rel_path}"
-        append_to_clipboard_tmp(content)
+        append_to_clipboard_tmp(content_with_header)
         return True, success_msg
 
     except Exception as e:
@@ -823,40 +860,12 @@ def calculate_total_tokens(marked_files):
             pass
     return total_tokens
 
-def write_project_tree(out, root):
-    """Write project structure using tree command if available, otherwise manually"""
-    # Try using tree command first
-    try:
-        # Run tree command (exclude hidden files)
-        result = subprocess.run(
-            ['tree', '--noreport', '--charset=utf8', '.'],
-            capture_output=True,
-            text=True,
-            cwd=Path.cwd()
-        )
-        if result.returncode == 0:
-            out.write(result.stdout)
-            return
 
-    except (subprocess.SubprocessError, FileNotFoundError):
-        pass
-
-    # Fallback: create tree manually
-    def write_tree_manual(node, prefix="", is_last=True):
-        if node.parent is None:
-            out.write(f"{node.name}/\n")
-        else:
-            connector = "└── " if is_last else "├── "
-            out.write(f"{prefix}{connector}{node.name}{'/' if node.is_dir else ''}\n")
-
-        if node.is_dir:
-            children = [c for c in node.children]
-            for idx, child in enumerate(children):
-                extension = "    " if is_last else "│   "
-                new_prefix = prefix + extension if node.parent else ""
-                write_tree_manual(child, new_prefix, idx == len(children) - 1)
-
-    write_tree_manual(root)
+def write_project_tree(out, marked_files):
+    """Write simple list of marked files with relative paths"""
+    for file_path in marked_files:
+        rel_path = file_path.relative_to(Path.cwd())
+        out.write(f"{rel_path}\n")
 
 def show_patch_history(stdscr):
     """Show patch history and allow unpatch/repatch"""
@@ -1019,13 +1028,20 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset):
 
     stdscr.refresh()
 
-def create_code_file(root):
+
+def create_code_file(root, structure_files=None):
     marked_files = get_marked_files(root)
 
     if not marked_files:
         return False
 
     marked_files = sorted(marked_files, key=lambda x: str(x))
+    
+    # Use all files from .promptpack for structure if provided
+    if structure_files is None:
+        structure_files = marked_files
+    else:
+        structure_files = sorted(structure_files, key=lambda x: str(x))
 
     with open('code.txt', 'w', encoding='utf-8') as out:
         out.write("""The following instructions apply if command #patch is given:
@@ -1037,9 +1053,12 @@ If a file exists in the project structure below but is not included in this docu
 Return patch commands using the promptpack -p format with stdin that make exact text replacements in files.
 For each change needed, use the promptpack patch command.
 
+BEFORE WE START:
+List #patch, #undo, #reset, #done and #outsource with a short description of what these commands do in a tidy table to show the user what commands are available.
+
 IMPORTANT FOR AI:
 - ALL files below contain COMPLETE and CURRENT source code
-- DO NOT ask for line numbers or file contents - you already have everything
+- DO NOT ask for line numbers or file contents - you already have everything. Always check your 'promptpack -a' commands to user before asking for files.
 - If you need to reference specific code, search within this document
 - Only use promptpack -r/-n/-s if you need files NOT included in this code.txt or if they have substantially changed and you need a refresher
 - Always put all promptpack commands in same bash as 'promptpack -c' depends on it.
@@ -1094,7 +1113,7 @@ promptpack -c
 
 READ SPECIFIC LINES (with search):
 ```bash
-# You should always ask for as many files/search strings as you know you need.
+# You should always ask for as many files/search strings as you know you need (a-zA-Z0-9).
 # Search for _function_to_search_for and grab all lines 10 rows before the function match and 20 rows after it.
 promptpack -s "_function_to_search_for" 10,20 relative/path
 
@@ -1135,6 +1154,13 @@ If we use command #reset this implies that all changes hav been reverted back to
 You will disregard all changes made by patches created during the chat session and fall back and start working from the source found in code.txt again.
 If we use the command #undo this implies that the last patch was reverted and undone, falling back to code before the patch was applied.
 
+GETTING STUCK:
+You might get stuck in reasoning/trying to find a solution to a problem.
+The user can then trigger, or you can suggest to the user to #outsource the current problem you are working on.
+If #outsource command is given you will write prompt for another AI, describing first what you are doing, what the problem is you are having and what result you are expecting to get.
+The prompt should ask for a well structured analysis of the code.
+End with a 'promptpack -a' command outside the AI prompt where are the files of interest are included, giving the AI all the code it needs to do the analysis.
+
 FALLBACK:
 If you find yourself not being able to solve an issue, trying multiple times and coming to the conclusion that you're stuck do not write a patch to restore the code back to the state of code.txt.
 Instead let user know that you want to #reset the code and if there are any patches produced in the conversation that are of importance/use, number each patch and instruct user to apply them after resetting the code, for example;
@@ -1167,7 +1193,9 @@ Never end summary thinking that issues are corrected. Always assume that when #d
 ## Project Structure
 """)
 
-        write_project_tree(out, root)
+
+
+        write_project_tree(out, structure_files)
         out.write("\n")
         for file_path in marked_files:
             rel_path = file_path.relative_to(Path.cwd())
@@ -1207,7 +1235,8 @@ If you for some reason later on find you need additional files from the project,
 ## Project Structure
 """)
 
-        write_project_tree(out, root)
+
+        write_project_tree(out, marked_files)
         for file_path in marked_files:
             try:
                 rel_path = file_path.relative_to(Path.cwd())
@@ -1321,8 +1350,9 @@ if __name__ == "__main__":
 
     parser.add_argument('-s', '--search', nargs=3, metavar=('STRING', 'OFFSET', 'FILE'),
                         help='Search for string and read lines with offset (e.g., "_function" "10,30" file.py means 10 before, 30 after)')
-    parser.add_argument('-t', '--tidy', metavar='FILE',
-                        help='Remove whitespace-only lines and reduce multiple empty lines to max 1')
+
+    parser.add_argument('-t', '--tidy', metavar='PATTERN',
+                        help='Remove whitespace-only lines and reduce multiple empty lines to max 1. Supports wildcards (*.py, world*.py, etc.)')
     parser.add_argument('-c', '--clear', action='store_true',
                         help='Copy clipboard.tmp to clipboard and remove the file')
     args = parser.parse_args()
@@ -1393,6 +1423,7 @@ if __name__ == "__main__":
 
     check_ctags()
 
+
     if args.add:
         cwd = Path.cwd().resolve()
         new_files = set()
@@ -1429,6 +1460,8 @@ if __name__ == "__main__":
             for path in sorted(all_paths):
                 f.write(f"{path}\n")
 
+
+
         print(f"✅ Added {len(new_files)} file(s) to .promptpack")
 
         root = build_tree(".", load_marks=False)
@@ -1436,6 +1469,7 @@ if __name__ == "__main__":
             print("❌ Could not read directory structure!")
             sys.exit(1)
 
+        # Mark new files for content inclusion
         mark_from_promptpack(root, new_files)
         marked_files = get_marked_files(root)
 
@@ -1443,7 +1477,17 @@ if __name__ == "__main__":
             print("❌ No valid files found!")
             sys.exit(1)
 
-        create_code_file(root)
+        # Filter all_paths to only include files from current project
+        current_project_files = set()
+        for path in all_paths:
+            try:
+                path.relative_to(cwd)
+                current_project_files.add(path)
+            except ValueError:
+                pass
+
+        # Create code.txt with current_project_files in structure, but only marked_files content
+        create_code_file(root, current_project_files)
 
         try:
             with open('code.txt', 'r', encoding='utf-8') as f:
