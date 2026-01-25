@@ -21,35 +21,36 @@ import shutil
 import subprocess
 import json
 from datetime import datetime
+
 import ast
 import re
+import fnmatch
 
 PROMPTPACK_FILE = Path.home() / '.promptpack'
 PATCH_HISTORY_FILE = Path('patch.json')
 CLIPBOARD_TMP_FILE = Path('clipboard.tmp')
 TEXT_CHECK_BYTES = 8192
 
-
 def tidy_file(pattern):
     """Remove whitespace-only lines and reduce multiple empty lines to max 1"""
     import glob
-    
+
     # Expand wildcard pattern
     matches = glob.glob(pattern, recursive=False)
-    
+
     if not matches:
         return False, f"No files found matching pattern: {pattern}"
-    
+
     results = []
     success_count = 0
     error_count = 0
-    
+
     for filepath in matches:
         filepath = Path(filepath)
-        
+
         if not filepath.is_file():
             continue
-            
+
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
@@ -89,10 +90,10 @@ def tidy_file(pattern):
         except Exception as e:
             results.append(f"❌ Error tidying {filepath}: {e}")
             error_count += 1
-    
+
     summary = f"\n✅ Tidied {success_count} file(s)" + (f", ❌ {error_count} error(s)" if error_count > 0 else "")
     full_message = '\n'.join(results) + summary
-    
+
     return error_count == 0, full_message
 
 def check_ctags():
@@ -289,25 +290,38 @@ def read_lines_to_clipboard(line_range, filepath):
         error_msg = f"Error reading file: {e}"
         return False, error_msg
 
-
 def search_and_read_lines(search_string, offset_range, filepath):
-    """Search for string and show lines with offset"""
+    """Search for string and show lines with offset. Supports wildcards (* ?) and regex (prefix with 'regex:')"""
     filepath = Path(filepath)
 
     if not filepath.exists():
         error_msg = f"File not found: {filepath}"
         return False, error_msg
 
+    # Check if regex mode
+    use_regex = search_string.startswith('regex:')
+    if use_regex:
+        search_string = search_string[6:]  # Remove 'regex:' prefix
+        try:
+            pattern = re.compile(search_string)
+        except re.error as e:
+            error_msg = f"❌ Invalid regex pattern: {e}"
+            append_to_clipboard_tmp(error_msg)
+            return False, error_msg
 
-    # Validate search string - allow safe characters including spaces and common symbols
-    allowed_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_- #.,:;()[]{}+=*/<>!?@\'\"')
-    invalid_chars = [c for c in search_string if c not in allowed_chars]
-    
-    if invalid_chars:
-        unique_invalid = ''.join(sorted(set(invalid_chars)))
-        error_msg = f"❌ Invalid characters in search string: '{unique_invalid}' (allowed: a-zA-Z0-9_- #.,:;()[]{{}}+=*/<>!?@'\")"
-        append_to_clipboard_tmp(error_msg)
-        return False, error_msg
+        def match_func(line):
+            return pattern.search(line) is not None
+    else:
+        # Check if wildcards are used
+        has_wildcards = '*' in search_string or '?' in search_string
+        if has_wildcards:
+            def match_func(line):
+                return fnmatch.fnmatch(line, f"*{search_string}*")
+
+        else:
+            # Literal search - accept any characters
+            def match_func(line):
+                return search_string in line
 
     try:
         # Parse offset range (e.g., "10,30" means 10 lines before, 30 lines after)
@@ -317,10 +331,10 @@ def search_and_read_lines(search_string, offset_range, filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
-        # Find all occurrences of search_string
+        # Find all occurrences using match function
         match_lines = []
         for i, line in enumerate(lines, start=1):
-            if search_string in line:
+            if match_func(line):
                 match_lines.append(i)
 
         if not match_lines:
@@ -338,8 +352,9 @@ def search_and_read_lines(search_string, offset_range, filepath):
 
         rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
 
-        uniqueness_info = "" if is_unique else f" | Search string is not unique, has {len(match_lines)} hits"
-        header = f"\n------ {rel_path} (found '{search_string}' at line {match_line}{uniqueness_info}) ------\n"
+        search_type = "regex" if use_regex else ("wildcard" if has_wildcards else "literal")
+        uniqueness_info = "" if is_unique else f" | Search pattern is not unique, has {len(match_lines)} hits"
+        header = f"\n------ {rel_path} (found '{search_string}' [{search_type}] at line {match_line}{uniqueness_info}) ------\n"
         selected_with_numbers = header
 
         for i, line in enumerate(lines[start-1:end], start=start):
@@ -352,7 +367,7 @@ def search_and_read_lines(search_string, offset_range, filepath):
                 selected_with_numbers += f"Hit line number #{idx}: {hit_line}\n"
 
         uniqueness_note = "" if is_unique else f" (not unique: {len(match_lines)} occurrences)"
-        success_msg = f"✅ Found '{search_string}' at line {match_line}{uniqueness_note}, showing lines {start}-{end} from {rel_path}"
+        success_msg = f"✅ Found '{search_string}' [{search_type}] at line {match_line}{uniqueness_note}, showing lines {start}-{end} from {rel_path}"
         append_to_clipboard_tmp(selected_with_numbers)
         return True, success_msg
 
@@ -363,6 +378,105 @@ def search_and_read_lines(search_string, offset_range, filepath):
         error_msg = f"Error searching file: {e}"
         return False, error_msg
 
+def file_search(search_term, pattern):
+    """
+    Search for text in files matching wildcard pattern. Supports wildcards (* ?) and regex (prefix with 'regex:')
+    Returns: (success: bool, message: str)
+    """
+    import glob
+
+
+    # Check if regex mode
+    use_regex = search_term.startswith('regex:')
+    if use_regex:
+        search_term = search_term[6:]  # Remove 'regex:' prefix
+        try:
+            regex_pattern = re.compile(search_term)
+        except re.error as e:
+            error_msg = f"❌ Invalid regex pattern: {e}"
+            return False, error_msg
+
+        def match_func(line):
+            return regex_pattern.search(line) is not None
+    else:
+        # Check if wildcards are used
+        has_wildcards = '*' in search_term or '?' in search_term
+        if has_wildcards:
+            def match_func(line):
+                return fnmatch.fnmatch(line, f"*{search_term}*")
+        else:
+            # Literal search - accept any characters
+            def match_func(line):
+                return search_term in line
+
+    # Make pattern recursive if it doesn't already contain **
+    if '**' not in pattern:
+        # Split pattern into directory and file parts
+        if '/' in pattern:
+            parts = pattern.rsplit('/', 1)
+            pattern = f"{parts[0]}/**/{parts[1]}"
+        else:
+            pattern = f"**/{pattern}"
+
+    # Expand wildcard pattern recursively
+    matches = glob.glob(pattern, recursive=True)
+
+    if not matches:
+        error_msg = f"❌ No files found matching pattern: {pattern}"
+        return False, error_msg
+
+    # Filter to only text files
+    text_files = []
+    for filepath in matches:
+        filepath = Path(filepath)
+        if filepath.is_file() and is_text_file(filepath):
+            text_files.append(filepath)
+
+    if not text_files:
+        error_msg = f"❌ No text files found matching pattern: {pattern}"
+        return False, error_msg
+
+    # Search in each file
+    results = []
+    total_hits = 0
+
+    for filepath in sorted(text_files):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            # Find all occurrences in this file
+            file_hits = []
+            for line_num, line in enumerate(lines, start=1):
+                if match_func(line):
+                    file_hits.append((line_num, line.rstrip()))
+
+            if file_hits:
+                rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+                results.append({
+                    'file': rel_path,
+                    'hits': file_hits,
+                    'count': len(file_hits)
+                })
+                total_hits += len(file_hits)
+
+        except Exception as e:
+            # Skip files that can't be read
+            continue
+
+    if not results:
+        error_msg = f"❌ No matches found for '{search_term}' in {len(text_files)} file(s)"
+        append_to_clipboard_tmp(error_msg)
+        return False, error_msg
+
+    # Format output - compact list format
+    output = ""
+    for result in results:
+        for line_num, line_text in result['hits']:
+            output += f"{result['file']}:{line_num}: {line_text}\n"
+
+    append_to_clipboard_tmp(output)
+    return True, ""
 
 def read_file_to_clipboard(filepath):
     """Read file and copy to clipboard"""
@@ -379,7 +493,7 @@ def read_file_to_clipboard(filepath):
         rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
         header = f"\n------ {rel_path} ------\n"
         content_with_header = header + content
-        
+
         success_msg = f"✅ Read {len(content)} bytes from {rel_path}"
         append_to_clipboard_tmp(content_with_header)
         return True, success_msg
@@ -457,6 +571,29 @@ def get_next_patch_id():
     if not history:
         return 1
     return max(p['id'] for p in history) + 1
+
+def tidy_text(text):
+    """
+    Normalize text by removing trailing whitespace and reducing multiple empty lines to max 1.
+    Used for matching during patching to be immune to whitespace variations.
+    Returns: normalized text
+    """
+    lines = text.splitlines(keepends=True)
+    tidied = []
+    prev_empty = False
+
+    for line in lines:
+        stripped = line.rstrip()  # Remove trailing whitespace
+
+        if not stripped:  # Line is empty or whitespace-only
+            if not prev_empty:  # Only add ONE empty line
+                tidied.append('')
+                prev_empty = True
+        else:
+            tidied.append(stripped)
+            prev_empty = False
+
+    return '\n'.join(tidied)
 
 def fix_indentation_errors(content):
 
@@ -561,8 +698,11 @@ def apply_patch(filepath, description, old_text, new_text):
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             original_content = f.read()
+
         # Try exact match first
         used_flexible_whitespace = False
+        used_tidy_matching = False
+
         if old_text in original_content:
             count = original_content.count(old_text)
 
@@ -576,22 +716,66 @@ def apply_patch(filepath, description, old_text, new_text):
             actual_old_text = old_text
 
         else:
+            # Try whitespace-agnostic matching
             used_flexible_whitespace = True
-# Try whitespace-agnostic matching
-            # Replace whitespace BEFORE escaping special chars
             pattern = re.sub(r'\s+', '\x00WHITESPACE\x00', old_text)
             pattern = re.escape(pattern)
             pattern = pattern.replace('\x00WHITESPACE\x00', r'\s+')
             matches = list(re.finditer(pattern, original_content))
 
             if len(matches) == 0:
+                # Try tidy matching as last resort
+                used_tidy_matching = True
+                tidied_old = tidy_text(old_text)
+                tidied_content = tidy_text(original_content)
 
-                rel_path = filepath.relative_to(Path.cwd())
-                file_col = f"{rel_path}".ljust(40)
-                desc_col = f"{description}".ljust(50)
-                error_msg = f"❌ {file_col} {desc_col} Old text not found in file (even with flexible whitespace)"
-                append_to_clipboard_tmp(error_msg)
-                return False, error_msg
+                if tidied_old in tidied_content:
+                    count = tidied_content.count(tidied_old)
+
+                    if count > 1:
+                        rel_path = filepath.relative_to(Path.cwd())
+                        file_col = f"{rel_path}".ljust(40)
+                        desc_col = f"{description}".ljust(50)
+                        error_msg = f"❌ {file_col} {desc_col} Old text appears {count} times in file after tidy (must be unique)"
+                        append_to_clipboard_tmp(error_msg)
+                        return False, error_msg
+
+                    # Find actual position in original content by matching tidied sections
+                    tidied_lines = tidied_content.split('\n')
+                    search_lines = tidied_old.split('\n')
+
+                    # Find where tidied match occurs
+                    for i in range(len(tidied_lines) - len(search_lines) + 1):
+                        if '\n'.join(tidied_lines[i:i+len(search_lines)]) == tidied_old:
+                            # Map back to original content
+                            original_lines = original_content.splitlines(keepends=True)
+                            tidy_to_original_map = []
+                            tidy_idx = 0
+
+                            for orig_idx, line in enumerate(original_lines):
+                                stripped = line.rstrip()
+                                if stripped or tidy_idx >= len(tidied_lines) or tidied_lines[tidy_idx]:
+                                    tidy_to_original_map.append(orig_idx)
+                                    tidy_idx += 1
+
+                            start_orig = tidy_to_original_map[i] if i < len(tidy_to_original_map) else 0
+                            end_orig = tidy_to_original_map[min(i + len(search_lines), len(tidy_to_original_map) - 1)]
+                            actual_old_text = ''.join(original_lines[start_orig:end_orig + 1])
+                            break
+                    else:
+                        rel_path = filepath.relative_to(Path.cwd())
+                        file_col = f"{rel_path}".ljust(40)
+                        desc_col = f"{description}".ljust(50)
+                        error_msg = f"❌ {file_col} {desc_col} Old text not found in file (even with tidy matching)"
+                        append_to_clipboard_tmp(error_msg)
+                        return False, error_msg
+                else:
+                    rel_path = filepath.relative_to(Path.cwd())
+                    file_col = f"{rel_path}".ljust(40)
+                    desc_col = f"{description}".ljust(50)
+                    error_msg = f"❌ {file_col} {desc_col} Old text not found in file (even with flexible whitespace and tidy)"
+                    append_to_clipboard_tmp(error_msg)
+                    return False, error_msg
 
             elif len(matches) > 1:
 
@@ -603,8 +787,13 @@ def apply_patch(filepath, description, old_text, new_text):
 
                 return False, error_msg
 
-            # Use the actual text from file (with correct whitespace)
-            actual_old_text = matches[0].group(0)
+            else:
+                # Use the actual text from file (with correct whitespace)
+                actual_old_text = matches[0].group(0)
+
+        # Apply tidy to new_text if tidy matching was used
+        if used_tidy_matching:
+            new_text = tidy_text(new_text)
 
         new_content = original_content.replace(actual_old_text, new_text)
 
@@ -649,6 +838,8 @@ def apply_patch(filepath, description, old_text, new_text):
         indicators = []
         if used_flexible_whitespace:
             indicators.append("flexible whitespace")
+        if used_tidy_matching:
+            indicators.append("tidy matching")
         if was_fixed:
             indicators.append("indentation auto-fixed")
 
@@ -860,7 +1051,6 @@ def calculate_total_tokens(marked_files):
             pass
     return total_tokens
 
-
 def write_project_tree(out, marked_files):
     """Write simple list of marked files with relative paths"""
     for file_path in marked_files:
@@ -1028,7 +1218,6 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset):
 
     stdscr.refresh()
 
-
 def create_code_file(root, structure_files=None):
     marked_files = get_marked_files(root)
 
@@ -1036,7 +1225,7 @@ def create_code_file(root, structure_files=None):
         return False
 
     marked_files = sorted(marked_files, key=lambda x: str(x))
-    
+
     # Use all files from .promptpack for structure if provided
     if structure_files is None:
         structure_files = marked_files
@@ -1044,6 +1233,7 @@ def create_code_file(root, structure_files=None):
         structure_files = sorted(structure_files, key=lambda x: str(x))
 
     with open('code.txt', 'w', encoding='utf-8') as out:
+
         out.write("""The following instructions apply if command #patch is given:
 Analyze the attached text document with collected source code which is only a compilation, not a target file.
 Interpretation of target file should be done via headers in the form ### ./relative/path.
@@ -1053,24 +1243,50 @@ If a file exists in the project structure below but is not included in this docu
 Return patch commands using the promptpack -p format with stdin that make exact text replacements in files.
 For each change needed, use the promptpack patch command.
 
+THIS FILE INCLUDES THE FULL CONTENT OF:
+""")
+
+        # Write the actual file list
+        for file_path in structure_files:
+            rel_path = file_path.relative_to(Path.cwd())
+            out.write(f"{rel_path}\n")
+
+        out.write("""
 BEFORE WE START:
-List #patch, #undo, #reset, #done and #outsource with a short description of what these commands do in a tidy table to show the user what commands are available.
+List #patch, #undo, #reset, #done and #outsource, #ask with a short description of what these commands do in a tidy table to show the user what commands are available.
 
 IMPORTANT FOR AI:
-- ALL files below contain COMPLETE and CURRENT source code
-- DO NOT ask for line numbers or file contents - you already have everything. Always check your 'promptpack -a' commands to user before asking for files.
-- If you need to reference specific code, search within this document
-- Only use promptpack -r/-n/-s if you need files NOT included in this code.txt or if they have substantially changed and you need a refresher
+- ALL files below contain COMPLETE and CURRENT source code.
+- NEVER ask for files you already have! ALWAYS search this document first using Ctrl+F or text search.
+- Before using promptpack -r/-n/-s, verify the file is NOT already in this document.
+- If you need to reference specific code, search within this document - the full source is here.
+- Only use promptpack -r/-n/-s if you need files NOT included in this code.txt or if they have substantially changed since code.txt was created.
 - Always put all promptpack commands in same bash as 'promptpack -c' depends on it.
 - Each command is run separately and we temporarily store the result of them.
-- By ensuring 'promptpack -c' is added to the end of each bash window using promptpack command, we make sure all result date is copied to clipboard and the tmp file is removed.
+- By ensuring 'promptpack -c' is added to the end of each bash window using promptpack command, we make sure all result data is copied to clipboard and the tmp file is removed.
+
+PATCH ERROR HANDLING:
+When patches fail, error messages are automatically copied to clipboard.tmp.
+CRITICAL RULES for handling failed patches:
+- ONLY fix patches that failed - do NOT recreate successful patches.
+- ALWAYS search this document first - you have the full source code already.
+- Common failures: text not found (already changed), text not unique (be more specific), whitespace issues.
+- To fix: Search this document for the current code, then create NEW patch with correct old_text.
+- NEVER use -r/-n/-s for files you already have in this document - search here first!
 
 RULES:
-- Description must be max 10 words
-- Old_text must match EXACTLY (including all whitespace and newlines)
-- Old_text must be unique in the file (appear only once)
-- Use ---SPLIT--- to separate old and new text
-- stdin handles all special characters safely (quotes, newlines, etc.)
+- Description must be max 10 words.
+- Old_text must match EXACTLY (including all whitespace and newlines).
+- Old_text must be unique in the file (appear only once).
+- Use ---SPLIT--- to separate old and new text.
+- stdin handles all special characters safely (quotes, newlines, etc.).
+
+PATCH BEST PRACTICES:
+- Use MINIMUM old_text needed for unique match - don't include unnecessary context lines.
+- Example: Instead of matching 10 lines, find 1-3 unique lines that only appear once.
+- Shorter old_text = less risk of whitespace/formatting mismatches.
+- Before writing patch, verify old_text appears EXACTLY ONCE by searching this document.
+- If old_text appears multiple times, make it more specific by including unique surrounding code.
 
 FORMAT FOR PATCHING FILES:
 ```bash
@@ -1102,6 +1318,26 @@ EOF
 [ $? -eq 0 ] && echo -e "✨ relative/path created successfully" || echo -e "❌ error creating relative/path"
 ```
 
+SEARCH IN FILES (with filename wildcard pattern):
+```bash
+# Search for text in files matching a pattern. Always searches recursively in all subdirectories.
+# Supports literal search, wildcards (*?), and regex (prefix with "regex:")
+# Results show: relative/path:line_number: line_content
+
+# Literal search
+promptpack -fs "search_term" "*.py"
+promptpack -fs "class Player" "terrain*.py"
+
+# Wildcard search
+promptpack -fs "def *init*" "*.py"
+
+# Regex search
+promptpack -fs "regex:def\s+\w+\(" "*.py"
+promptpack -fs "regex:^class\s+Player" "terrain*.py"
+
+promptpack -c
+```
+
 VIEW COMPLETE FILES:
 ```bash
 # This is the preferred way if you already have code.txt if you require any additional files that you already do not have.
@@ -1113,12 +1349,22 @@ promptpack -c
 
 READ SPECIFIC LINES (with search):
 ```bash
-# You should always ask for as many files/search strings as you know you need (a-zA-Z0-9).
-# Search for _function_to_search_for and grab all lines 10 rows before the function match and 20 rows after it.
+# You should always ask for as many files/search strings as you know you need.
+# Supports literal search, wildcards (*?), and regex (prefix with "regex:")
+# Format: promptpack -s "search_pattern" before,after relative/path
+
+# Literal search - grab 10 lines before and 20 lines after match
 promptpack -s "_function_to_search_for" 10,20 relative/path
 
-# Search for _anotherFunction_to_search_for and grab all lines 60 rows before the function match and 20 rows after it.
-promptpack -s "_anoterFunction_to_search_for" 60,20 relative/path
+# Wildcard search - find any init function
+promptpack -s "*init*" 5,15 relative/path
+
+# Regex search - find function definitions with parameters
+promptpack -s "regex:def\s+\w+\(" 10,20 relative/path
+
+# Regex search - find class declarations
+promptpack -s "regex:^class\s+\w+" 15,30 relative/path
+
 promptpack -c
 ```
 
@@ -1148,11 +1394,15 @@ IMPORTANT:
 - All patches in one bash/code block
 - Before asking for a file, always first check if you already got it with
 - When asking for lines from a files, batch as many as you know you need
+- ALL FILES YOU ASKED FOR WITH 'promptpack -a' ARE INCLUDED IN THIS FILE! YOU WILL NEVER ASK FOR -r, -n OR -s ON FILES YOU GOT ALREADY!
 
 ADDITIONAL NOTES:
 If we use command #reset this implies that all changes hav been reverted back to the original state.
 You will disregard all changes made by patches created during the chat session and fall back and start working from the source found in code.txt again.
 If we use the command #undo this implies that the last patch was reverted and undone, falling back to code before the patch was applied.
+
+Sometimes the user might ask questions, and you might take the questions as an invitation to start creating new patches.
+If you see the command #ask in, the user is strictly asking questions and you are not expected to write any code at this moment.
 
 GETTING STUCK:
 You might get stuck in reasoning/trying to find a solution to a problem.
@@ -1193,8 +1443,6 @@ Never end summary thinking that issues are corrected. Always assume that when #d
 ## Project Structure
 """)
 
-
-
         write_project_tree(out, structure_files)
         out.write("\n")
         for file_path in marked_files:
@@ -1224,8 +1472,9 @@ Once you know what files you need, let the user prepare the package of files for
 ```bash
 promptpack -a requiredfile.ext requiredfile2.ext path/requiredfile3.ext
 ```
-
-Note: In the interactive mode, press F1 for code.txt or F2 for ctags.txt
+IMPORTANT:
+ALL FILES YOU ASK FOR WITH 'promptpack -a' WILL BE INCLUDED IN THE TXT FILE!
+YOU WILL NEVER ASK FOR -r, -n OR -s ON FILES YOU GOT ALREADY!
 
 Here is the complete structure of the project and all the relevant files.
 Some files might not be included in the ctags list so you need to draw conclusions on what files do what based on their file names and what the user wants to achieve.
@@ -1234,7 +1483,6 @@ If you for some reason later on find you need additional files from the project,
 
 ## Project Structure
 """)
-
 
         write_project_tree(out, marked_files)
         for file_path in marked_files:
@@ -1349,23 +1597,39 @@ if __name__ == "__main__":
                         help='Read specific lines (e.g., 10,20) and copy to clipboard')
 
     parser.add_argument('-s', '--search', nargs=3, metavar=('STRING', 'OFFSET', 'FILE'),
-                        help='Search for string and read lines with offset (e.g., "_function" "10,30" file.py means 10 before, 30 after)')
+                        help='Search for string and read lines with offset. Supports wildcards (*?), regex (prefix with "regex:"). Example: "_function" "10,30" file.py or "regex:def\\s+\\w+" "5,15" file.py')
 
-    parser.add_argument('-t', '--tidy', metavar='PATTERN',
+    parser.add_argument('-fs', '--file-search', nargs=2, metavar=('STRING', 'PATTERN'),
+                        help='Search for string in files matching wildcard pattern. Supports wildcards (*?) and regex (prefix with "regex:"). Examples: -fs "def main" "*.py" or -fs "regex:class\\s+\\w+" "*.py"')
+
+    parser.add_argument('-t', '--tidy', nargs='+', metavar='PATTERN',
                         help='Remove whitespace-only lines and reduce multiple empty lines to max 1. Supports wildcards (*.py, world*.py, etc.)')
     parser.add_argument('-c', '--clear', action='store_true',
                         help='Copy clipboard.tmp to clipboard and remove the file')
     args = parser.parse_args()
 
     if args.tidy:
-        success, message = tidy_file(args.tidy)
-        print(message)
-        sys.exit(0 if success else 1)
+        success_messages = []
+        error_count = 0
+        total_success = True
+
+        for pattern in args.tidy:
+            success, message = tidy_file(pattern)
+            if not success:
+                error_count += 1
+                total_success = False
+            success_messages.append(message)
+
+        for msg in success_messages:
+            print(msg)
+
+        if error_count > 0:
+            print(f"\n❌ Failed to tidy {error_count} pattern(s)")
+        sys.exit(0 if total_success else 1)
 
     if args.clear:
         if CLIPBOARD_TMP_FILE.exists():
             if copy_clipboard_tmp_to_clipboard():
-
                 try:
                     CLIPBOARD_TMP_FILE.unlink()
                     sys.exit(0)
@@ -1376,8 +1640,7 @@ if __name__ == "__main__":
                 print("❌ Could not copy to clipboard (install xclip, xsel, or pbcopy)")
                 sys.exit(1)
         else:
-            print("❌ clipboard.tmp not found")
-            sys.exit(1)
+            sys.exit(0)
 
     if args.read:
         success, message = read_file_to_clipboard(args.read)
@@ -1394,6 +1657,21 @@ if __name__ == "__main__":
         search_string, offset_range, filepath = args.search
         success, message = search_and_read_lines(search_string, offset_range, filepath)
         print(message)
+        sys.exit(0 if success else 1)
+
+    if args.file_search:
+        search_term, pattern = args.file_search
+        success, message = file_search(search_term, pattern)
+
+        # Print results from clipboard.tmp if it exists
+        if success and CLIPBOARD_TMP_FILE.exists():
+            try:
+                with open(CLIPBOARD_TMP_FILE, 'r', encoding='utf-8') as f:
+                    print(f.read(), end='')
+            except:
+                pass
+        elif not success:
+            print(message)
 
         sys.exit(0 if success else 1)
 
@@ -1422,7 +1700,6 @@ if __name__ == "__main__":
             sys.exit(1)
 
     check_ctags()
-
 
     if args.add:
         cwd = Path.cwd().resolve()
@@ -1459,8 +1736,6 @@ if __name__ == "__main__":
         with open(PROMPTPACK_FILE, 'w', encoding='utf-8') as f:
             for path in sorted(all_paths):
                 f.write(f"{path}\n")
-
-
 
         print(f"✅ Added {len(new_files)} file(s) to .promptpack")
 
