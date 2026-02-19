@@ -529,8 +529,11 @@ def copy_clipboard_tmp_to_clipboard():
 def copy_to_clipboard(text):
     """Copy text to clipboard"""
     try:
+
         if shutil.which('xclip'):
             subprocess.run(['xclip', '-selection', 'clipboard'],
+                         input=text.encode(), check=True)
+            subprocess.run(['xclip', '-selection', 'primary'],
                          input=text.encode(), check=True)
             return True
         elif shutil.which('xsel'):
@@ -1152,7 +1155,8 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset):
 
     visible_nodes = flatten_visible_tree(root)
 
-    title = "↑↓: Navigate | ←→: Expand | Space: Mark | F1: code | F2: ctags | F12: patches | q: Quit"
+
+    title = "↑↓: Navigate | ←→: Expand | Space: Mark | i: Import deps | F1: code | F2: ctags | F12: patches | q: Quit"
     stdscr.addstr(0, 0, title.ljust(width-1)[:width-1], curses.A_REVERSE)
 
     display_height = height - 2
@@ -1511,6 +1515,111 @@ If you for some reason later on find you need additional files from the project,
 
     return True
 
+
+def get_all_py_files(root):
+    """Bygg dict: modulnamn -> TreeNode för alla .py-filer i trädet"""
+    module_map = {}
+
+    def traverse(node):
+        if not node.is_dir:
+            if node.path.suffix == '.py':
+                try:
+                    rel = node.path.relative_to(Path.cwd())
+                    parts = list(rel.parts)
+                    if parts[-1] == '__init__.py':
+                        module_name = '.'.join(parts[:-1])
+                    else:
+                        parts[-1] = parts[-1][:-3]
+                        module_name = '.'.join(parts)
+                    module_map[module_name] = node
+                    # Lägg även till kortnamn (sista delen)
+                    short = module_name.split('.')[-1]
+                    if short not in module_map:
+                        module_map[short] = node
+                except ValueError:
+                    pass
+        else:
+            for child in node.children:
+                traverse(child)
+
+    traverse(root)
+    return module_map
+
+def get_python_imports(filepath):
+    """Plocka ut alla importerade modulnamn från en Python-fil"""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            source = f.read()
+        tree = ast.parse(source, filename=str(filepath))
+    except (SyntaxError, OSError):
+        return set()
+
+    modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.add(alias.name)
+                modules.add(alias.name.split('.')[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                modules.add(node.module)
+                modules.add(node.module.split('.')[0])
+    return modules
+
+
+def get_dep_nodes(node, root, visited=None, module_map=None):
+    """Returnera set av TreeNode för filen och alla lokala beroenden"""
+    if visited is None:
+        visited = set()
+    if module_map is None:
+        module_map = get_all_py_files(root)
+
+    filepath = str(node.path.resolve())
+    if filepath in visited:
+        return set()
+    visited.add(filepath)
+
+    result = {node}
+
+    if node.path.suffix != '.py':
+        return result
+
+    imports = get_python_imports(node.path)
+    for module_name in imports:
+        if module_name in module_map:
+            dep_node = module_map[module_name]
+            if str(dep_node.path.resolve()) not in visited:
+                result |= get_dep_nodes(dep_node, root, visited, module_map)
+
+    return result
+
+def mark_with_deps(node, root, visited=None, module_map=None):
+    """Markera en fil och alla dess lokala Python-beroenden rekursivt"""
+    if visited is None:
+        visited = set()
+    if module_map is None:
+        module_map = get_all_py_files(root)
+
+    filepath = str(node.path.resolve())
+    if filepath in visited:
+        return 0
+    visited.add(filepath)
+
+    node.marked = True
+    count = 1
+
+    if node.path.suffix != '.py':
+        return count
+
+    imports = get_python_imports(node.path)
+    for module_name in imports:
+        if module_name in module_map:
+            dep_node = module_map[module_name]
+            if str(dep_node.path.resolve()) not in visited:
+                count += mark_with_deps(dep_node, root, visited, module_map)
+
+    return count
+
 def main(stdscr):
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -1575,12 +1684,25 @@ def main(stdscr):
                 node, _ = visible_nodes[selected_idx]
                 if node.is_dir and node.expanded:
                     node.toggle_expand()
+
         elif key == ord(' '):
             if selected_idx < len(visible_nodes):
                 node, _ = visible_nodes[selected_idx]
                 node.toggle_mark()
                 marked_files = get_marked_files(root)
                 save_promptpack(marked_files)
+
+        elif key == ord('i') or key == ord('I'):
+            if selected_idx < len(visible_nodes):
+                node, _ = visible_nodes[selected_idx]
+                if not node.is_dir and node.path.suffix == '.py':
+                    module_map = get_all_py_files(root)
+                    dep_nodes = get_dep_nodes(node, root, module_map=module_map)
+                    all_marked = all(n.marked for n in dep_nodes)
+                    for n in dep_nodes:
+                        n.marked = not all_marked
+                    marked_files = get_marked_files(root)
+                    save_promptpack(marked_files)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Interactive directory navigator')
