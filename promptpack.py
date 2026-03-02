@@ -1063,7 +1063,9 @@ def write_project_tree(out, marked_files):
 def show_patch_history(stdscr):
     """Show patch history and allow unpatch/repatch"""
     curses.curs_set(0)
+
     history = load_patch_history()
+    history = list(reversed(history))
 
     if not history:
         stdscr.clear()
@@ -1147,7 +1149,8 @@ def show_patch_history(stdscr):
             else:
                 success, msg = reapply_patch(patch['id'])
 
-            history = load_patch_history()
+
+            history = list(reversed(load_patch_history()))
 
 def draw_tree(stdscr, root, selected_idx, scroll_offset):
     stdscr.clear()
@@ -1292,6 +1295,16 @@ PATCH BEST PRACTICES:
 - Before writing patch, verify old_text appears EXACTLY ONCE by searching this document.
 - If old_text appears multiple times, make it more specific by including unique surrounding code.
 
+PATCH ERROR HANDLING:
+When patches fail, error messages are automatically copied to clipboard.tmp on user side.
+CRITICAL RULES for handling failed patches:
+- The error output you receive contains ONLY the patches that FAILED.
+- If a patch is NOT mentioned in the error output, it SUCCEEDED - do NOT recreate it.
+- ONLY fix the EXACT patches listed in the error output, nothing else.
+- Assume all other patches were applied successfully and leave them alone.
+- Common failures: text not found (already changed), text not unique (be more specific), whitespace issues.
+- To fix: Search this document for the current code, then create NEW patch with correct old_text.
+
 FORMAT FOR PATCHING FILES:
 ```bash
 cat <<'PATCH' | promptpack -p "relative/path" "Short description"
@@ -1325,7 +1338,8 @@ EOF
 SEARCH IN FILES (with filename wildcard pattern):
 ```bash
 # Search for text in files matching a pattern. Always searches recursively in all subdirectories.
-# Supports literal search, wildcards (*?), and regex (prefix with "regex:")
+# Supports literal search, wildcards (*?), and regex (prefix with "regex:").
+# REMEMBER: ALWAYS USE regex: WHEN SEARCHING WITH REGEX PATTERN!
 # Results show: relative/path:line_number: line_content
 
 # Literal search
@@ -1713,8 +1727,9 @@ if __name__ == "__main__":
 
     parser.add_argument('-p', '--patch', nargs=2, metavar=('FILE', 'DESC'),
                         help='Apply patch reading old/new text from stdin (format: OLD_TEXT\n---SPLIT---\nNEW_TEXT)')
-    parser.add_argument('-r', '--read', metavar='FILE',
-                        help='Read file and copy to clipboard')
+
+    parser.add_argument('-r', '--read', nargs='+', metavar='FILE',
+                        help='Read file(s) and copy to clipboard')
     parser.add_argument('-n', '--lines', nargs=2, metavar=('RANGE', 'FILE'),
                         help='Read specific lines (e.g., 10,20) and copy to clipboard')
 
@@ -1764,10 +1779,15 @@ if __name__ == "__main__":
         else:
             sys.exit(0)
 
+
     if args.read:
-        success, message = read_file_to_clipboard(args.read)
-        print(message)
-        sys.exit(0 if success else 1)
+        total_success = True
+        for filepath in args.read:
+            success, message = read_file_to_clipboard(filepath)
+            print(message)
+            if not success:
+                total_success = False
+        sys.exit(0 if total_success else 1)
 
     if args.lines:
         line_range, filepath = args.lines
