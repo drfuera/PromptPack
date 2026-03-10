@@ -1287,6 +1287,9 @@ RULES:
 - Old_text must be unique in the file (appear only once).
 - Use ---SPLIT--- to separate old and new text.
 - stdin handles all special characters safely (quotes, newlines, etc.).
+- NEVER use regex operators (\|, \s, \w, ^, ., *) in -s or -fs without the "regex:" prefix.
+  Wrong: promptpack -s "Foo\|Bar" 0,5 path
+  Right: promptpack -s "regex:Foo\|Bar" 0,5 path
 
 PATCH BEST PRACTICES:
 - Use MINIMUM old_text needed for unique match - don't include unnecessary context lines.
