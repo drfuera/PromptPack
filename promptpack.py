@@ -290,6 +290,28 @@ def read_lines_to_clipboard(line_range, filepath):
         error_msg = f"Error reading file: {e}"
         return False, error_msg
 
+
+
+# Unambiguous regex chars: escaped meta-chars, groups, quantifiers — never in literal searches
+_REGEX_HINT = re.compile(r'\\[|sSwWdDbBtnr]|\(\?|(?<![*?])[+{]')
+
+def _grep_to_python_regex(s):
+    """Convert grep-style regex escapes to Python: \| → |"""
+    return re.sub(r'\\\|', '|', s)
+
+def _resolve_search(s):
+    """Return (pattern, use_regex, auto_promoted).
+    - explicit 'regex:' prefix  → regex, not auto
+    - unambiguous regex escapes → regex, auto (silent)
+    - wildcards (* ?)           → glob, not regex
+    - else                      → literal
+    """
+    if s.startswith('regex:'):
+        return _grep_to_python_regex(s[6:]), True, False
+    if _REGEX_HINT.search(s):
+        return _grep_to_python_regex(s), True, True   # auto-promote silently
+    return s, False, False     # glob or literal, decided by caller
+
 def search_and_read_lines(search_string, offset_range, filepath):
     """Search for string and show lines with offset. Supports wildcards (* ?) and regex (prefix with 'regex:')"""
     filepath = Path(filepath)
@@ -298,30 +320,25 @@ def search_and_read_lines(search_string, offset_range, filepath):
         error_msg = f"File not found: {filepath}"
         return False, error_msg
 
-    # Check if regex mode
-    use_regex = search_string.startswith('regex:')
+
+    search_string, use_regex, auto_promoted = _resolve_search(search_string)
+    has_wildcards = not use_regex and ('*' in search_string or '?' in search_string)
+
     if use_regex:
-        search_string = search_string[6:]  # Remove 'regex:' prefix
         try:
             pattern = re.compile(search_string)
         except re.error as e:
             error_msg = f"❌ Invalid regex pattern: {e}"
             append_to_clipboard_tmp(error_msg)
             return False, error_msg
-
         def match_func(line):
             return pattern.search(line) is not None
+    elif has_wildcards:
+        def match_func(line):
+            return fnmatch.fnmatch(line, f"*{search_string}*")
     else:
-        # Check if wildcards are used
-        has_wildcards = '*' in search_string or '?' in search_string
-        if has_wildcards:
-            def match_func(line):
-                return fnmatch.fnmatch(line, f"*{search_string}*")
-
-        else:
-            # Literal search - accept any characters
-            def match_func(line):
-                return search_string in line
+        def match_func(line):
+            return search_string in line
 
     try:
         # Parse offset range (e.g., "10,30" means 10 lines before, 30 lines after)
@@ -337,8 +354,11 @@ def search_and_read_lines(search_string, offset_range, filepath):
             if match_func(line):
                 match_lines.append(i)
 
+
         if not match_lines:
             error_msg = f"String '{search_string}' not found in {filepath}"
+            if has_wildcards:
+                error_msg += f"\n⚠️  If this was a regex pattern, prefix with 'regex:' — e.g. regex:{search_string}"
             append_to_clipboard_tmp(error_msg)
             return False, error_msg
 
@@ -386,28 +406,24 @@ def file_search(search_term, pattern):
     import glob
 
 
-    # Check if regex mode
-    use_regex = search_term.startswith('regex:')
+
+    search_term, use_regex, auto_promoted = _resolve_search(search_term)
+    has_wildcards = not use_regex and ('*' in search_term or '?' in search_term)
+
     if use_regex:
-        search_term = search_term[6:]  # Remove 'regex:' prefix
         try:
             regex_pattern = re.compile(search_term)
         except re.error as e:
             error_msg = f"❌ Invalid regex pattern: {e}"
             return False, error_msg
-
         def match_func(line):
             return regex_pattern.search(line) is not None
+    elif has_wildcards:
+        def match_func(line):
+            return fnmatch.fnmatch(line, f"*{search_term}*")
     else:
-        # Check if wildcards are used
-        has_wildcards = '*' in search_term or '?' in search_term
-        if has_wildcards:
-            def match_func(line):
-                return fnmatch.fnmatch(line, f"*{search_term}*")
-        else:
-            # Literal search - accept any characters
-            def match_func(line):
-                return search_term in line
+        def match_func(line):
+            return search_term in line
 
     # Make pattern recursive if it doesn't already contain **
     if '**' not in pattern:
