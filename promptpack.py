@@ -1515,14 +1515,14 @@ If you for some reason later on find you need additional files from the project,
                     text=True,
                     check=True
                 )
+
                 if result.stdout:
                     out.write(f"\n### {rel_path}\n")
+                    KEEP_KINDS = {'class', 'method', 'interface', 'enum', 'struct'}
                     for line in result.stdout.splitlines():
                         parts = line.split(None, 4)
-                        if len(parts) >= 5:
-                            out.write(
-                                f"{parts[0]}\t{parts[1]}\t{parts[2]}\t{parts[4]}\n"
-                            )
+                        if len(parts) >= 4 and parts[1] in KEEP_KINDS:
+                            out.write(f"{parts[0]}\t{parts[1]}\n")
 
             except subprocess.CalledProcessError:
                 pass
