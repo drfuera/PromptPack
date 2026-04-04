@@ -542,11 +542,14 @@ def copy_clipboard_tmp_to_clipboard():
         print(f"Warning: Could not read clipboard.tmp: {e}")
         return False
 
+
 def copy_to_clipboard(text):
     """Copy text to clipboard"""
     try:
-
-        if shutil.which('xclip'):
+        if sys.platform == 'win32':
+            subprocess.run(['clip'], input=text.encode('utf-16-le'), check=True)
+            return True
+        elif shutil.which('xclip'):
             subprocess.run(['xclip', '-selection', 'clipboard'],
                          input=text.encode(), check=True)
             subprocess.run(['xclip', '-selection', 'primary'],
@@ -717,6 +720,75 @@ def apply_patch(filepath, description, old_text, new_text):
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             original_content = f.read()
+
+
+        WILDCARD = '***WILDCARD_PROMPTPACK***'
+
+        # Wildcard mode: split old_text on placeholder, match prefix + anything + suffix
+        if WILDCARD in old_text:
+            wc_parts = old_text.split(WILDCARD, 1)
+            wc_prefix, wc_suffix = wc_parts[0], wc_parts[1]
+
+            matches = []
+            search_start = 0
+            while True:
+                pre_pos = original_content.find(wc_prefix, search_start)
+                if pre_pos == -1:
+                    break
+                suf_pos = original_content.find(wc_suffix, pre_pos + len(wc_prefix))
+                if suf_pos == -1:
+                    break
+                matches.append((pre_pos, suf_pos + len(wc_suffix)))
+                search_start = pre_pos + 1
+
+            rel_path = filepath.relative_to(Path.cwd())
+            file_col = f"{rel_path}".ljust(40)
+            desc_col = f"{description}".ljust(50)
+
+            if len(matches) == 0:
+                error_msg = f"❌ {file_col} {desc_col} Wildcard prefix/suffix not found in file"
+                append_to_clipboard_tmp(error_msg)
+                return False, error_msg
+
+            if len(matches) > 1:
+                error_msg = f"❌ {file_col} {desc_col} Wildcard match not unique ({len(matches)} occurrences, must be 1)"
+                append_to_clipboard_tmp(error_msg)
+                return False, error_msg
+
+            wc_start, wc_end = matches[0]
+
+            if new_text.startswith('\n'):
+                new_text = new_text[1:]
+            new_content = original_content[:wc_start] + new_text + original_content[wc_end:]
+
+            validated_content, was_fixed, err = validate_and_fix_python_syntax(filepath, new_content)
+            if err:
+                full_error = f"❌ {file_col} {desc_col} {err}"
+                append_to_clipboard_tmp(full_error)
+                return False, full_error
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(validated_content)
+
+            history = load_patch_history()
+            patch_id = get_next_patch_id()
+            history.append({
+                'id': patch_id,
+                'timestamp': datetime.now().isoformat(),
+                'filepath': str(filepath),
+                'description': description,
+
+                'old_text': old_text,
+                'actual_old_text': original_content[wc_start:wc_end],
+                'new_text': new_text,
+                'applied': True
+            })
+            save_patch_history(history)
+
+            icon = "🔧" if was_fixed else "🧩"
+            indicator_str = " (wildcard match)" + (", indentation auto-fixed" if was_fixed else "")
+            success_msg = f"{icon} {file_col} {desc_col} Applied successfully{indicator_str}"
+            return True, success_msg
 
         # Try exact match first
         used_flexible_whitespace = False
@@ -905,7 +977,9 @@ def unapply_patch(patch_id):
         if patch['new_text'] not in content:
             return False, f"Cannot unpatch: new text not found in file"
 
-        content = content.replace(patch['new_text'], patch['old_text'])
+
+        restore_text = patch.get('actual_old_text', patch['old_text'])
+        content = content.replace(patch['new_text'], restore_text)
 
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
@@ -953,10 +1027,12 @@ def reapply_patch(patch_id):
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        if patch['old_text'] not in content:
+
+        restore_text = patch.get('actual_old_text', patch['old_text'])
+        if restore_text not in content:
             return False, f"Cannot reapply: old text not found in file"
 
-        content = content.replace(patch['old_text'], patch['new_text'])
+        content = content.replace(restore_text, patch['new_text'])
 
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
@@ -986,12 +1062,16 @@ def mark_from_promptpack(root, promptpack_paths):
             for child in node.children:
                 mark_node(child)
 
-            file_children = [child for child in node.children if not child.is_dir]
 
-            if file_children:
-                all_marked = all(child.marked for child in file_children)
-                if all_marked:
-                    node.marked = True
+            file_children = [child for child in node.children if not child.is_dir]
+            dir_children = [child for child in node.children if child.is_dir]
+
+            has_any_children = file_children or dir_children
+            all_files_marked = all(child.marked for child in file_children) if file_children else True
+            all_dirs_marked = all(child.marked for child in dir_children) if dir_children else True
+
+            if has_any_children and all_files_marked and all_dirs_marked:
+                node.marked = True
 
     mark_node(root)
 
@@ -1070,11 +1150,17 @@ def calculate_total_tokens(marked_files):
             pass
     return total_tokens
 
+
 def write_project_tree(out, marked_files):
-    """Write simple list of marked files with relative paths"""
+    """Write compact directory: file1, file2 grouped structure"""
+    from collections import defaultdict
+    groups = defaultdict(list)
     for file_path in marked_files:
         rel_path = file_path.relative_to(Path.cwd())
-        out.write(f"{rel_path}\n")
+        parent = str(rel_path.parent)
+        groups[parent].append(rel_path.name)
+    for directory, files in sorted(groups.items()):
+        out.write(f"{directory}: {', '.join(files)}\n")
 
 def show_patch_history(stdscr):
     """Show patch history and allow unpatch/repatch"""
@@ -1269,12 +1355,15 @@ For each change needed, use the promptpack patch command.
 THIS FILE INCLUDES THE FULL CONTENT OF:
 """)
 
+
         # Write the actual file list
-        for file_path in structure_files:
-            rel_path = file_path.relative_to(Path.cwd())
-            out.write(f"{rel_path}\n")
+        write_project_tree(out, structure_files)
+
 
         out.write("""
+⚠️ TO REQUEST ADDITIONAL FILES: Always use 'promptpack -r', NEVER 'promptpack -a'.
+promptpack -a is only run by the USER to rebuild the entire code.txt.
+
 BEFORE WE START:
 List #patch, #undo, #reset, #done and #outsource, #ask with a short description of what these commands do in a tidy table to show the user what commands are available.
 
@@ -1287,11 +1376,14 @@ IMPORTANT FOR AI:
 - Always put all promptpack commands in same bash as 'promptpack -c' depends on it.
 - Each command is run separately and we temporarily store the result of them.
 - By ensuring 'promptpack -c' is added to the end of each bash window using promptpack command, we make sure all result data is copied to clipboard and the tmp file is removed.
+- If you are Claude. Do not write #patch or new files in artifacts. Always write it in messages.
 
 PATCH ERROR HANDLING:
 When patches fail, error messages are automatically copied to clipboard.tmp.
 CRITICAL RULES for handling failed patches:
+
 - ONLY fix patches that failed - do NOT recreate successful patches.
+- If multiple patches run and only some fail, fix ONLY the failed ones. Assume all others applied successfully unless the user explicitly says otherwise.
 - ALWAYS search this document first - you have the full source code already.
 - Common failures: text not found (already changed), text not unique (be more specific), whitespace issues.
 - To fix: Search this document for the current code, then create NEW patch with correct old_text.
@@ -1314,32 +1406,21 @@ PATCH BEST PRACTICES:
 - Before writing patch, verify old_text appears EXACTLY ONCE by searching this document.
 - If old_text appears multiple times, make it more specific by including unique surrounding code.
 
-PATCH ERROR HANDLING:
-When patches fail, error messages are automatically copied to clipboard.tmp on user side.
-CRITICAL RULES for handling failed patches:
-- The error output you receive contains ONLY the patches that FAILED.
-- If a patch is NOT mentioned in the error output, it SUCCEEDED - do NOT recreate it.
-- ONLY fix the EXACT patches listed in the error output, nothing else.
-- Assume all other patches were applied successfully and leave them alone.
-- Common failures: text not found (already changed), text not unique (be more specific), whitespace issues.
-- To fix: Search this document for the current code, then create NEW patch with correct old_text.
+WILDCARD PATCHING:
+When old_text is MORE than a dozen lines, use ***WILDCARD_PROMPTPACK*** as a placeholder to skip the middle section!
+Only the old_text prefix and old_text suffix need to be unique together — the wildcard matches everything in between.
+- Use ONLY ONE ***WILDCARD_PROMPTPACK*** per patch block.
+- If the old_text prefix+suffix combination matches more than once, the patch is aborted with an error.
+- old_text prefix and old_text suffix should each be 2-5 unique lines to guarantee uniqueness.
 
-FORMAT FOR PATCHING FILES:
+Example:
 ```bash
 cat <<'PATCH' | promptpack -p "relative/path" "Short description"
-exact old text here
-with all whitespace preserved
+first unique lines of old_text (old_text prefix)
+***WILDCARD_PROMPTPACK***
+last unique lines of old_text (old_text suffix)
 ---SPLIT---
-exact new text here
-with all whitespace preserved
-PATCH
-
-cat <<'PATCH' | promptpack -p "relative/path" "Short description"
-exact old text here
-with all whitespace preserved
----SPLIT---
-exact new text here
-with all whitespace preserved
+new_text goes here in full
 PATCH
 
 promptpack -c
@@ -1521,7 +1602,9 @@ If you for some reason later on find you need additional files from the project,
 ## Project Structure
 """)
 
+
         write_project_tree(out, marked_files)
+        out.write("\n## Ctags Structure\n")
         for file_path in marked_files:
             try:
                 rel_path = file_path.relative_to(Path.cwd())
@@ -1532,13 +1615,23 @@ If you for some reason later on find you need additional files from the project,
                     check=True
                 )
 
+
                 if result.stdout:
-                    out.write(f"\n### {rel_path}\n")
-                    KEEP_KINDS = {'class', 'method', 'interface', 'enum', 'struct'}
+                    KEEP_KINDS = {'class', 'method', 'function', 'interface', 'enum', 'struct'}
+                    TYPE_KINDS = {'class', 'interface', 'enum', 'struct'}
+                    types = []
+                    methods = []
                     for line in result.stdout.splitlines():
                         parts = line.split(None, 4)
                         if len(parts) >= 4 and parts[1] in KEEP_KINDS:
-                            out.write(f"{parts[0]}\t{parts[1]}\n")
+                            if parts[1] in TYPE_KINDS:
+                                types.append(f"{parts[1]} {parts[0]}")
+                            else:
+                                methods.append(parts[0])
+                    if types or methods:
+                        type_str = ", ".join(types) if types else ""
+                        method_str = f" ({', '.join(methods)})" if methods else ""
+                        out.write(f"{file_path.name}: {type_str}{method_str}\n")
 
             except subprocess.CalledProcessError:
                 pass
@@ -1758,11 +1851,41 @@ if __name__ == "__main__":
     parser.add_argument('-fs', '--file-search', nargs=2, metavar=('STRING', 'PATTERN'),
                         help='Search for string in files matching wildcard pattern. Supports wildcards (*?) and regex (prefix with "regex:"). Examples: -fs "def main" "*.py" or -fs "regex:class\\s+\\w+" "*.py"')
 
+
     parser.add_argument('-t', '--tidy', nargs='+', metavar='PATTERN',
                         help='Remove whitespace-only lines and reduce multiple empty lines to max 1. Supports wildcards (*.py, world*.py, etc.)')
+    parser.add_argument('-tr', '--tidy-recursive', action='store_true',
+                        help='Recursively tidy all text files in current directory and subdirectories')
     parser.add_argument('-c', '--clear', action='store_true',
                         help='Copy clipboard.tmp to clipboard and remove the file')
     args = parser.parse_args()
+
+
+    if args.tidy_recursive:
+        import glob as _glob
+        patterns = []
+        for dirpath, dirnames, filenames in os.walk('.'):
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+            for filename in filenames:
+                filepath = os.path.join(dirpath, filename)
+                patterns.append(filepath)
+
+        success_count = 0
+        error_count = 0
+        for filepath in patterns:
+            if not is_text_file(Path(filepath)):
+                continue
+            success, message = tidy_file(filepath)
+            if success:
+                success_count += 1
+                if 'Removed 0' not in message:
+                    print(message)
+            else:
+                error_count += 1
+                print(message)
+
+        print(f"\n✅ Tidied {success_count} file(s)" + (f", ❌ {error_count} error(s)" if error_count else ""))
+        sys.exit(0 if error_count == 0 else 1)
 
     if args.tidy:
         success_messages = []
@@ -1845,7 +1968,9 @@ if __name__ == "__main__":
         # Split on ---SPLIT---
         parts = stdin_content.split('---SPLIT---')
         if len(parts) != 2:
-            print(f"❌ [{filepath}] '{description}': Error: stdin must contain OLD_TEXT---SPLIT---NEW_TEXT")
+            error_msg = f"❌ [{filepath}] '{description}': Error: stdin must contain OLD_TEXT---SPLIT---NEW_TEXT"
+            append_to_clipboard_tmp(error_msg)
+            print(error_msg)
             sys.exit(1)
 
         old_text = parts[0]
