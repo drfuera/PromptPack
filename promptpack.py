@@ -707,6 +707,7 @@ def apply_patch(filepath, description, old_text, new_text):
         append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
+
     words = description.split()
     if len(words) > 10:
 
@@ -714,6 +715,15 @@ def apply_patch(filepath, description, old_text, new_text):
         file_col = f"{rel_path}".ljust(40)
         desc_col = f"{description}".ljust(50)
         error_msg = f"❌ {file_col} {desc_col} Description too long ({len(words)} words, max 10)"
+        append_to_clipboard_tmp(error_msg)
+        return False, error_msg
+
+    WILDCARD = '***WILDCARD_PROMPTPACK***'
+    if WILDCARD in new_text:
+        rel_path = filepath.relative_to(Path.cwd())
+        file_col = f"{rel_path}".ljust(40)
+        desc_col = f"{description}".ljust(50)
+        error_msg = f"❌ {file_col} {desc_col} ***WILDCARD_PROMPTPACK*** is not allowed in new_text"
         append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
@@ -1407,11 +1417,13 @@ PATCH BEST PRACTICES:
 - If old_text appears multiple times, make it more specific by including unique surrounding code.
 
 WILDCARD PATCHING:
+REMEMBER THIS!
 When old_text is MORE than a dozen lines, use ***WILDCARD_PROMPTPACK*** as a placeholder to skip the middle section!
 Only the old_text prefix and old_text suffix need to be unique together — the wildcard matches everything in between.
 - Use ONLY ONE ***WILDCARD_PROMPTPACK*** per patch block.
 - If the old_text prefix+suffix combination matches more than once, the patch is aborted with an error.
 - old_text prefix and old_text suffix should each be 2-5 unique lines to guarantee uniqueness.
+- new_text is not capable of handling ***WILDCARD_PROMPTPACK***. Never use wildcard for new_text only for old_text.
 
 Example:
 ```bash
