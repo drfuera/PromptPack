@@ -249,12 +249,14 @@ def save_promptpack(marked_files):
     except Exception as e:
         pass
 
+
 def read_lines_to_clipboard(line_range, filepath):
     """Read specific lines and copy to clipboard"""
     filepath = Path(filepath)
 
     if not filepath.exists():
         error_msg = f"File not found: {filepath}"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
     try:
@@ -316,8 +318,10 @@ def search_and_read_lines(search_string, offset_range, filepath):
     """Search for string and show lines with offset. Supports wildcards (* ?) and regex (prefix with 'regex:')"""
     filepath = Path(filepath)
 
+
     if not filepath.exists():
         error_msg = f"File not found: {filepath}"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
 
@@ -494,12 +498,14 @@ def file_search(search_term, pattern):
     append_to_clipboard_tmp(output)
     return True, ""
 
+
 def read_file_to_clipboard(filepath):
     """Read file and copy to clipboard"""
     filepath = Path(filepath)
 
     if not filepath.exists():
         error_msg = f"File not found: {filepath}"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
     try:
@@ -1375,7 +1381,15 @@ THIS FILE INCLUDES THE FULL CONTENT OF:
 promptpack -a is only run by the USER to rebuild the entire code.txt.
 
 BEFORE WE START:
-List #patch, #undo, #reset, #done and #outsource, #ask with a short description of what these commands do in a tidy table to show the user what commands are available.
+List #patch, #undo, #reset, #done and #outsource, #ask, #dumb with a short description of what these commands do in a tidy table to show the user what commands are available.
+
+CONVERSATIONAL STYLE:
+Respond like smart caveman. All technical substance stay. Only fluff die.
+Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging. Fragments OK. Short synonyms (big not extensive, fix not "implement a solution for"). Technical terms exact. Code blocks unchanged. Errors quoted exact.
+Pattern: `[thing] [action] [reason]. [next step].`
+
+Not: "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by..."
+Yes: "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
 
 IMPORTANT FOR AI:
 - ALL files below contain COMPLETE and CURRENT source code.
@@ -1391,7 +1405,6 @@ IMPORTANT FOR AI:
 PATCH ERROR HANDLING:
 When patches fail, error messages are automatically copied to clipboard.tmp.
 CRITICAL RULES for handling failed patches:
-
 - ONLY fix patches that failed - do NOT recreate successful patches.
 - If multiple patches run and only some fail, fix ONLY the failed ones. Assume all others applied successfully unless the user explicitly says otherwise.
 - ALWAYS search this document first - you have the full source code already.
@@ -1540,6 +1553,9 @@ The user can then trigger, or you can suggest to the user to #outsource the curr
 If #outsource command is given you will write prompt for another AI, describing first what you are doing, what the problem is you are having and what result you are expecting to get.
 The prompt should ask for a well structured analysis of the code.
 End with a 'promptpack -a' command outside the AI prompt where are the files of interest are included, giving the AI all the code it needs to do the analysis.
+
+If user prompts you with the command #dumb, assume your last message was way to technical.
+Rewrite the last message in a manner that explains it in non technical terms that are easy to understand, imagine and visualize.
 
 FALLBACK:
 If you find yourself not being able to solve an issue, trying multiple times and coming to the conclusion that you're stuck do not write a patch to restore the code back to the state of code.txt.
