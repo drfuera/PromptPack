@@ -9,58 +9,74 @@ PromptPack helps you efficiently package source code for AI assistants (Claude, 
 ## Features
 
 ### 📦 Smart Code Packaging
+
 - **Interactive TUI**: Navigate your project tree with keyboard shortcuts
 - **Selective file marking**: Choose exactly which files to include
 - **Token counting**: Real-time token estimation for different AI models
 - **Persistent selection**: Your file selections are saved in `.promptpack`
 - **Two output modes**:
-  - `code.txt` - Full source code with AI instructions
-  - `ctags.txt` - Lightweight code structure overview
+  - `code.txt` — Full source code with embedded AI workflow instructions
+  - `ctags.txt` — Lightweight code structure overview via Universal Ctags
 
 ### 🔧 Advanced Patch Management
+
 - **Precise text replacement**: Apply patches with exact old→new text matching
-- **Smart matching algorithms**:
+- **Three-level smart matching**:
   - Exact matching (default)
-  - Flexible whitespace matching
-  - Tidy matching (immune to formatting variations)
-- **Python syntax validation**: Auto-fixes indentation errors
-- **Patch history**: Full undo/redo with F12 patch browser
-- **Error handling**: Failed patches are logged to `clipboard.tmp`
+  - Flexible whitespace matching (immune to space/tab variations)
+  - Tidy matching (normalizes blank lines and trailing whitespace before matching)
+- **Wildcard patching**: Skip large middle sections using `***WILDCARD_PROMPTPACK***`
+- **Python syntax validation**: Auto-detects and fixes indentation errors after patching
+- **Patch history**: Full undo/redo support with F12 patch browser
+- **Error logging**: Failed patches are written to `clipboard.tmp` for review
 
 ### 🔍 Code Navigation & Search
-- **File search**: Search across multiple files with wildcards or regex
-- **Line extraction**: Read specific line ranges from files
-- **Context search**: Find text and extract surrounding lines
-- **Clipboard integration**: All results copied to clipboard automatically
+
+- **File search (`-fs`)**: Search across multiple files with wildcards or regex, recursive by default
+- **Context search (`-s`)**: Find text and extract N lines before/after the match
+- **Line extraction (`-n`)**: Read specific line ranges from files
+- **Full file read (`-r`)**: Read complete files into the clipboard pipeline
+- **Clipboard pipeline**: All results accumulate in `clipboard.tmp`, copied at once with `-c`
+
+### 🐍 Python Dependency Tracking
+
+- **Import-aware marking (`i` key)**: Automatically mark a Python file and all its local dependencies
+- Recursively traces `import` and `from ... import` statements across the project tree
+- Toggle all deps on/off with a single keypress
 
 ### 🧹 Code Maintenance
-- **Tidy files**: Remove trailing whitespace and normalize empty lines
-- **Batch operations**: Process multiple files with wildcard patterns
+
+- **Tidy files (`-t`)**: Remove trailing whitespace and reduce consecutive empty lines to max 1
+- **Recursive tidy (`-tr`)**: Process all text files in the entire project tree at once
+- **Wildcard patterns**: Target specific file types (`*.py`, `src/*.js`, etc.)
 
 ---
 
 ## Installation
 
 ### Requirements
+
 - Python 3.6+
 - Universal Ctags (for ctags mode)
 - Clipboard utility: `xclip`, `xsel`, or `pbcopy`
+- `tiktoken` Python package
 
 ### Install Dependencies
 
-Ubuntu/Debian:
+**Ubuntu/Debian:**
 ```bash
 sudo apt install python3 python3-pip universal-ctags xclip
 pip3 install tiktoken
 ```
 
-macOS:
+**macOS:**
 ```bash
 brew install universal-ctags
 pip3 install tiktoken
 ```
 
 ### Install PromptPack
+
 ```bash
 # Clone the repository
 git clone https://github.com/drfuera/PromptPack.git
@@ -79,21 +95,24 @@ sudo ln -s "$(pwd)/promptpack.py" /usr/local/bin/promptpack
 
 ### Interactive Mode
 
-Launch interactive file browser:
+Launch the interactive file browser:
+
 ```bash
 promptpack
 ```
 
-Navigate with arrow keys, press Space to mark/unmark files, press F1 to generate code.txt, press F2 to generate ctags.txt, press F12 to view patch history, press q to quit.
+Navigate with arrow keys, mark files with `Space`, generate `code.txt` with `F1`, `ctags.txt` with `F2`, browse patch history with `F12`, quit with `q`.
 
 ### Quick Code Generation
 
-Generate code.txt from saved .promptpack selections:
+Generate `code.txt` from saved `.promptpack` selections:
+
 ```bash
 promptpack -q
 ```
 
-Add specific files and generate code.txt:
+Add specific files and generate `code.txt` in one step:
+
 ```bash
 promptpack -a file1.py file2.py src/module.py
 ```
@@ -108,52 +127,83 @@ promptpack -a file1.py file2.py src/module.py
 |-----|--------|
 | `↑↓` | Navigate files/folders |
 | `←→` | Collapse/expand folders |
-| `Space` | Mark/unmark file or folder |
-| `F1` | Generate code.txt |
-| `F2` | Generate ctags.txt |
-| `F12` | View patch history |
+| `Space` | Mark/unmark file or folder (marks all children) |
+| `i` | Mark file + all local Python import dependencies |
+| `F1` | Generate `code.txt` |
+| `F2` | Generate `ctags.txt` |
+| `F12` | Browse and toggle patch history |
 | `q` | Quit |
+
+---
 
 ### 📝 Patching Files
 
-Basic patch format:
+**Basic patch format:**
+
 ```bash
 cat <<'PATCH' | promptpack -p "path/to/file.py" "Short description"
 old text that exists in file
 exactly as it appears
 ---SPLIT---
 new text to replace it
-with correct formatting
-PATCH
-```
-
-Multiple patches in one command:
-```bash
-cat <<'PATCH' | promptpack -p "file1.py" "Fix bug in main"
-old_code_1
----SPLIT---
-new_code_1
 PATCH
 
-cat <<'PATCH' | promptpack -p "file2.py" "Add error handling"
-old_code_2
----SPLIT---
-new_code_2
-PATCH
-
-# Copy all results to clipboard
 promptpack -c
 ```
 
-Patch requirements:
-- Description: Max 10 words
-- `old_text`: Must match EXACTLY (including whitespace)
-- `old_text`: Must be UNIQUE in the file (appear only once)
-- Separator: `---SPLIT---` between old and new text
+**Multiple patches — always end batch with `promptpack -c`:**
+
+```bash
+cat <<'PATCH' | promptpack -p "file1.py" "Fix login bug"
+old_code_here
+---SPLIT---
+new_code_here
+PATCH
+
+cat <<'PATCH' | promptpack -p "file2.py" "Add error handling"
+other_old_code
+---SPLIT---
+other_new_code
+PATCH
+
+promptpack -c
+```
+
+**Patch requirements:**
+- Description: max 10 words
+- `old_text`: must match EXACTLY (including all whitespace and newlines)
+- `old_text`: must be UNIQUE in the file (appear only once)
+- Separator: `---SPLIT---` on its own line between old and new text
+
+---
+
+### 🧩 Wildcard Patching
+
+When `old_text` spans more than a dozen lines, use `***WILDCARD_PROMPTPACK***` as a placeholder to skip the middle section. Only the prefix and suffix need to be unique together.
+
+```bash
+cat <<'PATCH' | promptpack -p "path/to/file.py" "Replace large block"
+first 2-5 unique lines of old_text
+***WILDCARD_PROMPTPACK***
+last 2-5 unique lines of old_text
+---SPLIT---
+complete new replacement text goes here
+PATCH
+
+promptpack -c
+```
+
+**Wildcard rules:**
+- Use only **one** `***WILDCARD_PROMPTPACK***` per patch block
+- The prefix + suffix combination must match exactly once in the file
+- `***WILDCARD_PROMPTPACK***` is **not** valid in `new_text`, only in `old_text`
+
+---
 
 ### 🔍 Search Operations
 
-Search in files (recursive):
+**Search across files (recursive by default):**
+
 ```bash
 # Literal search
 promptpack -fs "def main" "*.py"
@@ -164,64 +214,71 @@ promptpack -fs "class *Player*" "game*.py"
 # Regex search
 promptpack -fs "regex:def\s+\w+\(" "*.py"
 
-# Copy results to clipboard
 promptpack -c
 ```
 
-Search and extract context:
+**Find text and extract surrounding context:**
+
 ```bash
-# Find text and grab 10 lines before, 20 lines after
+# Grab 10 lines before and 20 lines after the match
 promptpack -s "function_name" 10,20 path/to/file.py
 
-# Regex search with context
+# Regex match with context
 promptpack -s "regex:^class\s+\w+" 15,30 file.py
 
-# Copy results to clipboard
 promptpack -c
 ```
 
-Read specific lines:
-```bash
-# Read lines 100-150
-promptpack -n 100,150 path/to/file.py
+**Read specific line ranges:**
 
-# Batch read from multiple files
+```bash
+promptpack -n 100,150 path/to/file.py
 promptpack -n 10,20 file1.py
 promptpack -n 50,75 file2.py
 promptpack -c
 ```
 
-Read entire file:
+**Read entire file:**
+
 ```bash
 promptpack -r path/to/file.py
 promptpack -c
 ```
 
+> All `-r`, `-n`, `-s`, and `-fs` results accumulate in `clipboard.tmp`. Always end a batch with `promptpack -c` to copy everything to clipboard and clear the temp file.
+
+---
+
 ### 🧹 Code Maintenance
 
-Tidy files (remove trailing whitespace, normalize empty lines):
 ```bash
-# Single file
+# Tidy a single file
 promptpack -t file.py
 
-# Wildcard pattern
+# Tidy with wildcard pattern
 promptpack -t "*.py"
 promptpack -t "src/*.js"
 
-# Multiple patterns
+# Multiple patterns at once
 promptpack -t "*.py" "*.js" "*.cpp"
+
+# Recursively tidy ALL text files in entire project
+promptpack -tr
 ```
+
+Tidy removes trailing whitespace from every line and collapses consecutive empty lines down to a maximum of one.
+
+---
 
 ### 📋 Clipboard Management
 
-All read/search operations append to `clipboard.tmp`. Use `-c` to copy everything to clipboard and clear the temp file.
+All read and search operations append to `clipboard.tmp`. Use `-c` to copy all accumulated output to the system clipboard and delete the temp file.
 
-Example workflow:
 ```bash
 promptpack -r file1.py
 promptpack -n 100,150 file2.py
 promptpack -fs "def main" "*.py"
-promptpack -c  # Copy all to clipboard and remove temp file
+promptpack -c   # Copy all results to clipboard, remove clipboard.tmp
 ```
 
 ---
@@ -230,34 +287,34 @@ promptpack -c  # Copy all to clipboard and remove temp file
 
 ### The PromptPack Workflow
 
-1. Mark your files using interactive mode or `-a` flag
-2. Generate code.txt with AI instructions embedded
-3. Send to AI assistant (Claude, GPT-4, DeepSeek, etc.)
+1. Mark your files using interactive mode or `-a`
+2. Generate `code.txt` — AI instructions are embedded automatically
+3. Send to your AI assistant (Claude, GPT-4, DeepSeek, Grok, etc.)
 4. AI responds with patches in PromptPack format
-5. Apply patches automatically with bash script
-6. Review results in F12 patch history
-7. Undo/redo patches as needed
+5. Copy-paste and run the bash block to apply all patches at once
+6. Review results in the F12 patch history browser
+7. Undo/redo individual patches as needed
 
 ### Special AI Commands (Embedded in code.txt)
 
-When working with AI assistants, use these commands:
-
 | Command | Description |
 |---------|-------------|
-| `#patch` | Start patching mode - AI generates patch commands |
-| `#ask` | Question mode - AI answers without code changes |
-| `#undo` | Revert last applied patch |
-| `#reset` | Revert all patches, back to original code.txt |
-| `#outsource` | AI creates prompt for another AI to solve problem |
-| `#done` | Wrap up session with summary for next conversation |
+| `#patch` | Patching mode — AI generates patch commands |
+| `#ask` | Question mode — AI answers without writing code |
+| `#undo` | Revert the last applied patch |
+| `#reset` | Revert all patches back to the original `code.txt` state |
+| `#outsource` | AI writes a detailed prompt for another AI to solve the problem |
+| `#dumb` | Rewrite the last message in plain non-technical language |
+| `#done` | Wrap up session — AI generates a `PROMPTPACK Summary` for the next context window |
 
 ### Example AI Interaction
 
-User sends: #patch Add error handling to the login function
+User: `#patch Add error handling to the login function`
 
 AI responds with:
+
 ```bash
-cat <<'PATCH' | promptpack -p "auth/login.py" "Add error handling"
+cat <<'PATCH' | promptpack -p "auth/login.py" "Add error handling to login"
 def login(username, password):
     user = db.get_user(username)
     return user.verify_password(password)
@@ -276,7 +333,7 @@ PATCH
 promptpack -c
 ```
 
-User then runs the bash script to apply the patch.
+User runs the bash block — patch is applied and result is copied to clipboard.
 
 ---
 
@@ -284,16 +341,12 @@ User then runs the bash script to apply the patch.
 
 ### File Selection Storage
 
-File selections are stored in `~/.promptpack` (global) with absolute paths. This allows you to:
-- Work on multiple projects
-- Maintain separate file selections per project
-- Quickly regenerate code.txt with `promptpack -q`
+Selections are stored in `~/.promptpack` as absolute paths, scoped per project. This allows multiple projects to maintain independent selections on the same machine. Use `promptpack -q` to regenerate `code.txt` without opening the TUI.
 
 ### Patch History
 
-Patches are stored in `patch.json` in your project directory. Press `F12` in interactive mode to browse and toggle patches.
+Patches are stored in `patch.json` in the project directory. Open the browser with `F12` in interactive mode to inspect, unapply, or reapply any patch.
 
-Example patch.json structure:
 ```json
 [
   {
@@ -314,24 +367,23 @@ Example patch.json structure:
 
 ### Smart Patch Matching
 
-PromptPack uses three levels of text matching:
+PromptPack uses three escalating levels of text matching to handle real-world copy-paste variations:
 
-1. Exact match (fastest): Exact character-by-character matching
-2. Flexible whitespace: Matches with varying spaces/tabs/newlines
-3. Tidy matching: Normalizes formatting before matching
-
-This makes patches resilient to whitespace variations while maintaining precision.
+1. **Exact match** — character-for-character, fastest
+2. **Flexible whitespace** — matches when spacing/indentation differs
+3. **Tidy matching** — normalizes trailing whitespace and blank lines before comparing
 
 ### Python Syntax Auto-Fix
 
-For `.py` files, PromptPack automatically:
-- Validates syntax after patching
-- Fixes common indentation errors
-- Aborts patch if syntax errors remain
+For `.py` files, PromptPack automatically validates syntax after applying a patch. If an `IndentationError` is detected, it attempts to auto-correct indentation. If the error cannot be resolved, the patch is aborted and the file is left untouched.
+
+### Python Dependency Import Tracking
+
+Press `i` on any `.py` file in the TUI to automatically mark it along with all locally resolvable `import` dependencies. Pressing `i` again toggles all dependencies off. This ensures `code.txt` always contains the full dependency graph needed for AI context.
 
 ### Token Estimation
 
-Real-time token counting for AI model compatibility:
+Live token counts are shown in the status bar and printed after `code.txt` is generated:
 
 | Model | Max Tokens |
 |-------|-----------|
@@ -346,55 +398,65 @@ Real-time token counting for AI model compatibility:
 
 ## Troubleshooting
 
-### Common Issues
+### "Universal Ctags is not installed!"
 
-"Universal Ctags is not installed!"
 ```bash
-sudo apt install universal-ctags  # Ubuntu/Debian
-brew install universal-ctags       # macOS
+sudo apt install universal-ctags   # Ubuntu/Debian
+brew install universal-ctags        # macOS
 ```
 
-"Could not copy to clipboard"
+### "Could not copy to clipboard"
 
-Install: `xclip` (Linux), `xsel` (Linux), or `pbcopy` (macOS)
+Install a clipboard utility:
+
 ```bash
-sudo apt install xclip  # Ubuntu/Debian
+sudo apt install xclip   # Ubuntu/Debian
 ```
 
-Patch fails: "Old text not found"
-- Search `code.txt` for the current code
-- Copy EXACT text including whitespace
-- Use minimal unique text (1-3 lines)
-- Check for tab vs space differences
+Or use `xsel` (Linux) or `pbcopy` (macOS, built-in).
 
-Patch fails: "Old text appears N times"
+### Patch fails: "Old text not found"
+
+- Search `code.txt` for the current exact code
+- Ensure whitespace (tabs vs spaces) matches precisely
+- Use a minimal but unique 1–3 line `old_text`
+- If the block is large, use wildcard patching instead
+
+### Patch fails: "Old text appears N times"
+
 - Add more context to make `old_text` unique
-- Include surrounding lines or unique identifiers
+- Include unique surrounding lines or identifiers
 
-### Best Practices
+### Patch fails after regex in `-s` or `-fs`
 
-Patching:
-- Use MINIMUM old_text needed for unique match
-- Verify uniqueness by searching the file first
-- Keep descriptions under 10 words
-- Batch related patches in one bash script
+- Always prefix regex patterns with `regex:` — e.g. `regex:def\s+\w+\(`
+- Without the prefix, `\|`, `\s`, etc. are treated as literal characters
 
-File Selection:
-- Mark only files the AI needs to see
-- Use ctags.txt for quick project overview
-- Use code.txt for detailed work
-- Review token counts before sending to AI
+---
 
-Search:
-- Use wildcards for flexible matching: `*init*`
-- Use regex for complex patterns: `regex:^class\s+\w+`
-- Batch multiple searches before `-c` clipboard copy
+## Best Practices
+
+**Patching:**
+- Use the MINIMUM `old_text` needed for a unique match — shorter = more resilient
+- Verify uniqueness by searching the file or `code.txt` with Ctrl+F before writing the patch
+- For blocks longer than ~12 lines, use `***WILDCARD_PROMPTPACK***`
+- Always put all patches and `promptpack -c` in the same bash block
+
+**File Selection:**
+- Mark only what the AI actually needs
+- Use `ctags.txt` for an initial high-level overview
+- Use `i` (import deps) to pull in full dependency graphs for Python projects
+
+**Search:**
+- Batch as many `-r`, `-n`, `-s`, `-fs` calls as you know you need before running `-c`
+- Use `regex:` prefix explicitly for any regex patterns
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Please:
+Contributions are welcome!
+
 1. Fork the repository
 2. Create a feature branch
 3. Submit a pull request
@@ -403,7 +465,7 @@ Contributions are welcome! Please:
 
 ## License
 
-This project is open source. See LICENSE file for details.
+This project is open source. See the LICENSE file for details.
 
 ---
 
@@ -411,8 +473,8 @@ This project is open source. See LICENSE file for details.
 
 **By Andrej Fuera**
 
-*Romans 8:28*  
+*Romans 8:28*
 *"And we know that in all things God works for the good of those who love him, who have been called according to his purpose."*
 
-Special thanks to Jesus. Always Jesus. All the time. All the way.  
+Special thanks to Jesus. Always Jesus. All the time. All the way.
 God bless you!
