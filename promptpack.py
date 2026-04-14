@@ -271,11 +271,14 @@ def read_lines_to_clipboard(line_range, filepath):
             start = max(1, start - overflow)
             end = len(lines)
 
-        if start < 1 or start > end:
-            error_msg = f"Invalid range {start},{end} (file has {len(lines)} lines)"
-            return False, error_msg
+
 
         rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+
+        if start < 1 or start > end:
+            error_msg = f"❌ {rel_path}: Invalid range {start},{end} (file has {len(lines)} lines)"
+            append_to_clipboard_tmp(error_msg)
+            return False, error_msg
         header = f"\n------ {rel_path} ------\n"
         selected_with_numbers = header
         for i, line in enumerate(lines[start-1:end], start=start):
@@ -285,11 +288,15 @@ def read_lines_to_clipboard(line_range, filepath):
         append_to_clipboard_tmp(selected_with_numbers)
         return True, success_msg
 
+
+
     except ValueError:
         error_msg = f"Invalid range format: {line_range} (use: start,end)"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
     except Exception as e:
         error_msg = f"Error reading file: {e}"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
 
@@ -395,11 +402,15 @@ def search_and_read_lines(search_string, offset_range, filepath):
         append_to_clipboard_tmp(selected_with_numbers)
         return True, success_msg
 
+
     except ValueError:
         error_msg = f"Invalid offset format: {offset_range} (use: before,after, e.g., 10,30)"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
+
     except Exception as e:
         error_msg = f"Error searching file: {e}"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
 def file_search(search_term, pattern):
@@ -417,8 +428,10 @@ def file_search(search_term, pattern):
     if use_regex:
         try:
             regex_pattern = re.compile(search_term)
+
         except re.error as e:
             error_msg = f"❌ Invalid regex pattern: {e}"
+            append_to_clipboard_tmp(error_msg)
             return False, error_msg
         def match_func(line):
             return regex_pattern.search(line) is not None
@@ -441,8 +454,10 @@ def file_search(search_term, pattern):
     # Expand wildcard pattern recursively
     matches = glob.glob(pattern, recursive=True)
 
+
     if not matches:
         error_msg = f"❌ No files found matching pattern: {pattern}"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
     # Filter to only text files
@@ -452,8 +467,10 @@ def file_search(search_term, pattern):
         if filepath.is_file() and is_text_file(filepath):
             text_files.append(filepath)
 
+
     if not text_files:
         error_msg = f"❌ No text files found matching pattern: {pattern}"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
     # Search in each file
@@ -516,12 +533,14 @@ def read_file_to_clipboard(filepath):
         header = f"\n------ {rel_path} ------\n"
         content_with_header = header + content
 
+
         success_msg = f"✅ Read {len(content)} bytes from {rel_path}"
         append_to_clipboard_tmp(content_with_header)
         return True, success_msg
 
     except Exception as e:
         error_msg = f"Error reading file: {e}"
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
 def append_to_clipboard_tmp(message):
@@ -1934,19 +1953,32 @@ if __name__ == "__main__":
             print(f"\n❌ Failed to tidy {error_count} pattern(s)")
         sys.exit(0 if total_success else 1)
 
+
     if args.clear:
         if CLIPBOARD_TMP_FILE.exists():
-            if copy_clipboard_tmp_to_clipboard():
-                try:
+            try:
+                with open(CLIPBOARD_TMP_FILE, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                if content.strip():
+                    if copy_clipboard_tmp_to_clipboard():
+                        try:
+                            CLIPBOARD_TMP_FILE.unlink()
+                            sys.exit(0)
+                        except Exception as e:
+                            print(f"✅ File copied but could not remove: {e}")
+                            sys.exit(0)
+                    else:
+                        print("❌ Could not copy to clipboard (install xclip, xsel, or pbcopy)")
+                        sys.exit(1)
+                else:
+                    copy_to_clipboard("")
                     CLIPBOARD_TMP_FILE.unlink()
                     sys.exit(0)
-                except Exception as e:
-                    print(f"✅ File copied but could not remove: {e}")
-                    sys.exit(0)
-            else:
-                print("❌ Could not copy to clipboard (install xclip, xsel, or pbcopy)")
+            except Exception as e:
+                print(f"❌ Error reading clipboard.tmp: {e}")
                 sys.exit(1)
         else:
+            copy_to_clipboard("")
             sys.exit(0)
 
 
