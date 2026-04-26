@@ -337,7 +337,7 @@ def search_and_read_lines(search_string, offset_range, filepath):
 
     if use_regex:
         try:
-            pattern = re.compile(search_string)
+            pattern = re.compile(search_string, re.IGNORECASE)
         except re.error as e:
             error_msg = f"❌ Invalid regex pattern: {e}"
             append_to_clipboard_tmp(error_msg)
@@ -346,10 +346,10 @@ def search_and_read_lines(search_string, offset_range, filepath):
             return pattern.search(line) is not None
     elif has_wildcards:
         def match_func(line):
-            return fnmatch.fnmatch(line, f"*{search_string}*")
+            return fnmatch.fnmatch(line.lower(), f"*{search_string.lower()}*")
     else:
         def match_func(line):
-            return search_string in line
+            return search_string.lower() in line.lower()
 
     try:
         # Parse offset range (e.g., "10,30" means 10 lines before, 30 lines after)
@@ -427,7 +427,7 @@ def file_search(search_term, pattern):
 
     if use_regex:
         try:
-            regex_pattern = re.compile(search_term)
+            regex_pattern = re.compile(search_term, re.IGNORECASE)
 
         except re.error as e:
             error_msg = f"❌ Invalid regex pattern: {e}"
@@ -437,10 +437,10 @@ def file_search(search_term, pattern):
             return regex_pattern.search(line) is not None
     elif has_wildcards:
         def match_func(line):
-            return fnmatch.fnmatch(line, f"*{search_term}*")
+            return fnmatch.fnmatch(line.lower(), f"*{search_term.lower()}*")
     else:
         def match_func(line):
-            return search_term in line
+            return search_term.lower() in line.lower()
 
     # Make pattern recursive if it doesn't already contain **
     if '**' not in pattern:
@@ -921,6 +921,9 @@ def apply_patch(filepath, description, old_text, new_text):
         if used_tidy_matching:
             new_text = tidy_text(new_text)
 
+
+        if new_text.startswith('\n'):
+            new_text = new_text[1:]
         new_content = original_content.replace(actual_old_text, new_text)
 
         # Validate and auto-fix Python syntax
@@ -1378,232 +1381,134 @@ def create_code_file(root, structure_files=None):
 
     with open('code.txt', 'w', encoding='utf-8') as out:
 
-        out.write("""The following instructions apply if command #patch is given:
-Analyze the attached text document with collected source code which is only a compilation, not a target file.
-Interpretation of target file should be done via headers in the form ### ./relative/path.
+        out.write("""Code.txt = compilation only, not target. File headers = ### ./relative/path. Missing file needed? Ask first. Return changes as promptpack -p stdin patches (exact text replacement, one per change).
 
-If a file exists in the project structure below but is not included in this document, and you need to see it to complete the task, ask for that file before proceeding and it will be given to you.
-
-Return patch commands using the promptpack -p format with stdin that make exact text replacements in files.
-For each change needed, use the promptpack patch command.
-
-THIS FILE INCLUDES THE FULL CONTENT OF:
+FULL CONTENTS:
 """)
-
-
         # Write the actual file list
         write_project_tree(out, structure_files)
 
 
         out.write("""
-⚠️ TO REQUEST ADDITIONAL FILES: Always use 'promptpack -r', NEVER 'promptpack -a'.
-promptpack -a is only run by the USER to rebuild the entire code.txt.
+⚠️ Extra files: use -r, NEVER -a (-a = user-only, rebuilds code.txt).
 
-BEFORE WE START:
-List #patch, #undo, #reset, #done and #outsource, #ask, #dumb with a short description of what these commands do in a tidy table to show the user what commands are available.
+⚠️ Large replacements: ***WILDCARD_PROMPTPACK*** in old_text only — never in new_text.
 
-CONVERSATIONAL STYLE:
-Respond like smart caveman. All technical substance stay. Only fluff die.
-Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging. Fragments OK. Short synonyms (big not extensive, fix not "implement a solution for"). Technical terms exact. Code blocks unchanged. Errors quoted exact.
-Pattern: `[thing] [action] [reason]. [next step].`
+⚠️ IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT! ⚠️
+DO NOT FORGET: ***WILDCARD_PROMPTPACK*** Prefix+suffix each 2-5 unique lines.
+DO NOT FORGET: Always check if you already have file before asking for file!
 
-Not: "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by..."
-Yes: "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
+Always create all promptpack commands in the same bash-textbox.
 
-IMPORTANT FOR AI:
-- ALL files below contain COMPLETE and CURRENT source code.
-- NEVER ask for files you already have! ALWAYS search this document first using Ctrl+F or text search.
-- Before using promptpack -r/-n/-s, verify the file is NOT already in this document.
-- If you need to reference specific code, search within this document - the full source is here.
-- Only use promptpack -r/-n/-s if you need files NOT included in this code.txt or if they have substantially changed since code.txt was created.
-- Always put all promptpack commands in same bash as 'promptpack -c' depends on it.
-- Each command is run separately and we temporarily store the result of them.
-- By ensuring 'promptpack -c' is added to the end of each bash window using promptpack command, we make sure all result data is copied to clipboard and the tmp file is removed.
-- If you are Claude. Do not write #patch or new files in artifacts. Always write it in messages.
+START:
+List commands in table: #patch, #undo, #reset, #done, #outsource, #ask, #dumb, #ideas.
 
-PATCH ERROR HANDLING:
-When patches fail, error messages are automatically copied to clipboard.tmp.
-CRITICAL RULES for handling failed patches:
-- ONLY fix patches that failed - do NOT recreate successful patches.
-- If multiple patches run and only some fail, fix ONLY the failed ones. Assume all others applied successfully unless the user explicitly says otherwise.
-- ALWAYS search this document first - you have the full source code already.
-- Common failures: text not found (already changed), text not unique (be more specific), whitespace issues.
-- To fix: Search this document for the current code, then create NEW patch with correct old_text.
-- NEVER use -r/-n/-s for files you already have in this document - search here first!
-
-RULES:
-- Description must be max 10 words.
-- Old_text must match EXACTLY (including all whitespace and newlines).
-- Old_text must be unique in the file (appear only once).
-- Use ---SPLIT--- to separate old and new text.
-- stdin handles all special characters safely (quotes, newlines, etc.).
-- NEVER use regex operators (\|, \s, \w, ^, ., *) in -s or -fs without the "regex:" prefix.
-  Wrong: promptpack -s "Foo\|Bar" 0,5 path
-  Right: promptpack -s "regex:Foo\|Bar" 0,5 path
-
-PATCH BEST PRACTICES:
-- Use MINIMUM old_text needed for unique match - don't include unnecessary context lines.
-- Example: Instead of matching 10 lines, find 1-3 unique lines that only appear once.
-- Shorter old_text = less risk of whitespace/formatting mismatches.
-- Before writing patch, verify old_text appears EXACTLY ONCE by searching this document.
-- If old_text appears multiple times, make it more specific by including unique surrounding code.
-
-WILDCARD PATCHING:
-REMEMBER THIS!
-When old_text is MORE than a dozen lines, use ***WILDCARD_PROMPTPACK*** as a placeholder to skip the middle section!
-Only the old_text prefix and old_text suffix need to be unique together — the wildcard matches everything in between.
-- Use ONLY ONE ***WILDCARD_PROMPTPACK*** per patch block.
-- If the old_text prefix+suffix combination matches more than once, the patch is aborted with an error.
-- old_text prefix and old_text suffix should each be 2-5 unique lines to guarantee uniqueness.
-- new_text is not capable of handling ***WILDCARD_PROMPTPACK***. Never use wildcard for new_text only for old_text.
-
-Example:
-```bash
-cat <<'PATCH' | promptpack -p "relative/path" "Short description"
-first unique lines of old_text (old_text prefix)
-***WILDCARD_PROMPTPACK***
-last unique lines of old_text (old_text suffix)
----SPLIT---
-new_text goes here in full
-PATCH
-
-promptpack -c
-```
-
-CREATE NEW FILES WITH:
-```bash
-cat <<'EOF' > relative/path
-code goes here
-EOF
-
-[ $? -eq 0 ] && echo -e "✨ relative/path created successfully" || echo -e "❌ error creating relative/path"
-```
-
-SEARCH IN FILES (with filename wildcard pattern):
-```bash
-# Search for text in files matching a pattern. Always searches recursively in all subdirectories.
-# Supports literal search, wildcards (*?), and regex (prefix with "regex:").
-# REMEMBER: ALWAYS USE regex: WHEN SEARCHING WITH REGEX PATTERN!
-# Results show: relative/path:line_number: line_content
-
-# Literal search
-promptpack -fs "search_term" "*.py"
-promptpack -fs "class Player" "terrain*.py"
-
-# Wildcard search
-promptpack -fs "def *init*" "*.py"
-
-# Regex search
-promptpack -fs "regex:def\s+\w+\(" "*.py"
-promptpack -fs "regex:^class\s+Player" "terrain*.py"
-
-promptpack -c
-```
-
-VIEW COMPLETE FILES:
-```bash
-# This is the preferred way if you already have code.txt if you require any additional files that you already do not have.
-# code.txt always contains overhead, which you already have if you are reading this.
-promptpack -r relative/path
-promptpack -r relative/path
-promptpack -c
-```
-
-READ SPECIFIC LINES (with search):
-```bash
-# You should always ask for as many files/search strings as you know you need.
-# Supports literal search, wildcards (*?), and regex (prefix with "regex:")
-# Format: promptpack -s "search_pattern" before,after relative/path
-
-# Literal search - grab 10 lines before and 20 lines after match
-promptpack -s "_function_to_search_for" 10,20 relative/path
-
-# Wildcard search - find any init function
-promptpack -s "*init*" 5,15 relative/path
-
-# Regex search - find function definitions with parameters
-promptpack -s "regex:def\s+\w+\(" 10,20 relative/path
-
-# Regex search - find class declarations
-promptpack -s "regex:^class\s+\w+" 15,30 relative/path
-
-promptpack -c
-```
-
-READ SPECIFIC LINEES (with line numbers):
-```bash
-# You should always ask for as many files/lines as you know you need.
-promptpack -n 10,20 relative/path
-promptpack -n 190,250 relative/path
-promptpack -c
-```
-
-DIRECTORY CREATION:
-```bash
-mkdir -p relative/path/to/folder
-```
-
-REMOVAL OF FILES (soft-delete):
-```bash
-mv relative/path relative/path_deleted
-```
+STYLE: Smart caveman. Drop articles, fillers, pleasantries, hedging. Fragments OK. Short words. Technical terms exact. Code/errors unchanged.
+Pattern: [thing] [action] [reason]. [next step].
+Not: "Sure! I'd be happy to help..." → Yes: "Bug in auth. Fix:"
 
 IMPORTANT:
-- Use promptpack -p for all file changes
-- Description max 10 words
-- old_text must match EXACTLY (including all whitespace)
-- old_text must be unique (appear only once in file)
-- All patches in one bash/code block
-- Before asking for a file, always first check if you already got it with
-- When asking for lines from a files, batch as many as you know you need
-- ALL FILES YOU ASKED FOR WITH 'promptpack -a' ARE INCLUDED IN THIS FILE! YOU WILL NEVER ASK FOR -r, -n OR -s ON FILES YOU GOT ALREADY!
+Files here = complete & current. Search before asking.
+Use -r/-n/-s only for files NOT in this doc.
+All promptpack commands in same bash block. End every block with promptpack -c.
+Claude: never write #patch or files in artifacts — use messages.
 
-ADDITIONAL NOTES:
-If we use command #reset this implies that all changes hav been reverted back to the original state.
-You will disregard all changes made by patches created during the chat session and fall back and start working from the source found in code.txt again.
-If we use the command #undo this implies that the last patch was reverted and undone, falling back to code before the patch was applied.
+PATCH ERRORS:
+Failed patches → clipboard.tmp.
+Fix ONLY failed patches. Others = applied.
+Search doc first. Common causes: text not found, not unique, whitespace.
+Fix: find current code in doc → new patch with correct old_text.
+Never use -r/-n/-s for files already in doc.
 
-Sometimes the user might ask questions, and you might take the questions as an invitation to start creating new patches.
-If you see the command #ask in, the user is strictly asking questions and you are not expected to write any code at this moment.
+RULES:
+Description ≤10 words.
+old_text exact match, unique.
+Separator: ---SPLIT---.
+Regex in -s/-fs needs regex: prefix.
 
-GETTING STUCK:
-You might get stuck in reasoning/trying to find a solution to a problem.
-The user can then trigger, or you can suggest to the user to #outsource the current problem you are working on.
-If #outsource command is given you will write prompt for another AI, describing first what you are doing, what the problem is you are having and what result you are expecting to get.
-The prompt should ask for a well structured analysis of the code.
-End with a 'promptpack -a' command outside the AI prompt where are the files of interest are included, giving the AI all the code it needs to do the analysis.
+BEST PRACTICES: old_text = minimum unique match (1-3 lines).
+Shorter = safer.
+Verify appears exactly once before patching.
 
-If user prompts you with the command #dumb, assume your last message was way to technical.
-Rewrite the last message in a manner that explains it in non technical terms that are easy to understand, imagine and visualize.
+WILDCARD:
+old_text >12 lines → use ***WILDCARD_PROMPTPACK*** to skip middle.
+One wildcard per patch.
+Prefix+suffix each 2-5 unique lines.
+Never in new_text.
 
-FALLBACK:
-If you find yourself not being able to solve an issue, trying multiple times and coming to the conclusion that you're stuck do not write a patch to restore the code back to the state of code.txt.
-Instead let user know that you want to #reset the code and if there are any patches produced in the conversation that are of importance/use, number each patch and instruct user to apply them after resetting the code, for example;
-We're not getting anywhere, please #reset the code and apply #patch 2, 9, 12, 13 and 22. Let me know when you are ready and we can proceed.
+# PATCH
+```bash
+cat <<'PATCH' | promptpack -p "path" "description ≤10 words"
+prefix
+***WILDCARD_PROMPTPACK***
+suffix
+---SPLIT---
+new_text
+PATCH
+promptpack -c
+```
 
-ENDING:
-If the command #done is given it tells you that the conversation is very near its limit and context window is running out.
-We don't want to loose work so we need to wrap up!
-You need to summarize the whole conversation in the users language and title it "PROMPTPACK Summary":
-Start by describing what the project is, what the issue is and what goals its trying to achieve.
-If the current session was started with a "PROMPTPACK Summary" you need to first include the list of previously summarized conversations.
-Do not summarize the conversation history from previous summary, as this is already summarized.
-After adding the previous chat history, continue summarizing every message in this current conversation between you and the user.
-All summarized conversation history should be one unified log as if it were one long conversation.
-All summary should aid AI to not go in circles trying to find the goal. Example:
-User: Implement dynamic shadows in this OpenGL 3D engine.
-AI:   Used X and Y to do Z.
+# NEW FILE
+```bash
+cat <<'NEWFILE' | promptpack -f "path"
+code
+NEWFILE
+promptpack -c
+```
 
-User: Shadows are not visible.
-AI:   Bug: Z-coordinate was negative (`-(world.offset_y * sx)`), which created a double negation. Fixed by removing the minus sign.
+# SEARCH (recursive, literal/*?/regex:, output: path:line:content)
+```bash
+promptpack -fs "term" "*.cs"
+promptpack -fs "regex:pattern" "*.cs"
+promptpack -c
+```
 
-User: Still having same issue.
-AI:   Discovered that worldOffset was set in shadow_renderer.py but NEVER used in shadow_pass.vert. Added the offset to the vertex shader.
+# VIEW
+```bash
+promptpack -r path
+promptpack -c
+```
 
-Summarize what files you have been working with and their relative path.
-Create a promptpack -a command with all the files the next session needs to start with in order to pick up where we leave this conversation.
-End with notes and thoughts that are specially important to you for this session that can help the next conversation to get a head start.
-Never end summary thinking that issues are corrected. Always assume that when #done is called, we are only wrapping up in order to be able to continue in new context window.
+# READ BY SEARCH (before,after)
+```bash
+promptpack -s "term" 10,20 path
+promptpack -c
+```
+
+# READ BY LINES
+```bash
+promptpack -n 10,20 path
+promptpack -c
+```
+
+# MKDIR / DELETE
+```bash
+mkdir -p path
+mv path path_deleted
+```
+
+# EXEC (optional timeout seconds)
+```bash
+promptpack -e "cmd"
+promptpack -e 15 "cmd"
+promptpack -c
+```
+
+COMMANDS:
+#reset = all patches reverted, revert to code.txt.
+#undo = last patch reverted.
+#ask = questions only, no code.
+#dumb = rewrite last message in plain non-technical terms.
+#outsource = write prompt for another AI: what you're doing, problem, expected result, request structured analysis. End with promptpack -a of relevant files.
+#ideas = list alternative solutions/ideas for current problem, no code.
+#done = context limit reached. Write "PROMPTPACK Summary" in user's language:
+- Project description, issue, goals
+- If started from previous summary: include it unchanged, then continue log
+- Summarize full conversation as unified log (User/AI pairs, concise, no circles)
+- List files worked on with paths
+- End with promptpack -a of all files next session needs
+- Add important notes for next session
+- Never assume issues are fixed — always mid-work when #done is called
 
 ## Project Structure
 """)
@@ -1887,6 +1792,9 @@ if __name__ == "__main__":
     parser.add_argument('-p', '--patch', nargs=2, metavar=('FILE', 'DESC'),
                         help='Apply patch reading old/new text from stdin (format: OLD_TEXT\n---SPLIT---\nNEW_TEXT)')
 
+
+    parser.add_argument('-f', '--file', nargs=1, metavar='FILE',
+                        help='Create new file with content from stdin')
     parser.add_argument('-r', '--read', nargs='+', metavar='FILE',
                         help='Read file(s) and copy to clipboard')
     parser.add_argument('-n', '--lines', nargs=2, metavar=('RANGE', 'FILE'),
@@ -1899,10 +1807,13 @@ if __name__ == "__main__":
                         help='Search for string in files matching wildcard pattern. Supports wildcards (*?) and regex (prefix with "regex:"). Examples: -fs "def main" "*.py" or -fs "regex:class\\s+\\w+" "*.py"')
 
 
+
     parser.add_argument('-t', '--tidy', nargs='+', metavar='PATTERN',
                         help='Remove whitespace-only lines and reduce multiple empty lines to max 1. Supports wildcards (*.py, world*.py, etc.)')
     parser.add_argument('-tr', '--tidy-recursive', action='store_true',
                         help='Recursively tidy all text files in current directory and subdirectories')
+    parser.add_argument('-e', '--execute', nargs='+', metavar=('TIMEOUT', 'COMMAND'),
+                        help='Execute bash command with optional timeout (seconds). Output goes to clipboard.tmp. Examples: -e "echo hello" or -e 15 "python3 main.py"')
     parser.add_argument('-c', '--clear', action='store_true',
                         help='Copy clipboard.tmp to clipboard and remove the file')
     args = parser.parse_args()
@@ -2003,6 +1914,7 @@ if __name__ == "__main__":
         print(message)
         sys.exit(0 if success else 1)
 
+
     if args.file_search:
         search_term, pattern = args.file_search
         success, message = file_search(search_term, pattern)
@@ -2018,6 +1930,115 @@ if __name__ == "__main__":
             print(message)
 
         sys.exit(0 if success else 1)
+
+
+    if args.execute:
+        # Parse timeout and command
+        if len(args.execute) == 1:
+            timeout = None
+            command = args.execute[0]
+        elif len(args.execute) == 2:
+            try:
+                timeout = float(args.execute[0])
+                command = args.execute[1]
+            except ValueError:
+                error_msg = f"❌ Invalid timeout value: {args.execute[0]}"
+                append_to_clipboard_tmp(error_msg)
+                print(error_msg)
+                sys.exit(1)
+        else:
+            error_msg = "❌ Usage: -e [timeout] \"command\""
+            append_to_clipboard_tmp(error_msg)
+            print(error_msg)
+            sys.exit(1)
+
+
+
+        BLACKLIST = ['rm', 'rmdir', 'dd', 'chmod', ':(){', 'truncate', 'shred', 'mv']
+        for term in BLACKLIST:
+            if re.search(r'\b' + re.escape(term) + r'\b', command):
+                error_msg = f"❌ Blocked: command contains blacklisted term '{term}'"
+                append_to_clipboard_tmp(error_msg)
+                print(error_msg)
+                sys.exit(1)
+
+        header = f"------ OUTPUT FROM COMMAND: {command} ------"
+        append_to_clipboard_tmp(header)
+
+        import threading
+        import time
+
+        output_buffer = []
+        process = None
+        timed_out = False
+
+        def read_output(pipe, is_stderr=False):
+            for line in iter(pipe.readline, ''):
+                output_buffer.append(line)
+                append_to_clipboard_tmp(line.rstrip('\n'))
+            pipe.close()
+
+        try:
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+
+            stdout_thread = threading.Thread(target=read_output, args=(process.stdout, False))
+            stderr_thread = threading.Thread(target=read_output, args=(process.stderr, True))
+            stdout_thread.daemon = True
+            stderr_thread.daemon = True
+            stdout_thread.start()
+            stderr_thread.start()
+
+            if timeout:
+                process.wait(timeout=timeout)
+            else:
+                process.wait()
+
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+
+            if process.returncode != 0:
+                append_to_clipboard_tmp(f"\n[Command exited with code {process.returncode}]")
+            print(f"✅ Command executed, output in clipboard.tmp")
+
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.terminate()
+            time.sleep(0.1)
+            if process.poll() is None:
+                process.kill()
+            append_to_clipboard_tmp(f"\n[Command timed out after {timeout} seconds]")
+            print(f"⚠️ Command timed out, output captured up to timeout in clipboard.tmp")
+        except Exception as e:
+            error_msg = f"\n[Error executing command: {e}]"
+            append_to_clipboard_tmp(error_msg)
+            print(f"❌ Command failed: {e}")
+
+        sys.exit(0)
+
+
+    if args.file:
+        filepath = Path(args.file[0])
+        try:
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            content = sys.stdin.read()
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(content)
+            success_msg = f"✨ {filepath} created successfully"
+            append_to_clipboard_tmp(success_msg)
+            print(success_msg)
+            sys.exit(0)
+        except Exception as e:
+            error_msg = f"❌ Error creating {filepath}: {e}"
+            append_to_clipboard_tmp(error_msg)
+            print(error_msg)
+            sys.exit(1)
 
     if args.patch:
         filepath, description = args.patch
@@ -2038,7 +2059,9 @@ if __name__ == "__main__":
 
         success, message = apply_patch(filepath, description, old_text, new_text)
 
+
         if success:
+            append_to_clipboard_tmp(f"✅ {message}")
             print(f"✅ {message}")
             sys.exit(0)
         else:
