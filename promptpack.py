@@ -247,7 +247,7 @@ def save_promptpack(marked_files):
                 f.write(f"{path}\n")
 
     except Exception as e:
-        pass
+        append_to_clipboard_tmp(f"⚠️ Warning: Could not save .promptpack: {e}")
 
 
 def read_lines_to_clipboard(line_range, filepath):
@@ -267,8 +267,6 @@ def read_lines_to_clipboard(line_range, filepath):
 
         # Auto-adjust if end exceeds file length
         if end > len(lines):
-            overflow = end - len(lines)
-            start = max(1, start - overflow)
             end = len(lines)
 
 
@@ -513,7 +511,7 @@ def file_search(search_term, pattern):
             output += f"{result['file']}:{line_num}: {line_text}\n"
 
     append_to_clipboard_tmp(output)
-    return True, ""
+    return True, f"✅ Found {total_hits} match(es) in {len(results)} file(s)"
 
 
 def read_file_to_clipboard(filepath):
@@ -547,7 +545,7 @@ def append_to_clipboard_tmp(message):
     """Append message to clipboard.tmp"""
     try:
         with open(CLIPBOARD_TMP_FILE, 'a', encoding='utf-8') as f:
-            f.write(message + '\n')
+            f.write(message if message.endswith('\n') else message + '\n')
         return True
     except Exception as e:
         print(f"Warning: Could not write to clipboard.tmp: {e}")
@@ -757,8 +755,6 @@ def apply_patch(filepath, description, old_text, new_text):
             original_content = f.read()
 
 
-        WILDCARD = '***WILDCARD_PROMPTPACK***'
-
         # Wildcard mode: split old_text on placeholder, match prefix + anything + suffix
         if WILDCARD in old_text:
             wc_parts = old_text.split(WILDCARD, 1)
@@ -877,15 +873,24 @@ def apply_patch(filepath, description, old_text, new_text):
                             original_lines = original_content.splitlines(keepends=True)
                             tidy_to_original_map = []
                             tidy_idx = 0
+                            prev_was_empty = False
 
                             for orig_idx, line in enumerate(original_lines):
                                 stripped = line.rstrip()
-                                if stripped or tidy_idx >= len(tidied_lines) or tidied_lines[tidy_idx]:
+                                if stripped:
                                     tidy_to_original_map.append(orig_idx)
                                     tidy_idx += 1
+                                    prev_was_empty = False
+                                elif not prev_was_empty:
+                                    tidy_to_original_map.append(orig_idx)
+                                    tidy_idx += 1
+                                    prev_was_empty = True
 
                             start_orig = tidy_to_original_map[i] if i < len(tidy_to_original_map) else 0
-                            end_orig = tidy_to_original_map[min(i + len(search_lines), len(tidy_to_original_map) - 1)]
+                            if i + len(search_lines) < len(tidy_to_original_map):
+                                end_orig = tidy_to_original_map[i + len(search_lines)] - 1
+                            else:
+                                end_orig = len(original_lines) - 1
                             actual_old_text = ''.join(original_lines[start_orig:end_orig + 1])
                             break
                     else:
@@ -1012,29 +1017,37 @@ def unapply_patch(patch_id):
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        if patch['new_text'] not in content:
+        new_text_count = content.count(patch['new_text'])
+        if new_text_count == 0:
             return False, f"Cannot unpatch: new text not found in file"
-
+        if new_text_count > 1:
+            return False, f"Cannot unpatch: new_text not unique ({new_text_count} occurrences) — unapply in reverse order"
 
         restore_text = patch.get('actual_old_text', patch['old_text'])
-        content = content.replace(patch['new_text'], restore_text)
+        content = content.replace(patch['new_text'], restore_text, 1)
+
+        validated_content, was_fixed, error_msg = validate_and_fix_python_syntax(filepath, content)
+        if error_msg:
+            patch['unpatch_error'] = True
+            save_patch_history(history)
+            return False, f"Unapply would produce invalid syntax: {error_msg}"
 
         with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
+            f.write(validated_content)
 
         patch['applied'] = False
         patch['unpatch_error'] = False
         save_patch_history(history)
 
-        success_msg = f"Patch #{patch_id} unapplied successfully"
-        copy_to_clipboard(success_msg)
+        success_msg = f"Patch #{patch_id} unapplied successfully" + (" (indentation auto-fixed)" if was_fixed else "")
+        append_to_clipboard_tmp(success_msg)
         return True, success_msg
 
     except Exception as e:
         patch['unpatch_error'] = True
         save_patch_history(history)
         error_msg = f"Error: {e}"
-        copy_to_clipboard(error_msg)
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
 def reapply_patch(patch_id):
@@ -1067,27 +1080,36 @@ def reapply_patch(patch_id):
 
 
         restore_text = patch.get('actual_old_text', patch['old_text'])
-        if restore_text not in content:
+        restore_count = content.count(restore_text)
+        if restore_count == 0:
             return False, f"Cannot reapply: old text not found in file"
+        if restore_count > 1:
+            return False, f"Cannot reapply: old text not unique ({restore_count} occurrences) — reapply in order"
 
-        content = content.replace(restore_text, patch['new_text'])
+        content = content.replace(restore_text, patch['new_text'], 1)
+
+        validated_content, was_fixed, error_msg = validate_and_fix_python_syntax(filepath, content)
+        if error_msg:
+            patch['unpatch_error'] = True
+            save_patch_history(history)
+            return False, f"Reapply would produce invalid syntax: {error_msg}"
 
         with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
+            f.write(validated_content)
 
         patch['applied'] = True
         patch['unpatch_error'] = False
         save_patch_history(history)
 
-        success_msg = f"Patch #{patch_id} reapplied successfully"
-        copy_to_clipboard(success_msg)
+        success_msg = f"Patch #{patch_id} reapplied successfully" + (" (indentation auto-fixed)" if was_fixed else "")
+        append_to_clipboard_tmp(success_msg)
         return True, success_msg
 
     except Exception as e:
         patch['unpatch_error'] = True
         save_patch_history(history)
         error_msg = f"Error: {e}"
-        copy_to_clipboard(error_msg)
+        append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
 def mark_from_promptpack(root, promptpack_paths):
@@ -1292,7 +1314,7 @@ def show_patch_history(stdscr):
 
             history = list(reversed(load_patch_history()))
 
-def draw_tree(stdscr, root, selected_idx, scroll_offset):
+def draw_tree(stdscr, root, selected_idx, scroll_offset, total_tokens):
     stdscr.clear()
     height, width = stdscr.getmaxyx()
 
@@ -1355,8 +1377,6 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset):
             pass
 
     marked_files = get_marked_files(root)
-    total_tokens = calculate_total_tokens(marked_files)
-
     status = f"Marked: {len(marked_files)} files | Tokensize: {total_tokens:,} tokens"
     try:
         stdscr.addstr(height - 1, 0, status[:width-1], curses.A_REVERSE)
@@ -1671,33 +1691,6 @@ def get_dep_nodes(node, root, visited=None, module_map=None):
 
     return result
 
-def mark_with_deps(node, root, visited=None, module_map=None):
-    """Markera en fil och alla dess lokala Python-beroenden rekursivt"""
-    if visited is None:
-        visited = set()
-    if module_map is None:
-        module_map = get_all_py_files(root)
-
-    filepath = str(node.path.resolve())
-    if filepath in visited:
-        return 0
-    visited.add(filepath)
-
-    node.marked = True
-    count = 1
-
-    if node.path.suffix != '.py':
-        return count
-
-    imports = get_python_imports(node.path)
-    for module_name in imports:
-        if module_name in module_map:
-            dep_node = module_map[module_name]
-            if str(dep_node.path.resolve()) not in visited:
-                count += mark_with_deps(dep_node, root, visited, module_map)
-
-    return count
-
 def main(stdscr):
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -1714,6 +1707,8 @@ def main(stdscr):
 
     selected_idx = 0
     scroll_offset = 0
+    marked_files = get_marked_files(root)
+    cached_tokens = calculate_total_tokens(marked_files)
 
     while True:
         height, width = stdscr.getmaxyx()
@@ -1725,7 +1720,7 @@ def main(stdscr):
         elif selected_idx >= scroll_offset + display_height:
             scroll_offset = selected_idx - display_height + 1
 
-        draw_tree(stdscr, root, selected_idx, scroll_offset)
+        draw_tree(stdscr, root, selected_idx, scroll_offset, cached_tokens)
         key = stdscr.getch()
 
         if key == ord('q') or key == ord('Q'):
@@ -1769,6 +1764,7 @@ def main(stdscr):
                 node.toggle_mark()
                 marked_files = get_marked_files(root)
                 save_promptpack(marked_files)
+                cached_tokens = calculate_total_tokens(marked_files)
 
         elif key == ord('i') or key == ord('I'):
             if selected_idx < len(visible_nodes):
@@ -1781,6 +1777,7 @@ def main(stdscr):
                         n.marked = not all_marked
                     marked_files = get_marked_files(root)
                     save_promptpack(marked_files)
+                    cached_tokens = calculate_total_tokens(marked_files)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Interactive directory navigator')
@@ -1894,42 +1891,30 @@ if __name__ == "__main__":
 
 
     if args.read:
-        total_success = True
         for filepath in args.read:
             success, message = read_file_to_clipboard(filepath)
             print(message)
-            if not success:
-                total_success = False
-        sys.exit(0 if total_success else 1)
+        sys.exit(0)
 
     if args.lines:
         line_range, filepath = args.lines
         success, message = read_lines_to_clipboard(line_range, filepath)
         print(message)
-        sys.exit(0 if success else 1)
+        sys.exit(0)
 
     if args.search:
         search_string, offset_range, filepath = args.search
         success, message = search_and_read_lines(search_string, offset_range, filepath)
         print(message)
-        sys.exit(0 if success else 1)
+        sys.exit(0)
 
 
     if args.file_search:
         search_term, pattern = args.file_search
         success, message = file_search(search_term, pattern)
 
-        # Print results from clipboard.tmp if it exists
-        if success and CLIPBOARD_TMP_FILE.exists():
-            try:
-                with open(CLIPBOARD_TMP_FILE, 'r', encoding='utf-8') as f:
-                    print(f.read(), end='')
-            except:
-                pass
-        elif not success:
-            print(message)
-
-        sys.exit(0 if success else 1)
+        print(message)
+        sys.exit(0)
 
 
     if args.execute:
@@ -1971,11 +1956,13 @@ if __name__ == "__main__":
         output_buffer = []
         process = None
         timed_out = False
+        write_lock = threading.Lock()
 
         def read_output(pipe, is_stderr=False):
             for line in iter(pipe.readline, ''):
                 output_buffer.append(line)
-                append_to_clipboard_tmp(line.rstrip('\n'))
+                with write_lock:
+                    append_to_clipboard_tmp(line.rstrip('\n'))
             pipe.close()
 
         try:
@@ -2061,7 +2048,7 @@ if __name__ == "__main__":
 
 
         if success:
-            append_to_clipboard_tmp(f"✅ {message}")
+            append_to_clipboard_tmp(message)
             print(f"✅ {message}")
             sys.exit(0)
         else:
