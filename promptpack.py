@@ -732,14 +732,10 @@ def apply_patch(filepath, description, old_text, new_text):
 
 
     words = description.split()
+    desc_truncated = False
     if len(words) > 10:
-
-        rel_path = filepath.relative_to(Path.cwd())
-        file_col = f"{rel_path}".ljust(40)
-        desc_col = f"{description}".ljust(50)
-        error_msg = f"❌ {file_col} {desc_col} Description too long ({len(words)} words, max 10)"
-        append_to_clipboard_tmp(error_msg)
-        return False, error_msg
+        description = ' '.join(words[:10])
+        desc_truncated = True
 
     WILDCARD = '***WILDCARD_PROMPTPACK***'
     if WILDCARD in new_text:
@@ -817,7 +813,12 @@ def apply_patch(filepath, description, old_text, new_text):
             save_patch_history(history)
 
             icon = "🔧" if was_fixed else "🧩"
-            indicator_str = " (wildcard match)" + (", indentation auto-fixed" if was_fixed else "")
+            indicators_wc = ["wildcard match"]
+            if was_fixed:
+                indicators_wc.append("indentation auto-fixed")
+            if desc_truncated:
+                indicators_wc.append("description truncated to 10 words")
+            indicator_str = f" ({', '.join(indicators_wc)})"
             success_msg = f"{icon} {file_col} {desc_col} Applied successfully{indicator_str}"
             return True, success_msg
 
@@ -976,6 +977,8 @@ def apply_patch(filepath, description, old_text, new_text):
             indicators.append("tidy matching")
         if was_fixed:
             indicators.append("indentation auto-fixed")
+        if desc_truncated:
+            indicators.append("description truncated to 10 words")
 
         indicator_str = f" ({', '.join(indicators)})" if indicators else ""
         desc_col = f"{description}".ljust(50)
@@ -1432,6 +1435,7 @@ Files here = complete & current. Search before asking.
 Use -r/-n/-s only for files NOT in this doc.
 All promptpack commands in same bash block. End every block with promptpack -c.
 Claude: never write #patch or files in artifacts — use messages.
+Always batch promptpack commands, as many as possible.
 
 PATCH ERRORS:
 Failed patches → clipboard.tmp.
@@ -1566,6 +1570,12 @@ IMPORTANT:
 ALL FILES YOU ASK FOR WITH 'promptpack -a' WILL BE INCLUDED IN THE TXT FILE!
 YOU WILL NEVER ASK FOR -r, -n OR -s ON FILES YOU GOT ALREADY!
 
+INFORMATION:
+You will receive code.txt after giving the user your promptpack -a command.
+This file begins with exact instructions you must abide by using promptpack for the user, for patching, listing, searching files.
+Under the instructions you will find all the requested files concatenated.
+
+PROJECT:
 Here is the complete structure of the project and all the relevant files.
 Some files might not be included in the ctags list so you need to draw conclusions on what files do what based on their file names and what the user wants to achieve.
 If there are any files not listed in the ctags list but you suspect you also need them, please include them in the 'promptpack -a' command.
