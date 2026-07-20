@@ -20,6 +20,7 @@ import argparse
 import shutil
 import subprocess
 import json
+import hashlib
 from datetime import datetime
 
 import ast
@@ -184,51 +185,76 @@ def is_text_file(file_path):
     except:
         return False
 
+def compute_file_hash(filepath):
+    """SHA256 hash of file, read in 1MB chunks so huge files don't sit fully in memory."""
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
 def load_promptpack():
+    """Load cached entries for files under the current project.
+    Line format: HASH|TOKENS|ABSPATH. Old bare-path lines are still accepted,
+    with hash/tokens set to None so they get recomputed once."""
     if not PROMPTPACK_FILE.exists():
-        return set()
+        return {}
 
     try:
         cwd = Path.cwd().resolve()
-        paths = set()
+        entries = {}
 
         with open(PROMPTPACK_FILE, 'r', encoding='utf-8') as f:
             for line in f:
-                line = line.strip()
-                if not line:
+                line = line.rstrip('\n')
+                if not line.strip():
                     continue
 
-                path = Path(line)
-
-                if path.is_absolute():
-                    abs_path = path.resolve()
+                parts = line.split('|', 2)
+                if len(parts) == 3:
+                    file_hash, tokens_str, path_str = parts
+                    try:
+                        tokens = int(tokens_str)
+                    except ValueError:
+                        file_hash, tokens, path_str = None, None, line
                 else:
+                    file_hash, tokens, path_str = None, None, line
+
+                path = Path(path_str.strip())
+                if not path.is_absolute():
                     continue
+
+                abs_path = path.resolve()
 
                 try:
                     abs_path.relative_to(cwd)
                     if abs_path.exists():
-                        paths.add(abs_path)
+                        entries[abs_path] = {'hash': file_hash, 'tokens': tokens}
                 except (ValueError, OSError):
                     pass
 
-        return paths
+        return entries
     except:
-        return set()
+        return {}
 
 def save_promptpack(marked_files):
+    """Persist marked files with content-hash + token cache so unchanged
+    files never get re-tokenized. Returns total tokens for marked_files."""
     try:
         cwd = Path.cwd().resolve()
+        old_cache = load_promptpack()
 
-        existing_other_projects = set()
+        existing_other_projects = []
         if PROMPTPACK_FILE.exists():
             with open(PROMPTPACK_FILE, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
+                for raw_line in f:
+                    line = raw_line.rstrip('\n')
+                    if not line.strip():
                         continue
 
-                    path = Path(line)
+                    parts = line.split('|', 2)
+                    path_str = parts[2] if len(parts) == 3 else line
+                    path = Path(path_str.strip())
                     if not path.is_absolute():
                         continue
 
@@ -238,16 +264,37 @@ def save_promptpack(marked_files):
                         abs_path.relative_to(cwd)
                     except ValueError:
                         if abs_path.exists():
-                            existing_other_projects.add(str(abs_path))
+                            existing_other_projects.append(line)
 
-        all_paths = existing_other_projects | {str(f.resolve()) for f in marked_files}
+        total_tokens = 0
+        new_lines = []
+        for fp in marked_files:
+            resolved = fp.resolve()
+            try:
+                file_hash = compute_file_hash(resolved)
+                cached = old_cache.get(resolved)
+                if cached and cached['hash'] == file_hash and cached['tokens'] is not None:
+                    tokens = cached['tokens']
+                else:
+                    content = resolved.read_text(encoding='utf-8', errors='ignore')
+                    tokens = calculate_tokens(content)
+            except Exception:
+                file_hash, tokens = '', 0
+
+            total_tokens += tokens
+            new_lines.append(f"{file_hash}|{tokens}|{resolved}")
 
         with open(PROMPTPACK_FILE, 'w', encoding='utf-8') as f:
-            for path in sorted(all_paths):
-                f.write(f"{path}\n")
+            for line in sorted(existing_other_projects):
+                f.write(f"{line}\n")
+            for line in sorted(new_lines):
+                f.write(f"{line}\n")
+
+        return total_tokens
 
     except Exception as e:
         append_to_clipboard_tmp(f"⚠️ Warning: Could not save .promptpack: {e}")
+        return 0
 
 
 def read_lines_to_clipboard(line_range, filepath):
@@ -1203,15 +1250,9 @@ def get_marked_files(node, result=None):
     return result
 
 def calculate_total_tokens(marked_files):
-    total_tokens = 0
-    for file_path in marked_files:
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                total_tokens += calculate_tokens(content)
-        except:
-            pass
-    return total_tokens
+    """Delegates to save_promptpack, which hashes each file and reuses
+    cached tokens when the hash is unchanged (avoids re-tokenizing big files)."""
+    return save_promptpack(marked_files)
 
 
 def write_project_tree(out, marked_files):
@@ -1587,16 +1628,31 @@ If you for some reason later on find you need additional files from the project,
 
         write_project_tree(out, marked_files)
         out.write("\n## Ctags Structure\n")
+        CTAGS_MAX_BYTES = 2 * 1024 * 1024  # skip huge data files, ctags is for code symbols
+        CTAGS_TIMEOUT = 10
+
         for file_path in marked_files:
             try:
                 rel_path = file_path.relative_to(Path.cwd())
-                result = subprocess.run(
-                    ['ctags', '-x', str(rel_path)],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
 
+                try:
+                    if file_path.stat().st_size > CTAGS_MAX_BYTES:
+                        out.write(f"{file_path.name}: (skipped, >{CTAGS_MAX_BYTES // (1024*1024)}MB, likely data not code)\n")
+                        continue
+                except OSError:
+                    pass
+
+                try:
+                    result = subprocess.run(
+                        ['ctags', '-x', str(rel_path)],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=CTAGS_TIMEOUT
+                    )
+                except subprocess.TimeoutExpired:
+                    out.write(f"{file_path.name}: (skipped, ctags timed out after {CTAGS_TIMEOUT}s)\n")
+                    continue
 
                 if result.stdout:
                     KEEP_KINDS = {'class', 'method', 'function', 'interface', 'enum', 'struct'}
@@ -1773,7 +1829,6 @@ def main(stdscr):
                 node, _ = visible_nodes[selected_idx]
                 node.toggle_mark()
                 marked_files = get_marked_files(root)
-                save_promptpack(marked_files)
                 cached_tokens = calculate_total_tokens(marked_files)
 
         elif key == ord('i') or key == ord('I'):
@@ -1786,7 +1841,6 @@ def main(stdscr):
                     for n in dep_nodes:
                         n.marked = not all_marked
                     marked_files = get_marked_files(root)
-                    save_promptpack(marked_files)
                     cached_tokens = calculate_total_tokens(marked_files)
 
 if __name__ == "__main__":
@@ -2088,20 +2142,9 @@ if __name__ == "__main__":
             print("❌ No valid files to add!")
             sys.exit(1)
 
-        existing_paths = set()
-        if PROMPTPACK_FILE.exists():
-            with open(PROMPTPACK_FILE, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        path = Path(line)
-                        if path.exists():
-                            existing_paths.add(path.resolve())
-
-        all_paths = existing_paths | new_files
-        with open(PROMPTPACK_FILE, 'w', encoding='utf-8') as f:
-            for path in sorted(all_paths):
-                f.write(f"{path}\n")
+        old_cache = load_promptpack()
+        all_cwd_files = set(old_cache.keys()) | new_files
+        save_promptpack(all_cwd_files)
 
         print(f"✅ Added {len(new_files)} file(s) to .promptpack")
 
@@ -2118,9 +2161,9 @@ if __name__ == "__main__":
             print("❌ No valid files found!")
             sys.exit(1)
 
-        # Filter all_paths to only include files from current project
+        # Filter all_cwd_files to only include files from current project
         current_project_files = set()
-        for path in all_paths:
+        for path in all_cwd_files:
             try:
                 path.relative_to(cwd)
                 current_project_files.add(path)
