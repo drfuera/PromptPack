@@ -1365,7 +1365,7 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset, total_tokens):
     visible_nodes = flatten_visible_tree(root)
 
 
-    title = "↑↓: Navigate | ←→: Expand | Space: Mark | i: Import deps | F1: code | F2: ctags | F12: patches | q: Quit"
+    title = "↑↓: Navigate | ←→: Expand | Space: Mark | i: Import deps | F1: ctags | F12: patches | q: Quit"
     stdscr.addstr(0, 0, title.ljust(width-1)[:width-1], curses.A_REVERSE)
 
     display_height = height - 2
@@ -1429,37 +1429,11 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset, total_tokens):
 
     stdscr.refresh()
 
-def create_code_file(root, structure_files=None):
-    marked_files = get_marked_files(root)
-
-    if not marked_files:
-        return False
-
-    marked_files = sorted(marked_files, key=lambda x: str(x))
-
-    # Use all files from .promptpack for structure if provided
-    if structure_files is None:
-        structure_files = marked_files
-    else:
-        structure_files = sorted(structure_files, key=lambda x: str(x))
-
-    with open('code.txt', 'w', encoding='utf-8') as out:
-
-        out.write("""Code.txt = compilation only, not target. File headers = ### ./relative/path. Missing file needed? Ask first. Return changes as promptpack -p stdin patches (exact text replacement, one per change).
-
-FULL CONTENTS:
-""")
-        # Write the actual file list
-        write_project_tree(out, structure_files)
-
-
-        out.write("""
-⚠️ Extra files: use -r, NEVER -a (-a = user-only, rebuilds code.txt).
-
-⚠️ Large replacements: ***WILDCARD_PROMPTPACK*** in old_text only — never in new_text.
+PROMPTPACK_CORE_INSTRUCTIONS = """⚠️ Large replacements: """ + "***" + "WILDCARD_PROMPTPACK" + "***" + """ in old_text only
+— never in new_text.
 
 ⚠️ IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT! ⚠️
-DO NOT FORGET: ***WILDCARD_PROMPTPACK*** Prefix+suffix each 2-5 unique lines.
+DO NOT FORGET: """ + "***" + "WILDCARD_PROMPTPACK" + "***" + """ Prefix+suffix each 2-5 unique lines.
 DO NOT FORGET: Always check if you already have file before asking for file!
 
 Always create all promptpack commands in the same bash-textbox.
@@ -1488,7 +1462,7 @@ Never use -r/-n/-s for files already in doc.
 RULES:
 Description ≤10 words.
 old_text exact match, unique.
-Separator: ---SPLIT---.
+Separator: ---""" + "SPLIT" + """---.
 Regex in -s/-fs needs regex: prefix.
 
 BEST PRACTICES: old_text = minimum unique match (1-3 lines).
@@ -1496,7 +1470,7 @@ Shorter = safer.
 Verify appears exactly once before patching.
 
 WILDCARD:
-old_text >12 lines → use ***WILDCARD_PROMPTPACK*** to skip middle.
+old_text >12 lines → use """ + "***" + "WILDCARD_PROMPTPACK" + "***" + """ to skip middle.
 One wildcard per patch.
 Prefix+suffix each 2-5 unique lines.
 Never in new_text.
@@ -1505,9 +1479,9 @@ Never in new_text.
 ```bash
 cat <<'PATCH' | promptpack -p "path" "description ≤10 words"
 prefix
-***WILDCARD_PROMPTPACK***
+""" + "***" + "WILDCARD_PROMPTPACK" + "***" + """
 suffix
----SPLIT---
+---""" + "SPLIT" + """---
 new_text
 PATCH
 promptpack -c
@@ -1560,36 +1534,21 @@ promptpack -c
 ```
 
 COMMANDS:
-#reset = all patches reverted, revert to code.txt.
+#reset = all patches reverted, reverted to original state.
 #undo = last patch reverted.
 #ask = questions only, no code.
 #dumb = rewrite last message in plain non-technical terms.
-#outsource = write prompt for another AI: what you're doing, problem, expected result, request structured analysis. End with promptpack -a of relevant files.
+#outsource = write prompt for another AI: what you're doing, problem, expected result, request structured analysis. End with promptpack -r of relevant files.
 #ideas = list alternative solutions/ideas for current problem, no code.
 #done = context limit reached. Write "PROMPTPACK Summary" in user's language:
 - Project description, issue, goals
 - If started from previous summary: include it unchanged, then continue log
 - Summarize full conversation as unified log (User/AI pairs, concise, no circles)
 - List files worked on with paths
-- End with promptpack -a of all files next session needs
+- End with promptpack -r of all files next session needs
 - Add important notes for next session
 - Never assume issues are fixed — always mid-work when #done is called
-
-## Project Structure
-""")
-
-        write_project_tree(out, structure_files)
-        out.write("\n")
-        for file_path in marked_files:
-            rel_path = file_path.relative_to(Path.cwd())
-            out.write(f"\n### ./{rel_path}\n\n")
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    out.write(f.read())
-            except Exception as e:
-                out.write(f"# Error reading file: {e}\n")
-
-    return True
+"""
 
 def create_ctags_file(root):
     marked_files = get_marked_files(root)
@@ -1600,27 +1559,21 @@ def create_ctags_file(root):
     marked_files = sorted(marked_files, key=lambda x: str(x))
 
     with open('ctags.txt', 'w', encoding='utf-8') as out:
-        out.write("""These are all the files of the project listed with Universal Ctags.
+        out.write(PROMPTPACK_CORE_INSTRUCTIONS)
+        out.write("""
+These are all the files of the project listed with Universal Ctags.
 Understand the user request, what files are available and what they contain.
 Draw conclusions what you need from the project to achieve the users goals.
-Once you know what files you need, let the user prepare the package of files for you.
-```bash
-promptpack -a requiredfile.ext requiredfile2.ext path/requiredfile3.ext
-```
-IMPORTANT:
-ALL FILES YOU ASK FOR WITH 'promptpack -a' WILL BE INCLUDED IN THE TXT FILE!
-YOU WILL NEVER ASK FOR -r, -n OR -s ON FILES YOU GOT ALREADY!
+Instructions above already included here — go directly to 'promptpack -r path' for any file you need, no need to ask the user for anything first.
 
-INFORMATION:
-You will receive code.txt after giving the user your promptpack -a command.
-This file begins with exact instructions you must abide by using promptpack for the user, for patching, listing, searching files.
-Under the instructions you will find all the requested files concatenated.
+IMPORTANT:
+Files not read yet = unknown content, don't assume.
+You already have all promptpack instructions above (patch, search, view, etc.) from this file alone.
 
 PROJECT:
-Here is the complete structure of the project and all the relevant files.
+Here is the complete structure of the project and the ctags symbol list below.
 Some files might not be included in the ctags list so you need to draw conclusions on what files do what based on their file names and what the user wants to achieve.
-If there are any files not listed in the ctags list but you suspect you also need them, please include them in the 'promptpack -a' command.
-If you for some reason later on find you need additional files from the project, you can always ask the user for a new 'promptpack -a' with the additional files you require.
+Use 'promptpack -r path' whenever you need to read a file's full content — never wait for or ask for code.txt.
 
 ## Project Structure
 """)
@@ -1791,15 +1744,7 @@ def main(stdscr):
 
         if key == ord('q') or key == ord('Q'):
             return None
-        elif key == curses.KEY_F1:  # F1 för code.txt
-            marked_files = get_marked_files(root)
-            if marked_files:
-                save_promptpack(marked_files)
-                create_code_file(root)
-                return ('code', len(marked_files))
-            else:
-                return ('code', 0)
-        elif key == curses.KEY_F2:  # F2 för ctags.txt
+        elif key == curses.KEY_F1:  # F1 för ctags.txt
             marked_files = get_marked_files(root)
             if marked_files:
                 save_promptpack(marked_files)
@@ -1845,11 +1790,6 @@ def main(stdscr):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Interactive directory navigator')
-    parser.add_argument('-q', '--quick', action='store_true',
-                        help='Create code.txt directly from .promptpack without interactive mode')
-    parser.add_argument('-a', '--add', nargs='+', metavar='FILE',
-                        help='Add specified files to .promptpack and create code.txt')
-
     parser.add_argument('-p', '--patch', nargs=2, metavar=('FILE', 'DESC'),
                         help='Apply patch reading old/new text from stdin (format: OLD_TEXT\n---SPLIT---\nNEW_TEXT)')
 
@@ -1877,6 +1817,8 @@ if __name__ == "__main__":
                         help='Execute bash command with optional timeout (seconds). Output goes to clipboard.tmp. Examples: -e "echo hello" or -e 15 "python3 main.py"')
     parser.add_argument('-c', '--clear', action='store_true',
                         help='Copy clipboard.tmp to clipboard and remove the file')
+    parser.add_argument('-i', '--instructions', action='store_true',
+                        help='Export code.txt instructions section to promptpack_instructions.txt')
     args = parser.parse_args()
 
 
@@ -2119,176 +2061,53 @@ if __name__ == "__main__":
             print(f"❌ {message}")
             sys.exit(1)
 
+    if args.instructions:
+        try:
+            with open('promptpack_instructions.txt', 'w', encoding='utf-8') as out:
+                out.write(PROMPTPACK_CORE_INSTRUCTIONS)
+            print("✅ promptpack_instructions.txt created!")
+            sys.exit(0)
+        except Exception as e:
+            print(f"❌ Error creating promptpack_instructions.txt: {e}")
+            sys.exit(1)
+
     check_ctags()
 
-    if args.add:
-        cwd = Path.cwd().resolve()
-        new_files = set()
+    result = curses.wrapper(main)
 
-        for file_str in args.add:
-            file_path = Path(file_str).resolve()
-            if not file_path.exists():
-                print(f"❌ File not found: {file_str}")
-                continue
-            if not file_path.is_file():
-                print(f"❌ Not a file: {file_str}")
-                continue
-            if not is_text_file(file_path):
-                print(f"❌ Not a text file: {file_str}")
-                continue
-            new_files.add(file_path)
+    if result is not None:
+        file_type, file_count = result
 
-        if not new_files:
-            print("❌ No valid files to add!")
-            sys.exit(1)
-
-        old_cache = load_promptpack()
-        all_cwd_files = set(old_cache.keys()) | new_files
-        save_promptpack(all_cwd_files)
-
-        print(f"✅ Added {len(new_files)} file(s) to .promptpack")
-
-        root = build_tree(".", load_marks=False)
-        if not root:
-            print("❌ Could not read directory structure!")
-            sys.exit(1)
-
-        # Mark new files for content inclusion
-        mark_from_promptpack(root, new_files)
-        marked_files = get_marked_files(root)
-
-        if not marked_files:
-            print("❌ No valid files found!")
-            sys.exit(1)
-
-        # Filter all_cwd_files to only include files from current project
-        current_project_files = set()
-        for path in all_cwd_files:
+        if file_count == 0:
+            print("❌ No files marked!")
+        else:
+            filename = f"{file_type}.txt"
             try:
-                path.relative_to(cwd)
-                current_project_files.add(path)
-            except ValueError:
-                pass
+                with open(filename, 'r', encoding='utf-8') as f:
+                    content = f.read()
 
-        # Create code.txt with current_project_files in structure, but only marked_files content
-        create_code_file(root, current_project_files)
+                file_size = len(content)
+                total_tokens = calculate_tokens(content)
 
-        try:
-            with open('code.txt', 'r', encoding='utf-8') as f:
-                content = f.read()
-            total_tokens = calculate_tokens(content)
-            file_size = len(content)
+                print(f"✅ {filename} created!")
+                print(f"\nIncluded {file_count} files")
+                print(f"File size: {file_size:,} bytes")
+                print(f"Tokensize: {total_tokens:,} tokens")
+                print(f"\nModel capacity:")
 
-            print(f"✅ code.txt created!")
-            print(f"\nIncluded {len(marked_files)} files")
-            print(f"File size: {file_size:,} bytes")
-            print(f"Tokensize: {total_tokens:,} tokens")
-            print(f"\nModel capacity:")
+                models = {
+                    'DeepSeek': 128000,
+                    'Grok': 128000,
+                    'GPT-4': 32768,
+                    'GPT-5': 128000,
+                    'Claude': 200000,
+                    'Qwen': 128000
+                }
 
-            models = {
-                'DeepSeek': 128000,
-                'Grok': 128000,
-                'GPT-4': 32768,
-                'GPT-5': 128000,
-                'Claude': 200000,
-                'Qwen': 128000
-            }
+                for model, max_tokens in models.items():
+                    pct = (total_tokens / max_tokens) * 100
+                    status = '✅' if total_tokens <= max_tokens else '🔴'
+                    print(f"{status} {pct:5.1f}%\t{model}")
 
-            for model, max_tokens in models.items():
-                pct = (total_tokens / max_tokens) * 100
-                status = '✅' if total_tokens <= max_tokens else '🔴'
-                print(f"{status} {pct:5.1f}%\t{model}")
-
-        except Exception as e:
-            print(f"❌ Error reading code.txt: {e}")
-            sys.exit(1)
-
-    elif args.quick:
-        promptpack_paths = load_promptpack()
-
-        if not promptpack_paths:
-            print("❌ No files in .promptpack!")
-            sys.exit(1)
-
-        root = build_tree(".", load_marks=False)
-        if not root:
-            print("❌ Could not read directory structure!")
-            sys.exit(1)
-
-        mark_from_promptpack(root, promptpack_paths)
-
-        marked_files = get_marked_files(root)
-        if not marked_files:
-            print("❌ No valid files found from .promptpack!")
-            sys.exit(1)
-
-        create_code_file(root)
-
-        try:
-            with open('code.txt', 'r', encoding='utf-8') as f:
-                content = f.read()
-            total_tokens = calculate_tokens(content)
-            file_size = len(content)
-
-            print(f"✅ code.txt created!")
-            print(f"\nIncluded {len(marked_files)} files")
-            print(f"File size: {file_size:,} bytes")
-            print(f"Tokensize: {total_tokens:,} tokens")
-            print(f"\nModel capacity:")
-
-            models = {
-                'DeepSeek': 128000,
-                'Grok': 128000,
-                'GPT-4': 32768,
-                'GPT-5': 128000,
-                'Claude': 200000,
-                'Qwen': 128000
-            }
-
-            for model, max_tokens in models.items():
-                pct = (total_tokens / max_tokens) * 100
-                status = '✅' if total_tokens <= max_tokens else '🔴'
-                print(f"{status} {pct:5.1f}%\t{model}")
-
-        except Exception as e:
-            print(f"❌ Error reading code.txt: {e}")
-            sys.exit(1)
-    else:
-        result = curses.wrapper(main)
-
-        if result is not None:
-            file_type, file_count = result
-
-            if file_count == 0:
-                print("❌ No files marked!")
-            else:
-                filename = f"{file_type}.txt"
-                try:
-                    with open(filename, 'r', encoding='utf-8') as f:
-                        content = f.read()
-
-                    file_size = len(content)
-                    total_tokens = calculate_tokens(content)
-
-                    print(f"✅ {filename} created!")
-                    print(f"\nIncluded {file_count} files")
-                    print(f"File size: {file_size:,} bytes")
-                    print(f"Tokensize: {total_tokens:,} tokens")
-                    print(f"\nModel capacity:")
-
-                    models = {
-                        'DeepSeek': 128000,
-                        'Grok': 128000,
-                        'GPT-4': 32768,
-                        'GPT-5': 128000,
-                        'Claude': 200000,
-                        'Qwen': 128000
-                    }
-
-                    for model, max_tokens in models.items():
-                        pct = (total_tokens / max_tokens) * 100
-                        status = '✅' if total_tokens <= max_tokens else '🔴'
-                        print(f"{status} {pct:5.1f}%\t{model}")
-
-                except Exception as e:
-                    print(f"❌ Error reading {filename}: {e}")
+            except Exception as e:
+                print(f"❌ Error reading {filename}: {e}")
