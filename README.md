@@ -2,7 +2,7 @@
 
 **A powerful CLI tool for AI-assisted development workflows**
 
-PromptPack helps you efficiently package source code for AI assistants (Claude, GPT-4, DeepSeek, etc.) and manage AI-generated patches with precision. Built for developers who want to leverage AI coding assistance while maintaining full control over their codebase.
+PromptPack helps you package your codebase for AI assistants (Claude, GPT, DeepSeek, etc.) and apply AI-generated patches with precision. Built for developers who want AI coding assistance while keeping full control over their codebase.
 
 ---
 
@@ -13,10 +13,8 @@ PromptPack helps you efficiently package source code for AI assistants (Claude, 
 - **Interactive TUI**: Navigate your project tree with keyboard shortcuts
 - **Selective file marking**: Choose exactly which files to include
 - **Token counting**: Real-time token estimation for different AI models
-- **Persistent selection**: Your file selections are saved in `.promptpack`
-- **Two output modes**:
-  - `code.txt` — Full source code with embedded AI workflow instructions
-  - `ctags.txt` — Lightweight code structure overview via Universal Ctags
+- **Persistent selection**: File selections are saved in `.promptpack`
+- **`ctags.txt` output**: A lightweight structure overview (via Universal Ctags), with the full PromptPack AI-workflow instructions embedded at the top
 
 ### 🔧 Advanced Patch Management
 
@@ -27,7 +25,7 @@ PromptPack helps you efficiently package source code for AI assistants (Claude, 
   - Tidy matching (normalizes blank lines and trailing whitespace before matching)
 - **Wildcard patching**: Skip large middle sections using `***WILDCARD_PROMPTPACK***`
 - **Python syntax validation**: Auto-detects and fixes indentation errors after patching
-- **Patch history**: Full undo/redo support with F12 patch browser
+- **Patch history**: Full undo/redo support with an F12 patch browser
 - **Error logging**: Failed patches are written to `clipboard.tmp` for review
 
 ### 🔍 Code Navigation & Search
@@ -50,6 +48,10 @@ PromptPack helps you efficiently package source code for AI assistants (Claude, 
 - **Recursive tidy (`-tr`)**: Process all text files in the entire project tree at once
 - **Wildcard patterns**: Target specific file types (`*.py`, `src/*.js`, etc.)
 
+### 📄 Instruction Export
+
+- **`-i` flag**: Export the AI-workflow instructions (the same block embedded in `ctags.txt`) to a standalone `promptpack_instructions.txt` file — handy for pasting into a system prompt or sharing without a full project package
+
 ---
 
 ## Installation
@@ -57,7 +59,7 @@ PromptPack helps you efficiently package source code for AI assistants (Claude, 
 ### Requirements
 
 - Python 3.6+
-- Universal Ctags (for ctags mode)
+- Universal Ctags
 - Clipboard utility: `xclip`, `xsel`, or `pbcopy`
 - `tiktoken` Python package
 
@@ -101,21 +103,17 @@ Launch the interactive file browser:
 promptpack
 ```
 
-Navigate with arrow keys, mark files with `Space`, generate `code.txt` with `F1`, `ctags.txt` with `F2`, browse patch history with `F12`, quit with `q`.
+Navigate with arrow keys, mark files with `Space`, generate `ctags.txt` with `F1`, browse patch history with `F12`, quit with `q`.
 
-### Quick Code Generation
+### Export Instructions Only
 
-Generate `code.txt` from saved `.promptpack` selections:
-
-```bash
-promptpack -q
-```
-
-Add specific files and generate `code.txt` in one step:
+Export the AI-workflow instructions on their own, without packaging any files:
 
 ```bash
-promptpack -a file1.py file2.py src/module.py
+promptpack -i
 ```
+
+This writes `promptpack_instructions.txt` to the current directory.
 
 ---
 
@@ -129,8 +127,7 @@ promptpack -a file1.py file2.py src/module.py
 | `←→` | Collapse/expand folders |
 | `Space` | Mark/unmark file or folder (marks all children) |
 | `i` | Mark file + all local Python import dependencies |
-| `F1` | Generate `code.txt` |
-| `F2` | Generate `ctags.txt` |
+| `F1` | Generate `ctags.txt` |
 | `F12` | Browse and toggle patch history |
 | `q` | Quit |
 
@@ -287,24 +284,26 @@ promptpack -c   # Copy all results to clipboard, remove clipboard.tmp
 
 ### The PromptPack Workflow
 
-1. Mark your files using interactive mode or `-a`
-2. Generate `code.txt` — AI instructions are embedded automatically
-3. Send to your AI assistant (Claude, GPT-4, DeepSeek, Grok, etc.)
-4. AI responds with patches in PromptPack format
-5. Copy-paste and run the bash block to apply all patches at once
-6. Review results in the F12 patch history browser
-7. Undo/redo individual patches as needed
+1. Mark your files using interactive mode
+2. Generate `ctags.txt` (`F1`) — the AI instructions and project structure/symbol overview are embedded automatically
+3. Send `ctags.txt` to your AI assistant (Claude, GPT-4, DeepSeek, Grok, etc.)
+4. The AI already has the full instruction set from `ctags.txt` alone — it reads any file it needs directly with `promptpack -r path`, no separate packaging step required
+5. AI responds with patches in PromptPack format
+6. Copy-paste and run the bash block to apply all patches at once
+7. Review results in the F12 patch history browser
+8. Undo/redo individual patches as needed
 
-### Special AI Commands (Embedded in code.txt)
+### Special AI Commands (Embedded in ctags.txt)
 
 | Command | Description |
 |---------|-------------|
 | `#patch` | Patching mode — AI generates patch commands |
 | `#ask` | Question mode — AI answers without writing code |
 | `#undo` | Revert the last applied patch |
-| `#reset` | Revert all patches back to the original `code.txt` state |
-| `#outsource` | AI writes a detailed prompt for another AI to solve the problem |
+| `#reset` | Revert all patches, back to the original state |
+| `#outsource` | AI writes a detailed prompt for another AI to solve the problem, ending with the `promptpack -r` commands needed to gather relevant files |
 | `#dumb` | Rewrite the last message in plain non-technical language |
+| `#ideas` | List alternative solutions/ideas, no code |
 | `#done` | Wrap up session — AI generates a `PROMPTPACK Summary` for the next context window |
 
 ### Example AI Interaction
@@ -341,7 +340,7 @@ User runs the bash block — patch is applied and result is copied to clipboard.
 
 ### File Selection Storage
 
-Selections are stored in `~/.promptpack` as absolute paths, scoped per project. This allows multiple projects to maintain independent selections on the same machine. Use `promptpack -q` to regenerate `code.txt` without opening the TUI.
+Selections are stored in `~/.promptpack` as absolute paths, scoped per project. This allows multiple projects to maintain independent selections on the same machine.
 
 ### Patch History
 
@@ -379,11 +378,11 @@ For `.py` files, PromptPack automatically validates syntax after applying a patc
 
 ### Python Dependency Import Tracking
 
-Press `i` on any `.py` file in the TUI to automatically mark it along with all locally resolvable `import` dependencies. Pressing `i` again toggles all dependencies off. This ensures `code.txt` always contains the full dependency graph needed for AI context.
+Press `i` on any `.py` file in the TUI to automatically mark it along with all locally resolvable `import` dependencies. Pressing `i` again toggles all dependencies off. This ensures `ctags.txt` reflects the full dependency graph relevant to the AI's task.
 
 ### Token Estimation
 
-Live token counts are shown in the status bar and printed after `code.txt` is generated:
+Live token counts are shown in the status bar and printed after `ctags.txt` is generated:
 
 | Model | Max Tokens |
 |-------|-----------|
@@ -417,7 +416,7 @@ Or use `xsel` (Linux) or `pbcopy` (macOS, built-in).
 
 ### Patch fails: "Old text not found"
 
-- Search `code.txt` for the current exact code
+- Search `ctags.txt` (or the live file via `-r`) for the current exact code
 - Ensure whitespace (tabs vs spaces) matches precisely
 - Use a minimal but unique 1–3 line `old_text`
 - If the block is large, use wildcard patching instead
@@ -438,14 +437,15 @@ Or use `xsel` (Linux) or `pbcopy` (macOS, built-in).
 
 **Patching:**
 - Use the MINIMUM `old_text` needed for a unique match — shorter = more resilient
-- Verify uniqueness by searching the file or `code.txt` with Ctrl+F before writing the patch
+- Verify uniqueness by searching the file with `-fs` or Ctrl+F before writing the patch
 - For blocks longer than ~12 lines, use `***WILDCARD_PROMPTPACK***`
 - Always put all patches and `promptpack -c` in the same bash block
 
 **File Selection:**
 - Mark only what the AI actually needs
-- Use `ctags.txt` for an initial high-level overview
+- Use `ctags.txt` for a high-level overview plus the embedded AI instructions
 - Use `i` (import deps) to pull in full dependency graphs for Python projects
+- Let the AI use `-r` directly for any file it needs — no separate packaging step required
 
 **Search:**
 - Batch as many `-r`, `-n`, `-s`, `-fs` calls as you know you need before running `-c`
