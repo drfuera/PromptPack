@@ -28,6 +28,13 @@ PromptPack helps you package your codebase for AI assistants (Claude, GPT, DeepS
 - **Patch history**: Full undo/redo support with an F12 patch browser
 - **Error logging**: Failed patches are written to `clipboard.tmp` for review
 
+### 📊 Task Summaries & Work Log
+
+- **Summary history (`--summary`)**: Save a verbose, timestamped changelog entry to `summary.json` after each completed task — explains what changed and why, for future AI sessions or human reviewers
+- **Mark a summary reverted (`-us`)**: Flags a summary entry as `reverted` in `summary.json` — a historical annotation only. It never touches any patch or any code; undoing actual code changes is always done explicitly, one patch at a time, via `-u`
+- **Work log (`-w`)**: Combine `patch.json` + `summary.json` into a lightweight `work.txt` — a PATCH TOC (date, ID, file, description) up top, followed by the full chronological log (full summary text + compact one-line patch entries, no code embedded)
+- **Patch history lookup (`-ph`)**: Fetch full old/new code for one or more specific `PATCHID`s on demand — lets the AI use `work.txt`'s dates and descriptions to decide what's worth a closer look, without ever needing to read all of `patch.json` directly
+
 ### 🔍 Code Navigation & Search
 
 - **File search (`-fs`)**: Search across multiple files with wildcards or regex, recursive by default
@@ -48,6 +55,11 @@ PromptPack helps you package your codebase for AI assistants (Claude, GPT, DeepS
 - **Recursive tidy (`-tr`)**: Process all text files in the entire project tree at once
 - **Wildcard patterns**: Target specific file types (`*.py`, `src/*.js`, etc.)
 
+### 🖥️ Command Execution
+
+- **Run shell commands (`-e`)**: Execute a bash command (optionally with a timeout) with output captured live into `clipboard.tmp`
+- **Safety blacklist**: Destructive commands (`rm`, `rmdir`, `dd`, `chmod`, `mv`, `truncate`, `shred`, fork bombs) are blocked outright
+
 ### 📄 Instruction Export
 
 - **`-i` flag**: Export the AI-workflow instructions (the same block embedded in `ctags.txt`) to a standalone `promptpack_instructions.txt` file — handy for pasting into a system prompt or sharing without a full project package
@@ -66,20 +78,20 @@ PromptPack helps you package your codebase for AI assistants (Claude, GPT, DeepS
 ### Install Dependencies
 
 **Ubuntu/Debian:**
-```bash
+````bash
 sudo apt install python3 python3-pip universal-ctags xclip
 pip3 install tiktoken
-```
+````
 
 **macOS:**
-```bash
+````bash
 brew install universal-ctags
 pip3 install tiktoken
-```
+````
 
 ### Install PromptPack
 
-```bash
+````bash
 # Clone the repository
 git clone https://github.com/drfuera/PromptPack.git
 cd PromptPack
@@ -89,7 +101,7 @@ chmod +x promptpack.py
 
 # Optional: Add to PATH
 sudo ln -s "$(pwd)/promptpack.py" /usr/local/bin/promptpack
-```
+````
 
 ---
 
@@ -99,9 +111,9 @@ sudo ln -s "$(pwd)/promptpack.py" /usr/local/bin/promptpack
 
 Launch the interactive file browser:
 
-```bash
+````bash
 promptpack
-```
+````
 
 Navigate with arrow keys, mark files with `Space`, generate `ctags.txt` with `F1`, browse patch history with `F12`, quit with `q`.
 
@@ -109,9 +121,9 @@ Navigate with arrow keys, mark files with `Space`, generate `ctags.txt` with `F1
 
 Export the AI-workflow instructions on their own, without packaging any files:
 
-```bash
+````bash
 promptpack -i
-```
+````
 
 This writes `promptpack_instructions.txt` to the current directory.
 
@@ -137,7 +149,7 @@ This writes `promptpack_instructions.txt` to the current directory.
 
 **Basic patch format:**
 
-```bash
+````bash
 cat <<'PATCH' | promptpack -p "path/to/file.py" "Short description"
 old text that exists in file
 exactly as it appears
@@ -146,11 +158,11 @@ new text to replace it
 PATCH
 
 promptpack -c
-```
+````
 
 **Multiple patches — always end batch with `promptpack -c`:**
 
-```bash
+````bash
 cat <<'PATCH' | promptpack -p "file1.py" "Fix login bug"
 old_code_here
 ---SPLIT---
@@ -164,7 +176,7 @@ other_new_code
 PATCH
 
 promptpack -c
-```
+````
 
 **Patch requirements:**
 - Description: max 10 words
@@ -178,7 +190,7 @@ promptpack -c
 
 When `old_text` spans more than a dozen lines, use `***WILDCARD_PROMPTPACK***` as a placeholder to skip the middle section. Only the prefix and suffix need to be unique together.
 
-```bash
+````bash
 cat <<'PATCH' | promptpack -p "path/to/file.py" "Replace large block"
 first 2-5 unique lines of old_text
 ***WILDCARD_PROMPTPACK***
@@ -188,7 +200,7 @@ complete new replacement text goes here
 PATCH
 
 promptpack -c
-```
+````
 
 **Wildcard rules:**
 - Use only **one** `***WILDCARD_PROMPTPACK***` per patch block
@@ -197,11 +209,64 @@ promptpack -c
 
 ---
 
+### ↩️ Undoing and Redoing Patches
+
+**Undo a specific patch by its PATCHID:**
+
+````bash
+promptpack -u 12
+promptpack -c
+````
+
+If undo fails because the new text isn't unique, undo the more recent overlapping patches first (highest PATCHID down), then retry. Patches can also be toggled undo/redo from the `F12` browser in interactive mode.
+
+---
+
+### 📊 Working with Summaries & Work Log
+
+**Save a task summary (recommended at the end of every patch task):**
+
+````bash
+cat <<'SUMMARY' | promptpack --summary
+Explain what changed in each file and why, for a reader with zero context.
+SUMMARY
+promptpack -c
+````
+
+**Mark a summary as reverted (does NOT touch any patch or code):**
+
+````bash
+promptpack -us 4
+promptpack -c
+````
+
+This only flags the `summary.json` entry itself as historical/reverted. To actually undo code changes, find the relevant `PATCHID`s (via `-w`/`work.txt` or `-ph`) and undo each one explicitly with `-u`.
+
+**Build the combined work log:**
+
+````bash
+promptpack -w
+promptpack -c
+````
+
+Writes `work.txt`: a PATCH TOC (date, PATCHID, file, description) followed by the full chronological log — summaries in full, patches as compact one-liners. Safe to read in full even on a large project, since no code is embedded.
+
+**Fetch full code for specific patches:**
+
+````bash
+promptpack -ph 12 15 18
+promptpack -c
+````
+
+Returns the old/new code for just those PATCHIDs, identified from `work.txt`'s dates and descriptions — avoids ever needing to read all of `patch.json` directly.
+
+---
+
 ### 🔍 Search Operations
 
 **Search across files (recursive by default):**
 
-```bash
+````bash
 # Literal search
 promptpack -fs "def main" "*.py"
 
@@ -212,11 +277,11 @@ promptpack -fs "class *Player*" "game*.py"
 promptpack -fs "regex:def\s+\w+\(" "*.py"
 
 promptpack -c
-```
+````
 
 **Find text and extract surrounding context:**
 
-```bash
+````bash
 # Grab 10 lines before and 20 lines after the match
 promptpack -s "function_name" 10,20 path/to/file.py
 
@@ -224,31 +289,47 @@ promptpack -s "function_name" 10,20 path/to/file.py
 promptpack -s "regex:^class\s+\w+" 15,30 file.py
 
 promptpack -c
-```
+````
 
 **Read specific line ranges:**
 
-```bash
+````bash
 promptpack -n 100,150 path/to/file.py
 promptpack -n 10,20 file1.py
 promptpack -n 50,75 file2.py
 promptpack -c
-```
+````
 
 **Read entire file:**
 
-```bash
+````bash
 promptpack -r path/to/file.py
 promptpack -c
-```
+````
 
 > All `-r`, `-n`, `-s`, and `-fs` results accumulate in `clipboard.tmp`. Always end a batch with `promptpack -c` to copy everything to clipboard and clear the temp file.
 
 ---
 
+### 🖥️ Running Shell Commands
+
+````bash
+# No timeout
+promptpack -e "echo hello"
+
+# With a timeout (seconds)
+promptpack -e 15 "python3 main.py"
+
+promptpack -c
+````
+
+Output (stdout and stderr, streamed live) is appended to `clipboard.tmp`. Destructive commands (`rm`, `rmdir`, `dd`, `chmod`, `mv`, `truncate`, `shred`, fork bombs) are blocked outright and never run.
+
+---
+
 ### 🧹 Code Maintenance
 
-```bash
+````bash
 # Tidy a single file
 promptpack -t file.py
 
@@ -261,7 +342,7 @@ promptpack -t "*.py" "*.js" "*.cpp"
 
 # Recursively tidy ALL text files in entire project
 promptpack -tr
-```
+````
 
 Tidy removes trailing whitespace from every line and collapses consecutive empty lines down to a maximum of one.
 
@@ -269,14 +350,14 @@ Tidy removes trailing whitespace from every line and collapses consecutive empty
 
 ### 📋 Clipboard Management
 
-All read and search operations append to `clipboard.tmp`. Use `-c` to copy all accumulated output to the system clipboard and delete the temp file.
+All read, search, and execute operations append to `clipboard.tmp`. Use `-c` to copy all accumulated output to the system clipboard and delete the temp file.
 
-```bash
+````bash
 promptpack -r file1.py
 promptpack -n 100,150 file2.py
 promptpack -fs "def main" "*.py"
 promptpack -c   # Copy all results to clipboard, remove clipboard.tmp
-```
+````
 
 ---
 
@@ -288,10 +369,11 @@ promptpack -c   # Copy all results to clipboard, remove clipboard.tmp
 2. Generate `ctags.txt` (`F1`) — the AI instructions and project structure/symbol overview are embedded automatically
 3. Send `ctags.txt` to your AI assistant (Claude, GPT-4, DeepSeek, Grok, etc.)
 4. The AI already has the full instruction set from `ctags.txt` alone — it reads any file it needs directly with `promptpack -r path`, no separate packaging step required
-5. AI responds with patches in PromptPack format
-6. Copy-paste and run the bash block to apply all patches at once
+5. AI responds with patches in PromptPack format, ending the block with a `--summary` heredoc
+6. Copy-paste and run the bash block to apply all patches and save the summary at once
 7. Review results in the F12 patch history browser
-8. Undo/redo individual patches as needed
+8. Undo individual patches as needed with `-u <PATCHID>` — this is the only way code changes get reverted
+9. Run `-w` any time to rebuild `work.txt` — a full chronological changelog of the project, safe to read even on a large history; use `-ph <PATCHID...>` to pull full code for specific patches found there
 
 ### Special AI Commands (Embedded in ctags.txt)
 
@@ -304,6 +386,7 @@ promptpack -c   # Copy all results to clipboard, remove clipboard.tmp
 | `#outsource` | AI writes a detailed prompt for another AI to solve the problem, ending with the `promptpack -r` commands needed to gather relevant files |
 | `#dumb` | Rewrite the last message in plain non-technical language |
 | `#ideas` | List alternative solutions/ideas, no code |
+| `#name` | Suggest a short (3–8 word) internal codename for the current version/problem — for reference only, never written into code |
 | `#done` | Wrap up session — AI generates a `PROMPTPACK Summary` for the next context window |
 
 ### Example AI Interaction
@@ -312,7 +395,7 @@ User: `#patch Add error handling to the login function`
 
 AI responds with:
 
-```bash
+````bash
 cat <<'PATCH' | promptpack -p "auth/login.py" "Add error handling to login"
 def login(username, password):
     user = db.get_user(username)
@@ -329,10 +412,18 @@ def login(username, password):
         return False
 PATCH
 
-promptpack -c
-```
+cat <<'SUMMARY' | promptpack --summary
+Added error handling to login() in auth/login.py: wraps the database
+lookup and password check in a try/except, raises a clear error when the
+user isn't found, and logs any failure instead of letting it crash
+unhandled. This prevents unexpected exceptions from reaching callers and
+makes login failures easier to diagnose from the logs.
+SUMMARY
 
-User runs the bash block — patch is applied and result is copied to clipboard.
+promptpack -c
+````
+
+User runs the bash block — patch and summary are applied, and the result is copied to clipboard.
 
 ---
 
@@ -346,7 +437,7 @@ Selections are stored in `~/.promptpack` as absolute paths, scoped per project. 
 
 Patches are stored in `patch.json` in the project directory. Open the browser with `F12` in interactive mode to inspect, unapply, or reapply any patch.
 
-```json
+````json
 [
   {
     "id": 1,
@@ -358,7 +449,23 @@ Patches are stored in `patch.json` in the project directory. Open the browser wi
     "applied": true
   }
 ]
-```
+````
+
+### Summary History
+
+Task summaries are stored in `summary.json` in the project directory, written via `--summary` after each completed task.
+
+````json
+[
+  {
+    "id": 1,
+    "timestamp": "2025-01-25T10:35:00",
+    "text": "Added error handling to login() in auth/login.py..."
+  }
+]
+````
+
+`-us <SUMMARYID>` sets `"reverted": true` (plus a `reverted_at` timestamp) on the matching entry. This is a historical annotation only — it never deletes the entry and never touches `patch.json` or any file on disk. To undo the actual code changes a summary describes, undo each relevant `PATCHID` explicitly with `-u`.
 
 ---
 
@@ -380,6 +487,10 @@ For `.py` files, PromptPack automatically validates syntax after applying a patc
 
 Press `i` on any `.py` file in the TUI to automatically mark it along with all locally resolvable `import` dependencies. Pressing `i` again toggles all dependencies off. This ensures `ctags.txt` reflects the full dependency graph relevant to the AI's task.
 
+### Work Log & On-Demand Patch Detail
+
+As `patch.json` grows on a long-running project, reading it in full can eat a large chunk of an AI's context window. `-w` builds `work.txt` — a compact PATCH TOC plus a chronological log with full summary text but only one-line patch entries (date, ID, file, description; never code). The AI can then scan dates and descriptions to identify which specific patches are worth a closer look, and fetch just those via `-ph <PATCHID...>`, keeping context usage proportional to what's actually relevant.
+
 ### Token Estimation
 
 Live token counts are shown in the status bar and printed after `ctags.txt` is generated:
@@ -399,18 +510,18 @@ Live token counts are shown in the status bar and printed after `ctags.txt` is g
 
 ### "Universal Ctags is not installed!"
 
-```bash
+````bash
 sudo apt install universal-ctags   # Ubuntu/Debian
 brew install universal-ctags        # macOS
-```
+````
 
 ### "Could not copy to clipboard"
 
 Install a clipboard utility:
 
-```bash
+````bash
 sudo apt install xclip   # Ubuntu/Debian
-```
+````
 
 Or use `xsel` (Linux) or `pbcopy` (macOS, built-in).
 
@@ -450,6 +561,12 @@ Or use `xsel` (Linux) or `pbcopy` (macOS, built-in).
 **Search:**
 - Batch as many `-r`, `-n`, `-s`, `-fs` calls as you know you need before running `-c`
 - Use `regex:` prefix explicitly for any regex patterns
+
+**Summaries & Work Log:**
+- End every patch task with a `--summary` heredoc before the closing `-c` — skip it only when purely repairing a failed patch or running a plain `-u` undo
+- Write summary text for a reader with zero context: name every file touched and explain why, not just what
+- Remember `-us` only flags a summary's own record — it never undoes code. Use `-u <PATCHID>` for that, one patch at a time
+- Use `-w` to get oriented on a large project's history without pulling code into context, then `-ph <PATCHID...>` for the specific patches worth a closer look
 
 ---
 
