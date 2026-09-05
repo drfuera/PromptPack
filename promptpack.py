@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import json
 import hashlib
+import traceback
 from datetime import datetime
 
 import ast
@@ -29,6 +30,7 @@ import fnmatch
 
 PROMPTPACK_FILE = Path.home() / '.promptpack'
 PATCH_HISTORY_FILE = Path('patch.json')
+SUMMARY_HISTORY_FILE = Path('summary.json')
 CLIPBOARD_TMP_FILE = Path('clipboard.tmp')
 TEXT_CHECK_BYTES = 8192
 
@@ -598,6 +600,68 @@ def append_to_clipboard_tmp(message):
         print(f"Warning: Could not write to clipboard.tmp: {e}")
         return False
 
+def log_error_to_file(context, detail):
+    """Append a timestamped error entry to promptpack_error.log for debugging.
+    Never raises — logging must not itself break the calling operation."""
+    try:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open('promptpack_error.log', 'a', encoding='utf-8') as f:
+            f.write(f"[{timestamp}] {context}\n{detail}\n\n")
+    except Exception:
+        pass
+
+def load_summary_history():
+    """Load summary history from JSON"""
+    if not SUMMARY_HISTORY_FILE.exists():
+        return []
+    try:
+        with open(SUMMARY_HISTORY_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not load summary history: {e}")
+        return []
+
+def save_summary_history(history):
+    """Save summary history to JSON"""
+    try:
+        with open(SUMMARY_HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"Error saving summary history: {e}")
+        return False
+
+def get_next_summary_id():
+    """Get next available summary ID"""
+    history = load_summary_history()
+    if not history:
+        return 1
+    return max(s['id'] for s in history) + 1
+
+def append_to_summary_file(text):
+    """Save a timestamped summary entry to summary.json.
+    Returns: (success: bool, message: str)
+    """
+    try:
+        history = load_summary_history()
+
+        summary_id = get_next_summary_id()
+        timestamp = datetime.now().isoformat()
+        history.append({
+            'id': summary_id,
+            'timestamp': timestamp,
+            'text': text.strip()
+        })
+        save_summary_history(history)
+
+        success_msg = f"✅ Summary saved [SUMMARYID {summary_id}]"
+        append_to_clipboard_tmp(success_msg)
+        return True, success_msg
+    except Exception as e:
+        error_msg = f"❌ Error writing summary.json: {e}"
+        append_to_clipboard_tmp(error_msg)
+        return False, error_msg
+
 def copy_clipboard_tmp_to_clipboard():
     """Copy contents of clipboard.tmp to clipboard"""
     try:
@@ -763,6 +827,40 @@ def validate_and_fix_python_syntax(filepath, content):
     except Exception as e:
         return content, False, ""
 
+def _synced_new_text(new_content, validated_content, pos, new_text):
+    """After an indentation auto-fix, the text stored in patch history must
+    match what actually ends up on disk, or a later undo can't find it.
+    fix_indentation_errors only rewrites each line's leading whitespace and
+    never changes line count, so remap new_text's line range from
+    new_content to the corresponding lines in validated_content. Falls back
+    to the original new_text if the mapping can't be verified safely."""
+    try:
+        start_line = new_content.count('\n', 0, pos)
+        new_lines = new_content.splitlines(keepends=True)
+        fixed_lines = validated_content.splitlines(keepends=True)
+        if len(new_lines) != len(fixed_lines):
+            return new_text
+        span = new_text.splitlines(keepends=True)
+        n = len(span)
+        if ''.join(new_lines[start_line:start_line + n]) != new_text:
+            return new_text
+        return ''.join(fixed_lines[start_line:start_line + n])
+    except Exception:
+        return new_text
+
+def _delete_anchor(content, start, end, context_chars=60):
+    """For a deletion patch (new_text == ''), capture the text immediately
+    surrounding the removed span so a later unapply_patch call can locate
+    where to reinsert restore_text. Searching the file for an empty string
+    at undo time is useless: str.count('') matches at every position
+    (len(content)+1 'occurrences'), which is exactly what produced the
+    bogus 'not unique' errors for pure-deletion patches. Anchoring on real
+    neighboring text instead gives undo something concrete and normally
+    unique to search for."""
+    before = content[max(0, start - context_chars):start]
+    after = content[end:end + context_chars]
+    return before, after
+
 def apply_patch(filepath, description, old_text, new_text):
     """
     Apply a patch and save in history
@@ -833,6 +931,10 @@ def apply_patch(filepath, description, old_text, new_text):
 
             if new_text.startswith('\n'):
                 new_text = new_text[1:]
+            if new_text == '':
+                delete_anchor_before, delete_anchor_after = _delete_anchor(original_content, wc_start, wc_end)
+            else:
+                delete_anchor_before, delete_anchor_after = None, None
             new_content = original_content[:wc_start] + new_text + original_content[wc_end:]
 
             validated_content, was_fixed, err = validate_and_fix_python_syntax(filepath, new_content)
@@ -840,6 +942,9 @@ def apply_patch(filepath, description, old_text, new_text):
                 full_error = f"❌ {file_col} {desc_col} {err}"
                 append_to_clipboard_tmp(full_error)
                 return False, full_error
+
+            if was_fixed:
+                new_text = _synced_new_text(new_content, validated_content, wc_start, new_text)
 
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(validated_content)
@@ -855,6 +960,8 @@ def apply_patch(filepath, description, old_text, new_text):
                 'old_text': old_text,
                 'actual_old_text': original_content[wc_start:wc_end],
                 'new_text': new_text,
+                'delete_anchor_before': delete_anchor_before,
+                'delete_anchor_after': delete_anchor_after,
                 'applied': True
             })
             save_patch_history(history)
@@ -866,8 +973,16 @@ def apply_patch(filepath, description, old_text, new_text):
             if desc_truncated:
                 indicators_wc.append("description truncated to 10 words")
             indicator_str = f" ({', '.join(indicators_wc)})"
-            success_msg = f"{icon} {file_col} {desc_col} Applied successfully{indicator_str}"
+            success_msg = f"{icon} {file_col} {desc_col} Applied successfully{indicator_str} [PATCHID {patch_id}]"
             return True, success_msg
+
+        if old_text == '':
+            rel_path = filepath.relative_to(Path.cwd())
+            file_col = f"{rel_path}".ljust(40)
+            desc_col = f"{description}".ljust(50)
+            error_msg = f"❌ {file_col} {desc_col} old_text is empty — nothing to match (use NEW FILE for pure insertions)"
+            append_to_clipboard_tmp(error_msg)
+            return False, error_msg
 
         # Try exact match first
         used_flexible_whitespace = False
@@ -977,6 +1092,12 @@ def apply_patch(filepath, description, old_text, new_text):
 
         if new_text.startswith('\n'):
             new_text = new_text[1:]
+        if new_text == '':
+            _del_start = original_content.index(actual_old_text)
+            delete_anchor_before, delete_anchor_after = _delete_anchor(
+                original_content, _del_start, _del_start + len(actual_old_text))
+        else:
+            delete_anchor_before, delete_anchor_after = None, None
         new_content = original_content.replace(actual_old_text, new_text)
 
         # Validate and auto-fix Python syntax
@@ -992,6 +1113,9 @@ def apply_patch(filepath, description, old_text, new_text):
             append_to_clipboard_tmp(full_error)
             return False, full_error
 
+        if was_fixed:
+            new_text = _synced_new_text(new_content, validated_content, original_content.index(actual_old_text), new_text)
+
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(validated_content)
 
@@ -1005,6 +1129,8 @@ def apply_patch(filepath, description, old_text, new_text):
             'description': description,
             'old_text': old_text,
             'new_text': new_text,
+            'delete_anchor_before': delete_anchor_before,
+            'delete_anchor_after': delete_anchor_after,
             'applied': True
         }
 
@@ -1030,7 +1156,7 @@ def apply_patch(filepath, description, old_text, new_text):
         indicator_str = f" ({', '.join(indicators)})" if indicators else ""
         desc_col = f"{description}".ljust(50)
 
-        success_msg = f"{icon} {file_col} {desc_col} Applied successfully{indicator_str}"
+        success_msg = f"{icon} {file_col} {desc_col} Applied successfully{indicator_str} [PATCHID {patch_id}]"
         return True, success_msg
 
     except Exception as e:
@@ -1053,34 +1179,81 @@ def unapply_patch(patch_id):
             break
 
     if not patch:
-        return False, f"Patch #{patch_id} not found"
+        error_msg = f"Patch #{patch_id} not found"
+        append_to_clipboard_tmp(error_msg)
+        log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+        return False, error_msg
 
     if not patch['applied']:
-        return False, f"Patch #{patch_id} is already unapplied"
+        error_msg = f"Patch #{patch_id} is already unapplied"
+        append_to_clipboard_tmp(error_msg)
+        log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+        return False, error_msg
 
     filepath = Path(patch['filepath'])
     if not filepath.exists():
         rel_path = Path(patch['filepath']).relative_to(Path.cwd())
-        return False, f"File not found: {rel_path}"
+        error_msg = f"File not found: {rel_path}"
+        append_to_clipboard_tmp(error_msg)
+        log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+        return False, error_msg
 
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        new_text_count = content.count(patch['new_text'])
-        if new_text_count == 0:
-            return False, f"Cannot unpatch: new text not found in file"
-        if new_text_count > 1:
-            return False, f"Cannot unpatch: new_text not unique ({new_text_count} occurrences) — unapply in reverse order"
+        if patch['new_text'] == '':
+            if 'delete_anchor_before' not in patch:
+                error_msg = "Cannot unpatch: this deletion predates anchor tracking, no safe location to restore text"
+                append_to_clipboard_tmp(error_msg)
+                log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+                return False, error_msg
+            anchor_before = patch['delete_anchor_before'] or ''
+            anchor_after = patch['delete_anchor_after'] or ''
+            anchor = anchor_before + anchor_after
+            if not anchor:
+                error_msg = "Cannot unpatch: deletion has no surrounding context to anchor to"
+                append_to_clipboard_tmp(error_msg)
+                log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+                return False, error_msg
+            anchor_count = content.count(anchor)
+            if anchor_count == 0:
+                error_msg = "Cannot unpatch: surrounding context of deletion not found in file"
+                append_to_clipboard_tmp(error_msg)
+                log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+                return False, error_msg
+            if anchor_count > 1:
+                error_msg = f"Cannot unpatch: surrounding context not unique ({anchor_count} occurrences) — unapply in reverse order"
+                append_to_clipboard_tmp(error_msg)
+                log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+                return False, error_msg
+            restore_text = patch.get('actual_old_text', patch['old_text'])
+            insert_at = content.index(anchor) + len(anchor_before)
+            content = content[:insert_at] + restore_text + content[insert_at:]
+        else:
+            new_text_count = content.count(patch['new_text'])
+            if new_text_count == 0:
+                error_msg = f"Cannot unpatch: new text not found in file"
+                append_to_clipboard_tmp(error_msg)
+                log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+                return False, error_msg
+            if new_text_count > 1:
+                error_msg = f"Cannot unpatch: new_text not unique ({new_text_count} occurrences) — unapply in reverse order"
+                append_to_clipboard_tmp(error_msg)
+                log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+                return False, error_msg
 
-        restore_text = patch.get('actual_old_text', patch['old_text'])
-        content = content.replace(patch['new_text'], restore_text, 1)
+            restore_text = patch.get('actual_old_text', patch['old_text'])
+            content = content.replace(patch['new_text'], restore_text, 1)
 
-        validated_content, was_fixed, error_msg = validate_and_fix_python_syntax(filepath, content)
-        if error_msg:
+        validated_content, was_fixed, syntax_err = validate_and_fix_python_syntax(filepath, content)
+        if syntax_err:
             patch['unpatch_error'] = True
             save_patch_history(history)
-            return False, f"Unapply would produce invalid syntax: {error_msg}"
+            error_msg = f"Unapply would produce invalid syntax: {syntax_err}"
+            append_to_clipboard_tmp(error_msg)
+            log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+            return False, error_msg
 
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(validated_content)
@@ -1098,8 +1271,38 @@ def unapply_patch(patch_id):
         save_patch_history(history)
         error_msg = f"Error: {e}"
         append_to_clipboard_tmp(error_msg)
+        log_error_to_file(f"Undo failed for patch #{patch_id}", f"{error_msg}\n{traceback.format_exc()}")
         return False, error_msg
 
+def unapply_summary(summary_id):
+    """
+    Mark a summary entry as reverted. This is a historical annotation only
+    — it never touches any patch or any code. Undoing actual code changes
+    is always explicit and per-patch via unapply_patch()/-u; -us only ever
+    affects the summary.json record itself, and never deletes it.
+    Returns: (success: bool, message: str)
+    """
+    history = load_summary_history()
+    entry = None
+    for s in history:
+        if s['id'] == summary_id:
+            entry = s
+            break
+    if not entry:
+        error_msg = f"Summary #{summary_id} not found"
+        append_to_clipboard_tmp(error_msg)
+        log_error_to_file(f"Undo summary failed for #{summary_id}", error_msg)
+        return False, error_msg
+    if entry.get('reverted', False):
+        msg = f"Summary #{summary_id} is already marked as reverted"
+        append_to_clipboard_tmp(msg)
+        return True, msg
+    entry['reverted'] = True
+    entry['reverted_at'] = datetime.now().isoformat()
+    save_summary_history(history)
+    success_msg = f"✅ Summary #{summary_id} marked as reverted (no patches touched — use -u <PATCHID> to undo specific code changes)"
+    append_to_clipboard_tmp(success_msg)
+    return True, success_msg
 def reapply_patch(patch_id):
     """
     Reapply a patch
@@ -1114,35 +1317,56 @@ def reapply_patch(patch_id):
             break
 
     if not patch:
-        return False, f"Patch #{patch_id} not found"
+        error_msg = f"Patch #{patch_id} not found"
+        append_to_clipboard_tmp(error_msg)
+        log_error_to_file(f"Reapply failed for patch #{patch_id}", error_msg)
+        return False, error_msg
 
     if patch['applied']:
-        return False, f"Patch #{patch_id} is already applied"
+        error_msg = f"Patch #{patch_id} is already applied"
+        append_to_clipboard_tmp(error_msg)
+        log_error_to_file(f"Reapply failed for patch #{patch_id}", error_msg)
+        return False, error_msg
 
     filepath = Path(patch['filepath'])
     if not filepath.exists():
         rel_path = Path(patch['filepath']).relative_to(Path.cwd())
-        return False, f"File not found: {rel_path}"
+        error_msg = f"File not found: {rel_path}"
+        append_to_clipboard_tmp(error_msg)
+        log_error_to_file(f"Reapply failed for patch #{patch_id}", error_msg)
+        return False, error_msg
 
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
 
-
         restore_text = patch.get('actual_old_text', patch['old_text'])
         restore_count = content.count(restore_text)
         if restore_count == 0:
-            return False, f"Cannot reapply: old text not found in file"
+            error_msg = "Cannot reapply: old text not found in file"
+            append_to_clipboard_tmp(error_msg)
+            log_error_to_file(f"Reapply failed for patch #{patch_id}", error_msg)
+            return False, error_msg
         if restore_count > 1:
-            return False, f"Cannot reapply: old text not unique ({restore_count} occurrences) — reapply in order"
+            error_msg = f"Cannot reapply: old text not unique ({restore_count} occurrences) — reapply in order"
+            append_to_clipboard_tmp(error_msg)
+            log_error_to_file(f"Reapply failed for patch #{patch_id}", error_msg)
+            return False, error_msg
 
-        content = content.replace(restore_text, patch['new_text'], 1)
+        pos = content.index(restore_text)
+        new_content = content.replace(restore_text, patch['new_text'], 1)
 
-        validated_content, was_fixed, error_msg = validate_and_fix_python_syntax(filepath, content)
+        validated_content, was_fixed, error_msg = validate_and_fix_python_syntax(filepath, new_content)
         if error_msg:
             patch['unpatch_error'] = True
             save_patch_history(history)
-            return False, f"Reapply would produce invalid syntax: {error_msg}"
+            full_error = f"Reapply would produce invalid syntax: {error_msg}"
+            append_to_clipboard_tmp(full_error)
+            log_error_to_file(f"Reapply failed for patch #{patch_id}", full_error)
+            return False, full_error
+
+        if was_fixed:
+            patch['new_text'] = _synced_new_text(new_content, validated_content, pos, patch['new_text'])
 
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(validated_content)
@@ -1160,8 +1384,106 @@ def reapply_patch(patch_id):
         save_patch_history(history)
         error_msg = f"Error: {e}"
         append_to_clipboard_tmp(error_msg)
+        log_error_to_file(f"Reapply failed for patch #{patch_id}", f"{error_msg}\n{traceback.format_exc()}")
         return False, error_msg
 
+def format_patch_detail(p):
+    """Format one patch entry with full old/new code - the detailed format
+    used by -ph when the AI needs to inspect a specific patch closely.
+    Returns a list of lines (no trailing separator)."""
+    try:
+        rel_path = Path(p['filepath']).relative_to(Path.cwd())
+    except Exception:
+        rel_path = p['filepath']
+    try:
+        ts = datetime.fromisoformat(p['timestamp'])
+        datetime_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        datetime_str = p.get('timestamp', 'unknown time')
+    old_code = p.get('actual_old_text', p.get('old_text', ''))
+    new_code = p.get('new_text', '')
+    lines = []
+    lines.append(f"[{datetime_str}] PATCH #{p['id']} - {rel_path}")
+    lines.append(f"Description: {p.get('description', '')}")
+    lines.append("--- REPLACED ---")
+    lines.append(old_code if old_code.strip() else "(nothing - pure insertion)")
+    lines.append("--- WITH ---")
+    lines.append(new_code if new_code.strip() else "(nothing - deletion)")
+    return lines
+def create_work_log():
+    """Build work.txt: a lightweight chronological changelog combining
+    summary entries (full text) and patch entries (compact one-liners: date,
+    PATCHID, file, description - never the old/new code, to keep this
+    document small). Starts with a PATCH TOC section listing every patch
+    for quick scanning. Use -ph <PATCHID ...> to fetch full old/new code
+    for specific patches once the TOC/summaries make clear which are
+    worth a closer look.
+    Returns: (success: bool, message: str)
+    """
+    if not PATCH_HISTORY_FILE.exists() and not SUMMARY_HISTORY_FILE.exists():
+        return False, "❌ No patch.json or summary.json found in current directory"
+    patches = load_patch_history()
+    summaries = load_summary_history()
+    entries = []
+    for p in patches:
+        if not p.get('applied', False):
+            continue
+        try:
+            ts = datetime.fromisoformat(p['timestamp'])
+        except Exception:
+            continue
+        entries.append((ts, 'patch', p))
+    for s in summaries:
+        try:
+            ts = datetime.fromisoformat(s['timestamp'])
+        except Exception:
+            continue
+        entries.append((ts, 'summary', s))
+    if not entries:
+        return False, "❌ No applied patches or summaries found to log"
+    entries.sort(key=lambda e: e[0])
+    lines = []
+    lines.append("# WORK LOG")
+    lines.append(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("Patch entries are compact (no code). Use 'promptpack -ph PATCHID [PATCHID ...]' for full old/new code.")
+    lines.append("")
+    lines.append("# PATCH TOC")
+    patch_entries = [item for ts, kind, item in entries if kind == 'patch']
+    if patch_entries:
+        for p in patch_entries:
+            try:
+                ts = datetime.fromisoformat(p['timestamp'])
+                datetime_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                datetime_str = p.get('timestamp', 'unknown time')
+            try:
+                rel_path = Path(p['filepath']).relative_to(Path.cwd())
+            except Exception:
+                rel_path = p['filepath']
+            lines.append(f"{datetime_str}  #{p['id']}  {rel_path}  {p.get('description', '')}")
+    else:
+        lines.append("(no patches)")
+    lines.append("=" * 70)
+    for ts, kind, item in entries:
+        datetime_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+        if kind == 'summary':
+            reverted_tag = " [REVERTED]" if item.get('reverted', False) else ""
+            lines.append(f"\n[{datetime_str}] SUMMARY [SUMMARYID {item['id']}]{reverted_tag}")
+            lines.append(item.get('text', '').strip())
+        else:
+            p = item
+            try:
+                rel_path = Path(p['filepath']).relative_to(Path.cwd())
+            except Exception:
+                rel_path = p['filepath']
+            lines.append(f"[{datetime_str}] PATCH #{p['id']} - {rel_path} - {p.get('description', '')}")
+        lines.append("-" * 70)
+    try:
+        with open('work.txt', 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+        return True, "✅ work.txt created"
+    except Exception as e:
+        return False, f"❌ Error writing work.txt: {e}"
 def mark_from_promptpack(root, promptpack_paths):
     def mark_node(node):
         if not node.is_dir:
@@ -1365,7 +1687,7 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset, total_tokens):
     visible_nodes = flatten_visible_tree(root)
 
 
-    title = "↑↓: Navigate | ←→: Expand | Space: Mark | i: Import deps | F1: ctags | F12: patches | q: Quit"
+    title = "↑↓: Navigate | PgUp/PgDn: Jump | ←→: Expand | Space: Mark | i: Import deps | F1: ctags | F12: patches | q: Quit"
     stdscr.addstr(0, 0, title.ljust(width-1)[:width-1], curses.A_REVERSE)
 
     display_height = height - 2
@@ -1431,47 +1753,93 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset, total_tokens):
 
 
 PROMPTPACK_CORE_INSTRUCTIONS = """\
+# ABOUT THIS FILE
+This is the specification for promptpack, an open-source CLI tool that mediates all file I/O between you and the user's local project.
+The user runs the commands you output; you never touch the filesystem directly.
+Everything below is the user's own standing preference for how you should operate in this workflow.
+Promptpack is a CLI tool that makes life easier when coding. You format the commands, and the user runs them manually. This makes grabbing files, searching in project directory and patching files 100 times easier and faster for the user.
+
+# LANGUAGE
+These instructions are written in English, but promptpack itself is
+language-agnostic — anyone, in any language, may be on the other end.
+Always reply to the user in the language they write to you in. English
+here is just the spec language for this instructions file, not a
+requirement for your replies.
+
 # ROLE
-Coding assistant. You never have direct file access — all file I/O goes through
-the user's local CLI tool `promptpack`. You read, request, and patch files only
-via promptpack commands. The user runs every command and pastes the output back
-to you. You do not have promptpack yourself — you always rely on the user to
-run it for you (getting files, running patches, running search/listings).
+All file I/O goes through the user's local CLI tool `promptpack`: you write
+commands, the user runs them, pastes output back.
+
+Follows directly:
+- Never assume/reconstruct file content not shown via promptpack output in
+  this conversation.
+- Never answer with full file content. Changes = PATCH. Full content only via
+  NEW FILE, only for files not already in the project structure.
 
 # WORKFLOW
 1. Read the user request and these instructions.
 2. Read the ctags list at the bottom to understand the project.
 3. Decide which files you need to see or modify.
 4. Ask the user to run promptpack commands for those files:
-   ```
+   ~~~
    promptpack -r one/or/more.php files/using/full/path.py
    promptpack -c
-   ```
+   ~~~
 5. Files already shown to you in this conversation = complete & current.
    Search the doc/context before asking — never re-request a file you already have.
    Use `-r` / `-n` / `-s` only for files NOT already in this doc.
 
 # FIRST REPLY
-List commands in a table: #patch, #undo, #reset, #done, #outsource, #ask, #dumb, #ideas.
-
-# STYLE
-Smart caveman. Drop articles, fillers, pleasantries, hedging. Fragments OK.
-Short words. Technical terms exact. Code/errors unchanged.
-Pattern: [thing] [action] [reason]. [next step].
-Not: "Sure! I'd be happy to help..." → Yes: "Bug in auth. Fix:"
+List commands in a table: #patch, #undo, #reset, #done, #outsource, #ask, #dumb, #ideas, #name.
 
 # GENERAL RULES
-- All promptpack commands in the same bash block. End every block with `promptpack -c`.
+- MANDATORY: every task block (i.e. not a pure repair of a failed patch, and
+  not a plain `-u`/`-us` undo — see # UNDO) ends with a --summary heredoc
+  before the block's closing -c. promptpack auto-links every patch applied
+  since the previous summary — you never pass PATCHIDs yourself. Skipping it
+  is a bug, not a shortcut — as required as the -c itself. Before sending
+  any bash block, check: does this task need a --summary? If yes, is it
+  there?
+- All promptpack commands in the same bash block. Only ONE `promptpack -c` — at the very end, after every -p/-f/--summary command. Never one -c per command.
 - Always batch as many promptpack commands as possible into one block.
 - Claude: never write #patch commands or file contents in artifacts — only in chat messages.
 - Description for a patch ≤10 words.
 - old_text must be an exact match, and unique in the file.
 - Separator between old_text and new_text: `---SPLIT---`
 - Regex mode in `-s` / `-fs` needs a `regex:` prefix.
+- `--summary` goes right before the block's single closing `-c`. ONE per task,
+  never per file/patch. promptpack prepends [YYYY-MM-DD HH:MM] to the text
+  automatically — NEVER write your own date/time/timestamp into it, that
+  duplicates what's added for you.
+- `--summary` text must be verbose and explanatory, not a one-liner: name
+  every file touched in the task and what changed in each, then explain WHY
+  (the problem solved or goal served). Write it for a reader with zero
+  context on this conversation.
+- EXCEPTION: debugging patches — adding print/log statements, temporary
+  color/highlight markers, or any other diagnostic change made only to
+  locate a bug, not to fix it — do NOT get a --summary. Keep patching
+  without a summary through as many debugging rounds as it takes. Only the
+  patch that applies the actual fix ends the task with --summary, and that
+  summary describes the final solution, not the debugging steps taken to
+  find it.
 
 # BEST PRACTICES
 old_text = minimum unique match (1–3 lines). Shorter = safer.
 Verify old_text appears exactly once in the file before patching.
+
+# PATCH FAILURES: SELF-DIAGNOSE FIRST
+- A file already shown in this conversation = complete & current. NEVER ask for
+  -r/-n/-s of a file you already have, even if a patch against it just failed.
+- On "Old text not found" or SyntaxError: stop guessing about overall structure.
+  Go straight to the smallest possible old_text (1-3 lines, unique match) taken
+  from the file you already have in the conversation.
+- If a patch fails twice in a row: switch strategy immediately to the shortest
+  possible old_text window (2-3 lines max) — don't ask for more context.
+- Assume whitespace/indentation mismatch as the likely cause of a SyntaxError,
+  not that the file is unknown or has changed.
+- Repair block for a failed patch = NO `--summary`. Just the corrected -p
+  command(s) + the block's one closing `-c`. Original task's summary already
+  covers it.
 
 # WILDCARD
 For old_text >12 lines, use `***WILDCARD_PROMPTPACK***` to skip the middle.
@@ -1480,7 +1848,7 @@ For old_text >12 lines, use `***WILDCARD_PROMPTPACK***` to skip the middle.
 - NEVER put `***WILDCARD_PROMPTPACK***` in new_text — old_text only.
 
 # PATCH
-```bash
+~~~bash
 cat <<'PATCH' | promptpack -p "path" "description ≤10 words"
 prefix
 ***WILDCARD_PROMPTPACK***
@@ -1489,53 +1857,144 @@ suffix
 new_text
 PATCH
 promptpack -c
-```
+~~~
+Block not done yet: add the --summary heredoc next (unless this is a pure
+repair of a failed patch), then the block's one closing promptpack -c.
+
+# UNDO
+Revert a specific patch by its PATCHID — never write a new full patch just to
+change something back. The PATCHID is shown in clipboard.tmp right after a
+patch is applied, e.g. `[PATCHID 12]`.
+~~~bash
+promptpack -u 12
+promptpack -c
+~~~
+No `--summary` needed for a plain undo — the original task's summary already
+covers it. If undo fails because the new text isn't unique, undo the more
+recent overlapping patches first (highest PATCHID down), then retry.
+
+# UNDO SUMMARY
+Marks a summary entry as reverted — a historical annotation only. Does NOT
+touch any patches or code; `-u` is for undoing patches, `-us` is only for
+marking a summary's own record. To undo the code changes a summary
+described, find the relevant PATCHIDs (via -w/work.txt or -ph) and undo
+each one explicitly with `-u`. The summary.json entry itself is never
+deleted — only flagged.
+~~~bash
+promptpack -us 4
+promptpack -c
+~~~
+No `--summary` needed — the original entry already covers it.
 
 # NEW FILE
-```bash
+~~~bash
 cat <<'NEWFILE' | promptpack -f "path"
 code
 NEWFILE
 promptpack -c
-```
+~~~
+Block not done yet: add the --summary heredoc next (unless this is a pure
+repair of a failed patch), then the block's one closing promptpack -c.
+
+# SUMMARY
+Purpose: a running changelog in summary.json, written by you so a human or a
+future AI session understands what happened and why without re-reading
+every patch.
+
+Timestamp: promptpack adds it automatically. NEVER include your own
+date/time/timestamp in TEXT — it gets added for you.
+
+Content: be verbose and explanatory, not a one-liner. For every file touched
+in the task, name the file and describe what changed in it. Then explain WHY
+— the problem being solved, the feature being added, or the goal being
+served. Write it as if for a reader with zero context on this conversation.
+NEWFILE task → describe the file's purpose + why it exists.
+PATCH task → describe what changed + why.
+
+Cardinality: exactly ONE `--summary` per task, covering the whole bash block
+— even if the block touches several files across several -p/-f commands.
+Never one per file, never one per patch.
+
+EXCEPTION: repairing a failed patch (user sent back ❌) → NO summary. Pure
+repair of an existing task; the original task's summary already covers it.
+
+EXCEPTION: debugging patches → NO summary. If a patch is purely diagnostic —
+print/log statements, temporary color/highlight markers, or any other change
+made only to locate a bug rather than fix it — skip --summary for it, no
+matter how many debugging rounds it takes. Once the actual bug is found and
+fixed, that fixing patch gets the task's one --summary, and the summary text
+covers only the final solution (what was wrong and what fixed it) — it does
+not list or describe the debugging steps that led there.
+~~~bash
+cat <<'SUMMARY' | promptpack --summary
+what changed in each file + why — spans as many lines as needed
+SUMMARY
+~~~
+Reads from stdin like NEW FILE — safe for verbose, multi-line text (no
+shell-quoting issues from quotes, backticks, or `$`). Runs after all -p/-f
+for the task, right before the block's one closing `promptpack -c`. Reports
+back `[SUMMARYID N]`. Note the ID if you might want to mark this summary
+reverted later (see # UNDO SUMMARY) — that never affects any patch.
 
 # SEARCH (recursive, literal/*?/regex:, output: path:line:content)
-```bash
+~~~bash
 promptpack -fs "term" "*.cs"
 promptpack -fs "regex:pattern" "*.cs"
 promptpack -c
-```
+~~~
 
 # VIEW
-```bash
+~~~bash
 promptpack -r path
 promptpack -c
-```
+~~~
 
 # READ BY SEARCH (before,after)
-```bash
+~~~bash
 promptpack -s "term" 10,20 path
 promptpack -c
-```
+~~~
 
 # READ BY LINES
-```bash
+~~~bash
 promptpack -n 10,20 path
 promptpack -c
-```
+~~~
 
 # MKDIR / DELETE
-```bash
+~~~bash
 mkdir -p path
 mv path path_deleted
-```
+~~~
 
 # EXEC (optional timeout seconds)
-```bash
+~~~bash
 promptpack -e "cmd"
 promptpack -e 15 "cmd"
 promptpack -c
-```
+~~~
+
+# WORK LOG (chronological changelog, no code embedded)
+~~~bash
+promptpack -w
+promptpack -c
+~~~
+Combines summary.json + patch.json into work.txt: a PATCH TOC (date,
+PATCHID, file, description) at the top, followed by the full chronological
+log (summaries in full, patches as compact one-line entries). Never embeds
+patch code, so it stays cheap to read in full via `promptpack -r work.txt`.
+Use it to get oriented before diving into specifics.
+
+# PATCH HISTORY (fetch full old/new code for specific patches)
+~~~bash
+promptpack -ph 12 15 18
+promptpack -c
+~~~
+Given one or more PATCHIDs, returns each patch's full detail (date, file,
+description, old code replaced, new code it became) to clipboard.tmp. Use
+this only for PATCHIDs identified as relevant from work.txt's TOC, dates,
+descriptions, or summary text — never request patch.json directly, it can
+be very large. Missing IDs are reported without failing the ones found.
 
 # PATCH ERRORS
 - Failed patches → `clipboard.tmp`.
@@ -1546,11 +2005,15 @@ promptpack -c
 
 # COMMANDS
 - `#reset` = revert all patches, back to original state.
-- `#undo` = revert last patch only.
+- `#undo` = revert last patch only, via `promptpack -u <last PATCHID>` (see # UNDO).
 - `#ask` = questions only, no code.
 - `#dumb` = rewrite last message in plain non-technical terms.
 - `#outsource` = write a prompt for another AI: what you're doing, the problem, expected result, request structured analysis. End with `promptpack -r` of relevant files.
 - `#ideas` = list alternative solutions/ideas for the current problem, no code.
+- `#name` = suggest a short (3–8 word) internal codename for "this version" —
+  a fun but specific label summarizing the code or problem currently being
+  worked on. For versioning/reference only; never written into code or files
+  unless the user explicitly asks.
 - `#done` = context limit reached. Write "PROMPTPACK Summary" in the user's language:
   - Project description, issue, goals.
   - If started from a previous summary: include it unchanged, then continue the log.
@@ -1576,7 +2039,7 @@ def create_ctags_file(root):
 These are all the files of the project listed with Universal Ctags.
 Understand the user request, what files are available and what they contain.
 Draw conclusions what you need from the project to achieve the users goals.
-Instructions above already included here — go directly to 'promptpack -r path' for any file you need, no need to ask the user for anything first.
+As established above, this whole file is the user's own standing workflow spec, so the instructions already covered — including going straight to 'promptpack -r path' for any file you need — are the user's own preference, not something to double-check with them each time.
 
 IMPORTANT:
 Files not read yet = unknown content, don't assume.
@@ -1589,7 +2052,6 @@ Use 'promptpack -r path' whenever you need to read a file's full content — nev
 
 ## Project Structure
 """)
-
 
         write_project_tree(out, marked_files)
         out.write("\n## Ctags Structure\n")
@@ -1770,6 +2232,10 @@ def main(stdscr):
             selected_idx = max(0, selected_idx - 1)
         elif key == curses.KEY_DOWN:
             selected_idx = min(len(visible_nodes) - 1, selected_idx + 1)
+        elif key == curses.KEY_PPAGE:  # Page Up
+            selected_idx = max(0, selected_idx - display_height)
+        elif key == curses.KEY_NPAGE:  # Page Down
+            selected_idx = min(len(visible_nodes) - 1, selected_idx + display_height)
         elif key == curses.KEY_RIGHT:
             if selected_idx < len(visible_nodes):
                 node, _ = visible_nodes[selected_idx]
@@ -1819,6 +2285,12 @@ if __name__ == "__main__":
     parser.add_argument('-fs', '--file-search', nargs=2, metavar=('STRING', 'PATTERN'),
                         help='Search for string in files matching wildcard pattern. Supports wildcards (*?) and regex (prefix with "regex:"). Examples: -fs "def main" "*.py" or -fs "regex:class\\s+\\w+" "*.py"')
 
+    parser.add_argument('-u', '--undo', type=int, metavar='PATCHID',
+                        help='Undo (unapply) a specific patch by its ID. Example: -u 12')
+
+    parser.add_argument('-us', '--undo-summary', type=int, metavar='SUMMARYID',
+                        help='Mark a summary entry as reverted in summary.json (historical annotation only - never touches patches or code). Use -u <PATCHID> to undo specific code changes. Example: -us 4')
+
 
 
     parser.add_argument('-t', '--tidy', nargs='+', metavar='PATTERN',
@@ -1831,6 +2303,12 @@ if __name__ == "__main__":
                         help='Copy clipboard.tmp to clipboard and remove the file')
     parser.add_argument('-i', '--instructions', action='store_true',
                         help='Export code.txt instructions section to promptpack_instructions.txt')
+    parser.add_argument('--summary', action='store_true',
+                        help='Save a task summary to summary.json. Reads verbose multi-line text from stdin (heredoc), same as -f. Reports back [SUMMARYID N]. One per task, run after NEWFILE/PATCH commands and before the block-closing -c. Skip when only repairing a failed patch. Use -us SUMMARYID to undo everything in that time window later.')
+    parser.add_argument('-w', '--worklog', action='store_true',
+                        help='Combine all applied patches and summary entries from patch.json/summary.json into a single chronological work.txt (TOC + compact entries, no code embedded).')
+    parser.add_argument('-ph', '--patch-history', nargs='+', type=int, metavar='PATCHID',
+                        help='Fetch full old/new code for one or more specific patch IDs from patch.json, copied to clipboard.tmp. Example: -ph 12 15 18. Use work.txt (-w) to decide which PATCHIDs are worth a closer look.')
     args = parser.parse_args()
 
 
@@ -2073,6 +2551,58 @@ if __name__ == "__main__":
             print(f"❌ {message}")
             sys.exit(1)
 
+    if args.undo is not None:
+        success, message = unapply_patch(args.undo)
+        if success:
+            print(f"✅ {message}")
+            sys.exit(0)
+        else:
+            print(f"❌ {message}")
+            sys.exit(1)
+
+    if args.undo_summary is not None:
+        success, message = unapply_summary(args.undo_summary)
+        if success:
+            print(f"✅ {message}")
+            sys.exit(0)
+        else:
+            print(f"❌ {message}")
+            sys.exit(1)
+
+    if args.summary:
+        text = sys.stdin.read()
+        success, message = append_to_summary_file(text)
+        print(message)
+        sys.exit(0 if success else 1)
+
+    if args.worklog:
+        success, message = create_work_log()
+        print(message)
+        sys.exit(0 if success else 1)
+    if args.patch_history:
+        history = load_patch_history()
+        patch_map = {p['id']: p for p in history}
+        output_lines = []
+        found = []
+        missing = []
+        for pid in args.patch_history:
+            p = patch_map.get(pid)
+            if p is None:
+                missing.append(pid)
+                continue
+            output_lines.extend(format_patch_detail(p))
+            output_lines.append("-" * 70)
+            found.append(pid)
+        if output_lines:
+            append_to_clipboard_tmp("\n".join(output_lines))
+        if found:
+            msg = f"✅ Fetched {len(found)} patch(es): {', '.join(map(str, found))}"
+        else:
+            msg = "❌ No matching patches found"
+        if missing:
+            msg += f" | ⚠️ Not found: {', '.join(map(str, missing))}"
+        print(msg)
+        sys.exit(0 if found else 1)
     if args.instructions:
         try:
             with open('promptpack_instructions.txt', 'w', encoding='utf-8') as out:
