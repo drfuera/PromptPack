@@ -895,6 +895,20 @@ def apply_patch(filepath, description, old_text, new_text):
         with open(filepath, 'r', encoding='utf-8') as f:
             original_content = f.read()
 
+        # Fail-safe: reject a patch identical to one that is already applied
+        _norm_new = new_text[1:] if new_text.startswith('\n') else new_text
+        for _prev in load_patch_history():
+            if (_prev.get('applied')
+                    and _prev.get('filepath') == str(filepath)
+                    and _prev.get('old_text') == old_text
+                    and _prev.get('new_text') in (new_text, _norm_new)):
+                _rel = filepath.relative_to(Path.cwd())
+                error_msg = (f"❌ {str(_rel).ljust(40)} {description.ljust(50)} "
+                             f"Duplicate patch: identical patch already applied "
+                             f"[PATCHID {_prev['id']}] - undo it first with -u if you want to reapply")
+                append_to_clipboard_tmp(error_msg)
+                return False, error_msg
+
 
         # Wildcard mode: split old_text on placeholder, match prefix + anything + suffix
         if WILDCARD in old_text:
@@ -2048,7 +2062,7 @@ You already have all promptpack instructions above (patch, search, view, etc.) f
 PROJECT:
 Here is the complete structure of the project and the ctags symbol list below.
 Some files might not be included in the ctags list so you need to draw conclusions on what files do what based on their file names and what the user wants to achieve.
-Use 'promptpack -r path' whenever you need to read a file's full content — never wait for or ask for code.txt.
+Use 'promptpack -r path' whenever you need to read a file's full content.
 
 ## Project Structure
 """)
@@ -2302,7 +2316,7 @@ if __name__ == "__main__":
     parser.add_argument('-c', '--clear', action='store_true',
                         help='Copy clipboard.tmp to clipboard and remove the file')
     parser.add_argument('-i', '--instructions', action='store_true',
-                        help='Export code.txt instructions section to promptpack_instructions.txt')
+                        help='Export instructions section to promptpack_instructions.txt')
     parser.add_argument('--summary', action='store_true',
                         help='Save a task summary to summary.json. Reads verbose multi-line text from stdin (heredoc), same as -f. Reports back [SUMMARYID N]. One per task, run after NEWFILE/PATCH commands and before the block-closing -c. Skip when only repairing a failed patch. Use -us SUMMARYID to undo everything in that time window later.')
     parser.add_argument('-w', '--worklog', action='store_true',
