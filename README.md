@@ -452,6 +452,44 @@ User runs the bash block — patch and summary are applied, and the result is co
 
 ---
 
+## Optional: X11 Middle-Click Paste+Submit (`x11/`)
+
+Two small helper scripts speed up the copy → paste → submit loop that PromptPack workflows repeat constantly: copying an AI-generated bash block into a terminal, and pasting terminal output (the result of `promptpack -c`) back into the AI chat. With the helpers enabled, a single middle click pastes the clipboard and presses Enter, saving a few hand movements on every patch or reply.
+
+| Script | Purpose |
+|--------|---------|
+| `HomePageMiddleClickPasteSubmit.sh` | **Toggle.** Turns middle-click Paste+Enter on or off. Run it once to enable, again to disable. |
+| `HomePageMiddleClick_Status.sh` | **Status.** Prints `PasteSubmit ✅` when enabled and `PasteSubmit ⛔` when disabled. Meant to be polled by a panel applet or status bar. |
+
+**How it works:** the toggle script adds or removes a marked block (`# BEGIN paste-enter-toggle` … `# END paste-enter-toggle`) in `~/.xbindkeysrc` and restarts `xbindkeys`. While the block exists, mouse button 2 runs `xdotool key Shift+Insert`, waits 0.2 s and then runs `xdotool key Return`. The status script only checks whether that block is present, so it is safe to call as often as your panel needs.
+
+**Requirements:**
+- An **X11 session** — these scripts do not work under Wayland, where `xbindkeys` cannot capture global mouse clicks and `xdotool` cannot send input to native Wayland windows
+- `xbindkeys` and `xdotool` (`sudo apt install xbindkeys xdotool` on Ubuntu/Debian)
+- `bash`, `grep`, `sed` and `pkill` (present on practically every distro)
+
+**Setup:**
+
+````bash
+chmod +x x11/HomePageMiddleClickPasteSubmit.sh x11/HomePageMiddleClick_Status.sh
+
+# Toggle on/off (bind this to a panel button, launcher or keyboard shortcut)
+./x11/HomePageMiddleClickPasteSubmit.sh
+
+# Show current state (point your panel applet / status bar at this)
+./x11/HomePageMiddleClick_Status.sh
+````
+
+The status script outputs plain text, so it works with any desktop or bar that can display a command's output: a Cinnamon applet, Xfce generic monitor, polybar, i3blocks and similar.
+
+**Things to know:**
+- Middle click is captured **globally** while the feature is on, so normal middle-click behavior (primary-selection paste, closing tabs, opening links in new tabs) stops working until you toggle it off
+- Enter is sent immediately after the paste, so whatever is on the clipboard is **submitted at once**. Only enable it when you trust the clipboard content, and review commands before running them in a terminal
+- `Shift+Insert` pastes the clipboard in most applications, but a few terminals and Qt programs may paste the primary selection instead
+- `xbindkeys` is only started when the toggle runs. Add `xbindkeys` to your session autostart so an enabled binding survives a logout or reboot
+
+---
+
 ## Configuration
 
 ### File Selection Storage
@@ -596,16 +634,6 @@ Or use `xsel` (Linux) or `pbcopy` (macOS, built-in).
 - Write summary text for a reader with zero context: name every file touched and explain why, not just what
 - Remember `-us` only flags a summary's own record — it never undoes code. Use `-u <PATCHID>` for that, one patch at a time
 - Get oriented from the `# WORKLOG` in `ctags.txt` without pulling code into context, then `-log <ID...>` for summaries worth reading in full and `-ph <PATCHID...>` for the specific patches worth a closer look; reserve `-w` for when you truly need the whole history
-
----
-
-## Contributing
-
-Contributions are welcome!
-
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request
 
 ---
 
