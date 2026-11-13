@@ -638,19 +638,27 @@ def get_next_summary_id():
         return 1
     return max(s['id'] for s in history) + 1
 
-def append_to_summary_file(text):
+def append_to_summary_file(text, about):
     """Save a timestamped summary entry to summary.json.
     Returns: (success: bool, message: str)
     """
     try:
         history = load_summary_history()
 
+        about = (about or '').strip()
+        body = text.strip()
+        if not about or not body:
+            error_msg = "❌ Summary NOT saved: both parts are required: promptpack --summary 'about text' (1-2 dense sentences, as the argument) plus the verbose text via heredoc on stdin. Resend the --summary command."
+            append_to_clipboard_tmp(error_msg)
+            return False, error_msg
+
         summary_id = get_next_summary_id()
         timestamp = datetime.now().isoformat()
         history.append({
             'id': summary_id,
             'timestamp': timestamp,
-            'text': text.strip()
+            'text': body,
+            'about': about
         })
         save_summary_history(history)
 
@@ -1804,7 +1812,7 @@ Follows directly:
    Use `-r` / `-n` / `-s` only for files NOT already in this doc.
 
 # FIRST REPLY
-List commands in a table: #patch, #undo, #reset, #done, #outsource, #ask, #dumb, #ideas, #name.
+List commands in a table: #patch, #undo, #reset, #done, #outsource, #ask, #dumb, #ideas, #test, #name.
 
 # GENERAL RULES
 - MANDATORY: every task block (i.e. not a pure repair of a failed patch, and
@@ -1825,6 +1833,14 @@ List commands in a table: #patch, #undo, #reset, #done, #outsource, #ask, #dumb,
   never per file/patch. promptpack prepends [YYYY-MM-DD HH:MM] to the text
   automatically — NEVER write your own date/time/timestamp into it, that
   duplicates what's added for you.
+- `--summary` takes the ABOUT text as its quoted argument: 1-2 sentences,
+  an extremely dense digest of the whole task (files + what + why). A future
+  AI sees only this line in the # WORKLOG section of ctags.txt and uses it to
+  decide whether to fetch the full text, so it must reflect the summary
+  accurately. Keep it plain prose inside double quotes: no double quotes,
+  backticks or `$` in it (the shell would interpret them). The verbose text
+  goes in the heredoc on stdin. Without both parts the summary is rejected
+  and not saved: resend it.
 - `--summary` text must be verbose and explanatory, not a one-liner: name
   every file touched in the task and what changed in each, then explain WHY
   (the problem solved or goal served). Write it for a reader with zero
@@ -1838,19 +1854,30 @@ List commands in a table: #patch, #undo, #reset, #done, #outsource, #ask, #dumb,
   find it.
 
 # BEST PRACTICES
-old_text = minimum unique match (1–3 lines). Shorter = safer.
+old_text = whole lines, never a fragment. Always start at the beginning of a line
+and end at the end of a line, copied exactly (indentation and trailing text
+included) from the file as shown in this conversation. Use 1–3 whole lines that
+are unique together. A partial line (just a word, a tag, or a label inside a
+line) is NOT a safe match, even if it looks unique.
 Verify old_text appears exactly once in the file before patching.
+To change one word on a line, still put the whole line in old_text and the whole
+corrected line in new_text.
 
 # PATCH FAILURES: SELF-DIAGNOSE FIRST
 - A file already shown in this conversation = complete & current. NEVER ask for
   -r/-n/-s of a file you already have, even if a patch against it just failed.
 - On "Old text not found" or SyntaxError: stop guessing about overall structure.
-  Go straight to the smallest possible old_text (1-3 lines, unique match) taken
-  from the file you already have in the conversation.
-- If a patch fails twice in a row: switch strategy immediately to the shortest
-  possible old_text window (2-3 lines max) — don't ask for more context.
+  Go straight to old_text made of whole lines (1-3 lines, unique together) taken
+  exactly from the file you already have in the conversation, with the original
+  indentation.
+- If a patch fails twice in a row: switch to a single whole line with exact
+  indentation, copied from the file in this conversation. Never shrink old_text
+  to a fragment of a line. If you do not have the exact line (the file was not
+  shown, or may have changed since), run `promptpack -n <lines> path` to see it
+  and then patch the whole line.
 - Assume whitespace/indentation mismatch as the likely cause of a SyntaxError,
-  not that the file is unknown or has changed.
+  not that the file is unknown or has changed. Do not blame special characters
+  (å, ä, ö, ≈ etc.) without evidence.
 - Repair block for a failed patch = NO `--summary`. Just the corrected -p
   command(s) + the block's one closing `-c`. Original task's summary already
   covers it.
@@ -1918,6 +1945,12 @@ every patch.
 Timestamp: promptpack adds it automatically. NEVER include your own
 date/time/timestamp in TEXT — it gets added for you.
 
+ABOUT argument: the quoted argument of --summary, 1-2 sentences, as
+information-dense as possible (token-cheap, but precise enough that a reader
+knows what the task was). It is stored separately as the `about` field and
+listed in # WORKLOG of ctags.txt. The heredoc holds only the verbose text.
+Plain prose only: no double quotes, backticks or `$` inside it.
+
 Content: be verbose and explanatory, not a one-liner. For every file touched
 in the task, name the file and describe what changed in it. Then explain WHY
 — the problem being solved, the feature being added, or the goal being
@@ -1940,7 +1973,7 @@ fixed, that fixing patch gets the task's one --summary, and the summary text
 covers only the final solution (what was wrong and what fixed it) — it does
 not list or describe the debugging steps that led there.
 ~~~bash
-cat <<'SUMMARY' | promptpack --summary
+cat <<'SUMMARY' | promptpack --summary "dense 1-2 sentence about of the task (files, what, why)"
 what changed in each file + why — spans as many lines as needed
 SUMMARY
 ~~~
@@ -1997,7 +2030,8 @@ Combines summary.json + patch.json into work.txt: a PATCH TOC (date,
 PATCHID, file, description) at the top, followed by the full chronological
 log (summaries in full, patches as compact one-line entries). Never embeds
 patch code, so it stays cheap to read in full via `promptpack -r work.txt`.
-Use it to get oriented before diving into specifics.
+It grows large on long projects: prefer the # WORKLOG section at the bottom
+of this file plus `-log`, and use -w only when the full history is needed.
 
 # PATCH HISTORY (fetch full old/new code for specific patches)
 ~~~bash
@@ -2009,6 +2043,20 @@ description, old code replaced, new code it became) to clipboard.tmp. Use
 this only for PATCHIDs identified as relevant from work.txt's TOC, dates,
 descriptions, or summary text — never request patch.json directly, it can
 be very large. Missing IDs are reported without failing the ones found.
+
+# LOG FETCH (full text of specific summaries)
+~~~bash
+promptpack -log 53 54 55
+promptpack -c
+~~~
+The # WORKLOG section at the bottom of this file lists all work in
+chronological order, one line each: `ID LOG:about` = a task summary,
+`ID PATCH:description` = a patch. Patches come right before the LOG that
+closes their task. Use it for overview; usually only the last few LOGs
+matter. To read a summary in full, fetch it with -log (space- or
+comma-separated IDs, several at once for efficiency). To see a patch's code,
+use -ph with the PATCH ID. LOG and PATCH IDs are separate number series.
+Missing IDs are reported without failing the ones found.
 
 # PATCH ERRORS
 - Failed patches → `clipboard.tmp`.
@@ -2024,6 +2072,23 @@ be very large. Missing IDs are reported without failing the ones found.
 - `#dumb` = rewrite last message in plain non-technical terms.
 - `#outsource` = write a prompt for another AI: what you're doing, the problem, expected result, request structured analysis. End with `promptpack -r` of relevant files.
 - `#ideas` = list alternative solutions/ideas for the current problem, no code.
+- `#test` = structured review of code from the current work, in three modes. Report only: never write patches while running #test; patch afterwards, and only after the user okays it. Two steps:
+  - Modes (`full` is a reserved word, never a target name):
+    - `#test` = the patches you wrote in this session plus directly affected code (callers and callees of the changed functions). You may read one or two clearly relevant include or import files, but do not wander further.
+    - `#test <target>` = a named function, class or file, whether or not it changed in this session, plus directly affected code.
+    - `#test full` = the whole codebase, but never in one reply. Plan from the ctags list, prioritize risky parts (parsing, file I/O, shell), review one module per round over several rounds, and state clearly what was reviewed and what was not reached.
+  - Locate the code: in session mode you wrote the patches yourself, so use the [PATCHID n] lines in output the user pasted back. Only if the session was restarted via #done, take the patch IDs listed under the latest LOG lines in # WORKLOG and fetch them with `promptpack -ph <IDs>`. In every mode, read the actual current code with -r/-n even if it was shown earlier, because indentation may have been auto-corrected when patching.
+  - Mindset: review as if someone else wrote the code. Trace real values through it instead of writing "looks correct".
+  - STEP 1 = pure reasoning, passes 1-7 in this fixed order, no extra round. Each pass uses the results of the earlier ones. A pass may be skipped only if you state the reason in one line, never silently. Pass 8 is always mandatory, pass 2 too in session mode.
+    1. Scope: list what is under review (files, functions). Callers of changed functions need a search, so list them here as SUSPECTED and put the search in the step 2 block.
+    2. Requirements: in session mode, did the change do exactly what was asked, no more and no less? If not, report it, skip passes 3-7 and still run step 2 and the final report. In target and full mode there is no request to compare with: compare the code with its purpose (docstring, README, function name) or skip the pass with a stated reason.
+    3. Design by Contract: derive preconditions, postconditions and invariants of each changed function. Passes 4, 5 and 6 build on them.
+    4. Boundary analysis: probe the edges of those contracts (empty, None, one element, extreme values, Unicode, missing files) and walk each case through with concrete values.
+    5. Pre-mortem: assume this crashes in a month. Build 3-5 realistic failures from the suspicions in 3-4, plus failure paths (error halfway through, leftover state, resources not closed).
+    6. OWASP/CWE/CERT: only if the changed code touches input, files, paths, shell or parsing. Check input validation, injection/shell quoting, paths, secrets, resource and error handling, starting from the input sources found in 3.
+    7. Consistency and design: does it follow the project's own patterns and error handling; names, needless complexity, unused imports, leftover debug prints; in session mode, does the summary match what the patches really do?
+  - Every finding: file and line, severity (bug = wrong result or data loss / risk / minor remark), status VERIFIED or SUSPECTED. A bug needs a concrete input that triggers it. Speculation is always SUSPECTED. A pass without findings must say so explicitly.
+  - STEP 2 = pass 8, verification and final report: collect ALL SUSPECTED findings into ONE bash block using -r/-n/-s/-fs/-e (for example pyflakes or ruff, tests if present, a search for callers of changed functions), ending with the block's one -c. Even with no SUSPECTED findings the block holds at least a syntax check (for example py_compile of the files under review). No --summary, since nothing is patched. The user runs it once and pastes the output back; then give the final report with each finding VERIFIED or dropped.
 - `#name` = suggest a short (3–8 word) internal codename for "this version" —
   a fun but specific label summarizing the code or problem currently being
   worked on. For versioning/reference only; never written into code or files
@@ -2038,6 +2103,37 @@ be very large. Missing IDs are reported without failing the ones found.
   - Never assume issues are fixed — always treat work as mid-progress when #done is called.
 """
 
+
+def build_worklog_lines():
+    """Compact chronological worklog for ctags.txt: one line per applied patch
+    ('ID PATCH:description') and per summary ('ID LOG:about'). Patches sort
+    before the summary that closes their task (same-timestamp ties)."""
+    entries = []
+    for p in load_patch_history():
+        if not p.get('applied', False):
+            continue
+        try:
+            ts = datetime.fromisoformat(p['timestamp'])
+        except Exception:
+            continue
+        entries.append((ts, 0, 'PATCH', p))
+    for s in load_summary_history():
+        try:
+            ts = datetime.fromisoformat(s['timestamp'])
+        except Exception:
+            continue
+        entries.append((ts, 1, 'LOG', s))
+    entries.sort(key=lambda e: (e[0], e[1]))
+    lines = []
+    for ts, _, kind, item in entries:
+        if kind == 'LOG':
+            tag = ' [REVERTED]' if item.get('reverted', False) else ''
+            about = ' '.join((item.get('about') or '(no about)').split())
+            lines.append(f"{item['id']} LOG:{about}{tag}")
+        else:
+            desc = ' '.join(str(item.get('description', '')).split())
+            lines.append(f"{item['id']} PATCH:{desc}")
+    return lines
 
 def create_ctags_file(root):
     marked_files = get_marked_files(root)
@@ -2117,6 +2213,12 @@ Use 'promptpack -r path' whenever you need to read a file's full content.
             except Exception as e:
                 out.write(f"\n### {file_path.relative_to(Path.cwd())}\n")
                 out.write(f"# Error running ctags: {e}\n")
+
+        worklog_lines = build_worklog_lines()
+        if worklog_lines:
+            out.write("\n# WORKLOG\n")
+            out.write("Chronological. `ID LOG:` = task summary (full text: promptpack -log ID ...), `ID PATCH:` = patch (full code: promptpack -ph ID ...). Patches come before the LOG that closes their task. LOG and PATCH IDs are separate number series.\n")
+            out.write("\n".join(worklog_lines) + "\n")
 
     return True
 
@@ -2317,12 +2419,14 @@ if __name__ == "__main__":
                         help='Copy clipboard.tmp to clipboard and remove the file')
     parser.add_argument('-i', '--instructions', action='store_true',
                         help='Export instructions section to promptpack_instructions.txt')
-    parser.add_argument('--summary', action='store_true',
-                        help='Save a task summary to summary.json. Reads verbose multi-line text from stdin (heredoc), same as -f. Reports back [SUMMARYID N]. One per task, run after NEWFILE/PATCH commands and before the block-closing -c. Skip when only repairing a failed patch. Use -us SUMMARYID to undo everything in that time window later.')
+    parser.add_argument('--summary', nargs='?', const='', default=None, metavar='ABOUT',
+                        help='Save a task summary to summary.json. The argument ABOUT is 1-2 dense sentences (stored as the "about" field, listed in ctags.txt # WORKLOG); the verbose text is read from stdin (heredoc), same as -f. Both are required. Reports back [SUMMARYID N]. One per task, run after NEWFILE/PATCH commands and before the block-closing -c. Skip when only repairing a failed patch. Use -us SUMMARYID to undo everything in that time window later. Example: promptpack --summary "about text" with a heredoc on stdin.')
     parser.add_argument('-w', '--worklog', action='store_true',
                         help='Combine all applied patches and summary entries from patch.json/summary.json into a single chronological work.txt (TOC + compact entries, no code embedded).')
     parser.add_argument('-ph', '--patch-history', nargs='+', type=int, metavar='PATCHID',
                         help='Fetch full old/new code for one or more specific patch IDs from patch.json, copied to clipboard.tmp. Example: -ph 12 15 18. Use work.txt (-w) to decide which PATCHIDs are worth a closer look.')
+    parser.add_argument('-log', '--log-fetch', nargs='+', metavar='SUMMARYID',
+                        help='Fetch the full text (and ABOUT line) of one or more summaries from summary.json, copied to clipboard.tmp. IDs may be space- or comma-separated. Example: -log 53 54 55 or -log 53,54,55. IDs come from the # WORKLOG section in ctags.txt (lines starting with ID LOG:).')
     args = parser.parse_args()
 
 
@@ -2583,9 +2687,19 @@ if __name__ == "__main__":
             print(f"❌ {message}")
             sys.exit(1)
 
-    if args.summary:
+    if args.summary is not None:
+        if not args.summary.strip():
+            error_msg = "❌ Summary NOT saved: the about text is missing. Use: promptpack --summary 'about text' (1-2 dense sentences) plus the verbose text via heredoc on stdin. Resend the --summary command."
+            append_to_clipboard_tmp(error_msg)
+            print(error_msg)
+            sys.exit(1)
+        if sys.stdin.isatty():
+            error_msg = "❌ Summary NOT saved: no verbose text on stdin. Pipe it in with a heredoc: cat <<'SUMMARY' | promptpack --summary 'about text'. Resend the --summary command."
+            append_to_clipboard_tmp(error_msg)
+            print(error_msg)
+            sys.exit(1)
         text = sys.stdin.read()
-        success, message = append_to_summary_file(text)
+        success, message = append_to_summary_file(text, args.summary)
         print(message)
         sys.exit(0 if success else 1)
 
@@ -2615,6 +2729,47 @@ if __name__ == "__main__":
             msg = "❌ No matching patches found"
         if missing:
             msg += f" | ⚠️ Not found: {', '.join(map(str, missing))}"
+        print(msg)
+        sys.exit(0 if found else 1)
+    if args.log_fetch:
+        ids = []
+        bad = []
+        for chunk in args.log_fetch:
+            for tok in chunk.replace(',', ' ').split():
+                try:
+                    ids.append(int(tok))
+                except ValueError:
+                    bad.append(tok)
+        summary_map = {s['id']: s for s in load_summary_history()}
+        output_lines = []
+        found = []
+        missing = []
+        for sid in ids:
+            s = summary_map.get(sid)
+            if s is None:
+                missing.append(sid)
+                continue
+            try:
+                ts_str = datetime.fromisoformat(s['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                ts_str = s.get('timestamp', 'unknown time')
+            tag = " [REVERTED]" if s.get('reverted', False) else ""
+            output_lines.append(f"[{ts_str}] LOG [SUMMARYID {sid}]{tag}")
+            if s.get('about'):
+                output_lines.append(f"ABOUT: {s['about']}")
+            output_lines.append(s.get('text', '').strip())
+            output_lines.append("-" * 70)
+            found.append(sid)
+        if output_lines:
+            append_to_clipboard_tmp("\n".join(output_lines))
+        if found:
+            msg = f"✅ Fetched {len(found)} summary(ies): {', '.join(map(str, found))}"
+        else:
+            msg = "❌ No matching summaries found"
+        if missing:
+            msg += f" | ⚠️ Not found: {', '.join(map(str, missing))}"
+        if bad:
+            msg += f" | ⚠️ Not a number: {', '.join(bad)}"
         print(msg)
         sys.exit(0 if found else 1)
     if args.instructions:
