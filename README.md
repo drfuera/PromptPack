@@ -622,5 +622,5 @@ This project is open source. See the LICENSE file for details.
 *Romans 8:28*
 *"And we know that in all things God works for the good of those who love him, who have been called according to his purpose."*
 
-Special thanks to Jesus. Always Jesus. All the time. All the way.
+All thanks and praise be to Jesus. Always Jesus. All the time. All the way.
 God bless you!
