@@ -14,7 +14,7 @@ PromptPack helps you package your codebase for AI assistants (Claude, GPT, DeepS
 - **Selective file marking**: Choose exactly which files to include
 - **Token counting**: Real-time token estimation for different AI models
 - **Persistent selection**: File selections are saved in `.promptpack`
-- **`ctags.txt` output**: A lightweight structure overview (via Universal Ctags), with the full PromptPack AI-workflow instructions embedded at the top
+- **`ctags.txt` output**: A lightweight structure overview (via Universal Ctags), with the full PromptPack AI-workflow instructions embedded at the top and a compact `# WORKLOG` of the project's history at the bottom
 
 ### 🔧 Advanced Patch Management
 
@@ -30,10 +30,12 @@ PromptPack helps you package your codebase for AI assistants (Claude, GPT, DeepS
 
 ### 📊 Task Summaries & Work Log
 
-- **Summary history (`--summary`)**: Save a verbose, timestamped changelog entry to `summary.json` after each completed task — explains what changed and why, for future AI sessions or human reviewers
+- **Summary history (`--summary "about text"`)**: Save a timestamped changelog entry to `summary.json` after each completed task. The quoted argument is a 1–2 sentence, information-dense `about` line; the heredoc on stdin holds the verbose text explaining what changed and why, for future AI sessions or human reviewers. Both parts are required — a call missing either one is rejected and nothing is saved
 - **Mark a summary reverted (`-us`)**: Flags a summary entry as `reverted` in `summary.json` — a historical annotation only. It never touches any patch or any code; undoing actual code changes is always done explicitly, one patch at a time, via `-u`
 - **Work log (`-w`)**: Combine `patch.json` + `summary.json` into a lightweight `work.txt` — a PATCH TOC (date, ID, file, description) up top, followed by the full chronological log (full summary text + compact one-line patch entries, no code embedded)
 - **Patch history lookup (`-ph`)**: Fetch full old/new code for one or more specific `PATCHID`s on demand — lets the AI use `work.txt`'s dates and descriptions to decide what's worth a closer look, without ever needing to read all of `patch.json` directly
+- **`# WORKLOG` in `ctags.txt`**: Every time `ctags.txt` is generated it ends with a compact, chronological worklog — one line per applied patch (`ID PATCH:description`) and one per summary (`ID LOG:about`), with each patch listed just before the LOG that closes its task. It gives the AI a cheap overview of the whole project history; usually only the last few entries matter
+- **Summary lookup (`-log`)**: Fetch the full text (and `about` line) of one or more summaries by ID, space- or comma-separated (`-log 53 54 55`), so the AI pulls only the summaries it needs instead of reading all of `work.txt`
 
 ### 🔍 Code Navigation & Search
 
@@ -227,11 +229,22 @@ If undo fails because the new text isn't unique, undo the more recent overlappin
 **Save a task summary (recommended at the end of every patch task):**
 
 ````bash
-cat <<'SUMMARY' | promptpack --summary
+cat <<'SUMMARY' | promptpack --summary "Dense 1-2 sentence about: files touched, what changed, why."
 Explain what changed in each file and why, for a reader with zero context.
 SUMMARY
 promptpack -c
 ````
+
+The quoted argument is the `about` line. It is stored separately in `summary.json` and listed in the `# WORKLOG` section of `ctags.txt`, so keep it to 1–2 sentences, as information-dense as possible. Use plain prose only — no double quotes, backticks or `$` inside it, because the shell interprets them inside double quotes. The heredoc holds only the verbose text. If either part is missing the call is rejected immediately, with an error in `clipboard.tmp`, and nothing is saved.
+
+**Fetch full summaries by ID (IDs come from the `# WORKLOG` section in `ctags.txt`):**
+
+````bash
+promptpack -log 53 54 55
+promptpack -c
+````
+
+IDs can be space- or comma-separated (`-log 53,54,55`). Missing IDs are reported without failing the ones that were found. Use `-ph` for the code of a specific patch — LOG and PATCH IDs are separate number series.
 
 **Mark a summary as reverted (does NOT touch any patch or code):**
 
@@ -373,7 +386,8 @@ promptpack -c   # Copy all results to clipboard, remove clipboard.tmp
 6. Copy-paste and run the bash block to apply all patches and save the summary at once
 7. Review results in the F12 patch history browser
 8. Undo individual patches as needed with `-u <PATCHID>` — this is the only way code changes get reverted
-9. Run `-w` any time to rebuild `work.txt` — a full chronological changelog of the project, safe to read even on a large history; use `-ph <PATCHID...>` to pull full code for specific patches found there
+9. The `# WORKLOG` at the bottom of `ctags.txt` gives the AI a compact overview of all earlier work; it fetches full summaries with `-log <ID...>` and full patch code with `-ph <PATCHID...>` only when needed
+10. Run `-w` any time to rebuild `work.txt`, the complete chronological changelog; it grows large on long projects, so the worklog plus `-log` is the preferred way in
 
 ### Special AI Commands (Embedded in ctags.txt)
 
@@ -386,8 +400,19 @@ promptpack -c   # Copy all results to clipboard, remove clipboard.tmp
 | `#outsource` | AI writes a detailed prompt for another AI to solve the problem, ending with the `promptpack -r` commands needed to gather relevant files |
 | `#dumb` | Rewrite the last message in plain non-technical language |
 | `#ideas` | List alternative solutions/ideas, no code |
+| `#test` | Structured review in three modes: `#test` (this session's patches), `#test <target>` (a named function, class or file) and `#test full` (whole codebase, one module per round) — fixed passes (requirements, contracts, boundary values, pre-mortem, security, consistency), report only, no patches until you approve |
 | `#name` | Suggest a short (3–8 word) internal codename for the current version/problem — for reference only, never written into code |
 | `#done` | Wrap up session — AI generates a `PROMPTPACK Summary` for the next context window |
+
+### Reviewing Changes with `#test`
+
+`#test` has three modes. Plain `#test` reviews the patches the AI wrote in the current session plus directly affected code (callers and callees; it may read one or two clearly relevant imported files, but does not wander further). `#test <target>` reviews a named function, class or file, whether or not it changed this session, plus directly affected code. `#test full` covers the whole codebase, but never in a single reply: the AI plans from the ctags list, prioritizes risky parts such as parsing, file I/O and shell calls, reviews one module per round, and states plainly what was reviewed and what was not reached. `full` is a reserved word, so it cannot be used as a target name.
+
+In session mode the AI knows its own patches from the `[PATCHID n]` lines you pasted back. Only if the session was restarted via `#done` does it fall back to the patch IDs under the latest `LOG` lines of the `# WORKLOG`, fetched with `-ph`. In every mode it reads the actual code with `-r`/`-n`, because patching can auto-correct indentation and the file may differ from the patch text.
+
+Seven reasoning passes run in a fixed order, each using the results of the earlier ones: scope, requirements coverage, Design by Contract, boundary analysis, pre-mortem, OWASP/CWE/CERT (only if input, files, paths, shell or parsing are touched) and consistency/design. In session mode the requirements pass asks whether the change did exactly what was asked; if not, passes 3-7 are skipped but you still get a report. In `<target>` and `full` mode there is no request to compare with, so the code is compared with its purpose (docstring, README, function name) or the pass is skipped with a stated reason. Callers of changed functions are listed as `SUSPECTED` in the scope pass and checked by a search in the verification block. The check that the summary matches the patches applies only in session mode. The AI may skip a pass only by stating a reason in one line. Every finding has file and line, severity (bug, risk, minor remark) and status `VERIFIED` or `SUSPECTED`; bugs come with a concrete triggering input.
+
+Then comes a single verification block: all `SUSPECTED` findings are collected into one bash block (`-r`, `-n`, `-s`, `-fs`, `-e`, for example `pyflakes`/`ruff`, tests or caller searches). Even with no `SUSPECTED` findings the block holds at least a syntax check such as `py_compile` of the files under review. You run it once and paste the output back, and the AI delivers the final report. No patches are written during `#test`; fixes come only after your okay, as a normal `#patch`.
 
 ### Example AI Interaction
 
@@ -412,7 +437,7 @@ def login(username, password):
         return False
 PATCH
 
-cat <<'SUMMARY' | promptpack --summary
+cat <<'SUMMARY' | promptpack --summary "login() in auth/login.py now catches lookup and password-check failures and logs them instead of crashing."
 Added error handling to login() in auth/login.py: wraps the database
 lookup and password check in a try/except, raises a clear error when the
 user isn't found, and logs any failure instead of letting it crash
@@ -453,14 +478,15 @@ Patches are stored in `patch.json` in the project directory. Open the browser wi
 
 ### Summary History
 
-Task summaries are stored in `summary.json` in the project directory, written via `--summary` after each completed task.
+Task summaries are stored in `summary.json` in the project directory, written via `--summary` after each completed task. Each entry has a separate `about` field (the quoted `--summary` argument) next to the verbose `text` (the heredoc). Entries created before `about` existed simply lack the field.
 
 ````json
 [
   {
     "id": 1,
     "timestamp": "2025-01-25T10:35:00",
-    "text": "Added error handling to login() in auth/login.py..."
+    "text": "Added error handling to login() in auth/login.py...",
+    "about": "login() in auth/login.py now catches lookup and password-check failures and logs them."
   }
 ]
 ````
@@ -489,7 +515,9 @@ Press `i` on any `.py` file in the TUI to automatically mark it along with all l
 
 ### Work Log & On-Demand Patch Detail
 
-As `patch.json` grows on a long-running project, reading it in full can eat a large chunk of an AI's context window. `-w` builds `work.txt` — a compact PATCH TOC plus a chronological log with full summary text but only one-line patch entries (date, ID, file, description; never code). The AI can then scan dates and descriptions to identify which specific patches are worth a closer look, and fetch just those via `-ph <PATCHID...>`, keeping context usage proportional to what's actually relevant.
+As `patch.json` and `summary.json` grow on a long-running project, reading them in full can eat a large chunk of an AI's context window. Instead, `ctags.txt` ends with a compact `# WORKLOG`: chronological, one line per applied patch (`ID PATCH:description`) and per summary (`ID LOG:about`), with each patch listed just before the LOG that closes its task. The AI scans it for orientation, then fetches only what matters — `-log <ID...>` for full summaries and `-ph <PATCHID...>` for full patch code — keeping context usage proportional to what's actually relevant. LOG and PATCH IDs are separate number series, and the WORKLOG is regenerated whenever `ctags.txt` is (`F1`).
+
+`-w` still builds the complete `work.txt` (a PATCH TOC plus the full chronological log with full summary text and one-line patch entries, never code) for when the whole history is needed, but it grows large on long projects.
 
 ### Token Estimation
 
@@ -563,10 +591,11 @@ Or use `xsel` (Linux) or `pbcopy` (macOS, built-in).
 - Use `regex:` prefix explicitly for any regex patterns
 
 **Summaries & Work Log:**
-- End every patch task with a `--summary` heredoc before the closing `-c` — skip it only when purely repairing a failed patch or running a plain `-u` undo
+- End every patch task with `--summary "about"` plus a verbose heredoc before the closing `-c` — skip it only when purely repairing a failed patch or running a plain `-u` undo
+- Keep the `about` argument to 1–2 dense sentences of plain prose (no double quotes, backticks or `$`); it is what the AI sees in the `# WORKLOG`
 - Write summary text for a reader with zero context: name every file touched and explain why, not just what
 - Remember `-us` only flags a summary's own record — it never undoes code. Use `-u <PATCHID>` for that, one patch at a time
-- Use `-w` to get oriented on a large project's history without pulling code into context, then `-ph <PATCHID...>` for the specific patches worth a closer look
+- Get oriented from the `# WORKLOG` in `ctags.txt` without pulling code into context, then `-log <ID...>` for summaries worth reading in full and `-ph <PATCHID...>` for the specific patches worth a closer look; reserve `-w` for when you truly need the whole history
 
 ---
 
