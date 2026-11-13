@@ -600,6 +600,10 @@ def append_to_clipboard_tmp(message):
         print(f"Warning: Could not write to clipboard.tmp: {e}")
         return False
 
+def err_note(message):
+    """Append a terminal-only notice that the error is saved in clipboard.tmp"""
+    return f"{message}\n   ↳ error saved to clipboard.tmp - run promptpack -c"
+
 def log_error_to_file(context, detail):
     """Append a timestamped error entry to promptpack_error.log for debugging.
     Never raises — logging must not itself break the calling operation."""
@@ -638,7 +642,7 @@ def get_next_summary_id():
         return 1
     return max(s['id'] for s in history) + 1
 
-def append_to_summary_file(text, about):
+def append_to_summary_file(text, about, rating):
     """Save a timestamped summary entry to summary.json.
     Returns: (success: bool, message: str)
     """
@@ -654,15 +658,21 @@ def append_to_summary_file(text, about):
 
         summary_id = get_next_summary_id()
         timestamp = datetime.now().isoformat()
+        claimed = set()
+        for prev in history:
+            claimed.update(prev.get('patch_ids', []))
+        patch_ids = sorted(p['id'] for p in load_patch_history() if p['id'] not in claimed)
         history.append({
             'id': summary_id,
             'timestamp': timestamp,
             'text': body,
-            'about': about
+            'about': about,
+            'rating': rating,
+            'patch_ids': patch_ids
         })
         save_summary_history(history)
 
-        success_msg = f"✅ Summary saved [SUMMARYID {summary_id}]"
+        success_msg = f"✅ Summary saved [SUMMARYID {summary_id}] (rating {rating}, {len(patch_ids)} patch(es) linked)"
         append_to_clipboard_tmp(success_msg)
         return True, success_msg
     except Exception as e:
@@ -1845,6 +1855,14 @@ List commands in a table: #patch, #undo, #reset, #done, #outsource, #ask, #dumb,
   every file touched in the task and what changed in each, then explain WHY
   (the problem solved or goal served). Write it for a reader with zero
   context on this conversation.
+- `--summary` ALSO requires `--rating N` (1, 2 or 3): your judgment of how much
+  this task matters for the code and future development. 3 = architecture, data
+  format, workflow rules or a decision future work must respect (rare, roughly
+  1 task in 8); 2 = new feature or noticeable behavior change; 1 = bugfix,
+  docs, cosmetics or small refactor without behavior change. A future AI sees
+  only the # WORKLOG section, which keeps old tasks by rating, so rate honestly;
+  when unsure between two levels, pick the lower. Without it the summary is
+  rejected and not saved: resend it.
 - EXCEPTION: debugging patches — adding print/log statements, temporary
   color/highlight markers, or any other diagnostic change made only to
   locate a bug, not to fix it — do NOT get a --summary. Keep patching
@@ -1951,6 +1969,18 @@ knows what the task was). It is stored separately as the `about` field and
 listed in # WORKLOG of ctags.txt. The heredoc holds only the verbose text.
 Plain prose only: no double quotes, backticks or `$` inside it.
 
+RATING argument: `--rating N` after the about text, N = 1, 2 or 3, required. It
+grades how much the task matters for the code and for future development, and
+decides how long the task stays visible in # WORKLOG (rating 3 stays longest,
+rating 1 drops out first). Judge it by: would a future AI that sees only
+# WORKLOG make a mistake or redo work if this task were missing?
+  3 = architecture, data format, workflow rules, public interface, or a
+      decision that future work must respect. Rare.
+  2 = new feature or a noticeable behavior change.
+  1 = bugfix, docs, cosmetics, small refactor without behavior change.
+When unsure between two levels, choose the lower. A bugfix is normally 1,
+unless it reveals something future work must know.
+
 Content: be verbose and explanatory, not a one-liner. For every file touched
 in the task, name the file and describe what changed in it. Then explain WHY
 — the problem being solved, the feature being added, or the goal being
@@ -1973,7 +2003,7 @@ fixed, that fixing patch gets the task's one --summary, and the summary text
 covers only the final solution (what was wrong and what fixed it) — it does
 not list or describe the debugging steps that led there.
 ~~~bash
-cat <<'SUMMARY' | promptpack --summary "dense 1-2 sentence about of the task (files, what, why)"
+cat <<'SUMMARY' | promptpack --summary "dense 1-2 sentence about of the task (files, what, why)" --rating 2
 what changed in each file + why — spans as many lines as needed
 SUMMARY
 ~~~
@@ -2031,7 +2061,8 @@ PATCHID, file, description) at the top, followed by the full chronological
 log (summaries in full, patches as compact one-line entries). Never embeds
 patch code, so it stays cheap to read in full via `promptpack -r work.txt`.
 It grows large on long projects: prefer the # WORKLOG section at the bottom
-of this file plus `-log`, and use -w only when the full history is needed.
+of this file plus `-log`. Use `-completelog` (see # COMPLETE LOG) when you need
+the whole compact history, and -w only when you need every summary in full.
 
 # PATCH HISTORY (fetch full old/new code for specific patches)
 ~~~bash
@@ -2049,14 +2080,28 @@ be very large. Missing IDs are reported without failing the ones found.
 promptpack -log 53 54 55
 promptpack -c
 ~~~
-The # WORKLOG section at the bottom of this file lists all work in
-chronological order, one line each: `ID LOG:about` = a task summary,
-`ID PATCH:description` = a patch. Patches come right before the LOG that
-closes their task. Use it for overview; usually only the last few LOGs
-matter. To read a summary in full, fetch it with -log (space- or
+The # WORKLOG section at the bottom of this file is a filtered, chronological
+view of the work, one line each: `ID LOG R<n>:about` = a task summary with its
+impact rating 1-3, `ID PATCH:description` = a patch. Recent tasks come with
+their patch lines, right before the LOG that closes their task; older tasks
+are kept only if rated high and show their patch IDs as `[P41-43]` (a range =
+every ID in it). Tasks that were filtered out leave gaps in the LOG numbering.
+Use it for overview; usually only the last few LOGs matter. To read a summary
+in full, fetch it with -log (space- or
 comma-separated IDs, several at once for efficiency). To see a patch's code,
 use -ph with the PATCH ID. LOG and PATCH IDs are separate number series.
 Missing IDs are reported without failing the ones found.
+
+# COMPLETE LOG (every task and patch, unfiltered)
+~~~bash
+promptpack -completelog
+promptpack -c
+~~~
+The # WORKLOG section in this file is filtered by rating and age. This command
+prints the same format with nothing left out: every LOG with its rating and
+every PATCH line. It can be long, so use it only when the filtered view is not
+enough, for example when a topic is not covered by the LOGs you can see or you
+need the history behind an old decision. Then fetch details with -log / -ph.
 
 # PATCH ERRORS
 - Failed patches → `clipboard.tmp`.
@@ -2104,36 +2149,88 @@ Missing IDs are reported without failing the ones found.
 """
 
 
-def build_worklog_lines():
-    """Compact chronological worklog for ctags.txt: one line per applied patch
-    ('ID PATCH:description') and per summary ('ID LOG:about'). Patches sort
-    before the summary that closes their task (same-timestamp ties)."""
-    entries = []
-    for p in load_patch_history():
-        if not p.get('applied', False):
-            continue
-        try:
-            ts = datetime.fromisoformat(p['timestamp'])
-        except Exception:
-            continue
-        entries.append((ts, 0, 'PATCH', p))
-    for s in load_summary_history():
-        try:
-            ts = datetime.fromisoformat(s['timestamp'])
-        except Exception:
-            continue
-        entries.append((ts, 1, 'LOG', s))
-    entries.sort(key=lambda e: (e[0], e[1]))
+WORKLOG_RECENT = 50  # newest tasks: always shown, every rating, with patch lines
+WORKLOG_MID = 25     # older tasks rated 2-3
+WORKLOG_LONG = 25    # older tasks rated 3
+
+def _compress_ids(ids):
+    """[41, 42, 43, 47] -> '41-43,47'"""
+    ids = sorted(set(ids))
+    parts = []
+    i = 0
+    while i < len(ids):
+        j = i
+        while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1:
+            j += 1
+        parts.append(str(ids[i]) if i == j else f"{ids[i]}-{ids[j]}")
+        i = j + 1
+    return ','.join(parts)
+
+def build_worklog_lines(complete=False):
+    """Worklog for ctags.txt (and -completelog). Returns (note, lines).
+    Tiers: the newest WORKLOG_RECENT summaries always (every rating, with
+    their patch lines), plus the newest WORKLOG_MID older ones rated 2-3 and
+    the newest WORKLOG_LONG older ones rated 3 (patch IDs compressed into a
+    range on the LOG line). Reverted summaries are never kept in the older
+    tiers. complete=True filters nothing. A patch belongs to the summary that
+    claimed it (summary['patch_ids']); applied patches no summary has claimed
+    yet are work in progress and come last."""
+    patches = {p['id']: p for p in load_patch_history() if p.get('applied', False)}
+    summaries = sorted(load_summary_history(), key=lambda s: s['id'])
+    claimed = set()
+    for s in summaries:
+        claimed.update(s.get('patch_ids', []))
+
+    def rating_of(s):
+        return s['rating'] if s.get('rating') in (1, 2, 3) else 2
+
+    total = len(summaries)
+    if complete:
+        recent, older = summaries, []
+    else:
+        recent = summaries[max(0, total - WORKLOG_RECENT):]
+        older = summaries[:max(0, total - WORKLOG_RECENT)]
+    live = [s for s in older if not s.get('reverted', False)]
+    mid = [s for s in live if rating_of(s) >= 2][-WORKLOG_MID:]
+    long_term = [s for s in live if rating_of(s) == 3][-WORKLOG_LONG:]
+    detail_ids = {s['id'] for s in recent}
+    compact_ids = {s['id'] for s in mid} | {s['id'] for s in long_term}
+
     lines = []
-    for ts, _, kind, item in entries:
-        if kind == 'LOG':
-            tag = ' [REVERTED]' if item.get('reverted', False) else ''
-            about = ' '.join((item.get('about') or '(no about)').split())
-            lines.append(f"{item['id']} LOG:{about}{tag}")
+    for s in summaries:
+        sid = s['id']
+        compact = sid not in detail_ids
+        if compact and sid not in compact_ids:
+            continue
+        own = [pid for pid in sorted(s.get('patch_ids', [])) if pid in patches]
+        pid_tag = ''
+        if compact:
+            if own:
+                pid_tag = f" [P{_compress_ids(own)}]"
         else:
-            desc = ' '.join(str(item.get('description', '')).split())
-            lines.append(f"{item['id']} PATCH:{desc}")
-    return lines
+            for pid in own:
+                desc = ' '.join(str(patches[pid].get('description', '')).split())
+                lines.append(f"{pid} PATCH:{desc}")
+        tag = ' [REVERTED]' if s.get('reverted', False) else ''
+        about = ' '.join((s.get('about') or '(no about)').split())
+        lines.append(f"{sid} LOG R{rating_of(s)}{pid_tag}:{about}{tag}")
+    for pid in sorted(patches):
+        if pid not in claimed:
+            desc = ' '.join(str(patches[pid].get('description', '')).split())
+            lines.append(f"{pid} PATCH:{desc}")
+
+    omitted = total - len(detail_ids | compact_ids)
+    if complete:
+        note = f"Complete, unfiltered: all {total} tasks with all their patches."
+    elif omitted > 0:
+        note = (f"Filtered view: the latest {WORKLOG_RECENT} tasks (all ratings, with patch lines) "
+                f"+ up to {WORKLOG_MID} older tasks rated 2-3 + up to {WORKLOG_LONG} older tasks rated 3. "
+                f"{omitted} older task(s) were omitted, so LOG IDs have gaps. "
+                f"Everything, unfiltered: promptpack -completelog")
+    else:
+        note = (f"Nothing omitted yet: all {total} task{'s' if total != 1 else ''} shown. Older tasks get filtered "
+                f"by rating once there are more than {WORKLOG_RECENT}.")
+    return note, lines
 
 def create_ctags_file(root):
     marked_files = get_marked_files(root)
@@ -2214,10 +2311,11 @@ Use 'promptpack -r path' whenever you need to read a file's full content.
                 out.write(f"\n### {file_path.relative_to(Path.cwd())}\n")
                 out.write(f"# Error running ctags: {e}\n")
 
-        worklog_lines = build_worklog_lines()
+        worklog_note, worklog_lines = build_worklog_lines()
         if worklog_lines:
             out.write("\n# WORKLOG\n")
-            out.write("Chronological. `ID LOG:` = task summary (full text: promptpack -log ID ...), `ID PATCH:` = patch (full code: promptpack -ph ID ...). Patches come before the LOG that closes their task. LOG and PATCH IDs are separate number series.\n")
+            out.write("Chronological. `ID LOG R<n>:` = task summary with impact rating 1-3 (3 = most important; full text: promptpack -log ID ...), `ID PATCH:` = patch (full code: promptpack -ph ID ...). Patches come before the LOG that closes their task; older LOGs list their patch IDs as `[P41-43]` instead of separate lines (a range means every ID in it). LOG and PATCH IDs are separate number series.\n")
+            out.write(worklog_note + "\n")
             out.write("\n".join(worklog_lines) + "\n")
 
     return True
@@ -2383,7 +2481,18 @@ def main(stdscr):
                     cached_tokens = calculate_total_tokens(marked_files)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Interactive directory navigator')
+    class ClipboardArgumentParser(argparse.ArgumentParser):
+        def error(self, message):
+            cmd = 'promptpack ' + ' '.join(sys.argv[1:])
+            append_to_clipboard_tmp(
+                f"❌ PROMPTPACK ARGUMENT ERROR: {message}\n"
+                f"Command that failed: {cmd}\n"
+                f"Nothing was executed. Check the command syntax in the promptpack spec (e.g. -n takes 'START,END FILE', -s takes 'STRING BEFORE,AFTER FILE').\n"
+            )
+            self.print_usage(sys.stderr)
+            self.exit(2, f"{self.prog}: error: {message}\n(error copied to clipboard.tmp - run promptpack -c)\n")
+
+    parser = ClipboardArgumentParser(description='Interactive directory navigator')
     parser.add_argument('-p', '--patch', nargs=2, metavar=('FILE', 'DESC'),
                         help='Apply patch reading old/new text from stdin (format: OLD_TEXT\n---SPLIT---\nNEW_TEXT)')
 
@@ -2420,13 +2529,17 @@ if __name__ == "__main__":
     parser.add_argument('-i', '--instructions', action='store_true',
                         help='Export instructions section to promptpack_instructions.txt')
     parser.add_argument('--summary', nargs='?', const='', default=None, metavar='ABOUT',
-                        help='Save a task summary to summary.json. The argument ABOUT is 1-2 dense sentences (stored as the "about" field, listed in ctags.txt # WORKLOG); the verbose text is read from stdin (heredoc), same as -f. Both are required. Reports back [SUMMARYID N]. One per task, run after NEWFILE/PATCH commands and before the block-closing -c. Skip when only repairing a failed patch. Use -us SUMMARYID to undo everything in that time window later. Example: promptpack --summary "about text" with a heredoc on stdin.')
+                        help='Save a task summary to summary.json. The argument ABOUT is 1-2 dense sentences (stored as the "about" field, listed in ctags.txt # WORKLOG); the verbose text is read from stdin (heredoc), same as -f. Both are required, plus --rating. Reports back [SUMMARYID N]. One per task, run after NEWFILE/PATCH commands and before the block-closing -c. Skip when only repairing a failed patch. Use -us SUMMARYID to mark a summary as reverted later (annotation only, no patches are touched). Example: promptpack --summary "about text" --rating 2 with a heredoc on stdin.')
     parser.add_argument('-w', '--worklog', action='store_true',
                         help='Combine all applied patches and summary entries from patch.json/summary.json into a single chronological work.txt (TOC + compact entries, no code embedded).')
     parser.add_argument('-ph', '--patch-history', nargs='+', type=int, metavar='PATCHID',
                         help='Fetch full old/new code for one or more specific patch IDs from patch.json, copied to clipboard.tmp. Example: -ph 12 15 18. Use work.txt (-w) to decide which PATCHIDs are worth a closer look.')
     parser.add_argument('-log', '--log-fetch', nargs='+', metavar='SUMMARYID',
                         help='Fetch the full text (and ABOUT line) of one or more summaries from summary.json, copied to clipboard.tmp. IDs may be space- or comma-separated. Example: -log 53 54 55 or -log 53,54,55. IDs come from the # WORKLOG section in ctags.txt (lines starting with ID LOG:).')
+    parser.add_argument('-completelog', '--complete-log', action='store_true',
+                        help='Print the complete, unfiltered worklog (every summary with its rating, every patch line) to clipboard.tmp, in the same format as the # WORKLOG section of ctags.txt. Can be long.')
+    parser.add_argument('--rating', type=int, choices=[1, 2, 3], default=None, metavar='N',
+                        help='Required together with --summary: impact of the task on the code and future development, 1 (minor) to 3 (architecture, data format, workflow rules or decisions future work must respect). Decides how long the task stays visible in the ctags.txt # WORKLOG.')
     args = parser.parse_args()
 
 
@@ -2483,6 +2596,8 @@ if __name__ == "__main__":
                     content = f.read()
                 if content.strip():
                     if copy_clipboard_tmp_to_clipboard():
+                        copied_kb = len(content.encode('utf-8')) / 1024
+                        print(f"✅ Copied to clipboard: {copied_kb:,.1f} KB, {calculate_tokens(content):,} tokens")
                         try:
                             CLIPBOARD_TMP_FILE.unlink()
                             sys.exit(0)
@@ -2507,18 +2622,24 @@ if __name__ == "__main__":
     if args.read:
         for filepath in args.read:
             success, message = read_file_to_clipboard(filepath)
+            if not success:
+                message = err_note(message)
             print(message)
         sys.exit(0)
 
     if args.lines:
         line_range, filepath = args.lines
         success, message = read_lines_to_clipboard(line_range, filepath)
+        if not success:
+            message = err_note(message)
         print(message)
         sys.exit(0)
 
     if args.search:
         search_string, offset_range, filepath = args.search
         success, message = search_and_read_lines(search_string, offset_range, filepath)
+        if not success:
+            message = err_note(message)
         print(message)
         sys.exit(0)
 
@@ -2526,6 +2647,8 @@ if __name__ == "__main__":
     if args.file_search:
         search_term, pattern = args.file_search
         success, message = file_search(search_term, pattern)
+        if not success:
+            message = err_note(message)
 
         print(message)
         sys.exit(0)
@@ -2666,7 +2789,7 @@ if __name__ == "__main__":
             print(f"✅ {message}")
             sys.exit(0)
         else:
-            print(f"❌ {message}")
+            print(f"❌ {err_note(message)}")
             sys.exit(1)
 
     if args.undo is not None:
@@ -2675,7 +2798,7 @@ if __name__ == "__main__":
             print(f"✅ {message}")
             sys.exit(0)
         else:
-            print(f"❌ {message}")
+            print(f"❌ {err_note(message)}")
             sys.exit(1)
 
     if args.undo_summary is not None:
@@ -2684,12 +2807,17 @@ if __name__ == "__main__":
             print(f"✅ {message}")
             sys.exit(0)
         else:
-            print(f"❌ {message}")
+            print(f"❌ {err_note(message)}")
             sys.exit(1)
 
     if args.summary is not None:
         if not args.summary.strip():
             error_msg = "❌ Summary NOT saved: the about text is missing. Use: promptpack --summary 'about text' (1-2 dense sentences) plus the verbose text via heredoc on stdin. Resend the --summary command."
+            append_to_clipboard_tmp(error_msg)
+            print(error_msg)
+            sys.exit(1)
+        if args.rating is None:
+            error_msg = "❌ Summary NOT saved: --rating is missing. Add --rating 1, 2 or 3 (3 = architecture, data format, workflow rules or a decision future work must respect; 2 = new feature or noticeable behavior change; 1 = bugfix, docs, cosmetics). Resend the --summary command."
             append_to_clipboard_tmp(error_msg)
             print(error_msg)
             sys.exit(1)
@@ -2699,7 +2827,9 @@ if __name__ == "__main__":
             print(error_msg)
             sys.exit(1)
         text = sys.stdin.read()
-        success, message = append_to_summary_file(text, args.summary)
+        success, message = append_to_summary_file(text, args.summary, args.rating)
+        if not success:
+            message = err_note(message)
         print(message)
         sys.exit(0 if success else 1)
 
@@ -2726,7 +2856,8 @@ if __name__ == "__main__":
         if found:
             msg = f"✅ Fetched {len(found)} patch(es): {', '.join(map(str, found))}"
         else:
-            msg = "❌ No matching patches found"
+            msg = "❌ No matching patches found (error saved to clipboard.tmp - run promptpack -c)"
+            append_to_clipboard_tmp("❌ No matching patches found")
         if missing:
             msg += f" | ⚠️ Not found: {', '.join(map(str, missing))}"
         print(msg)
@@ -2754,7 +2885,9 @@ if __name__ == "__main__":
             except Exception:
                 ts_str = s.get('timestamp', 'unknown time')
             tag = " [REVERTED]" if s.get('reverted', False) else ""
-            output_lines.append(f"[{ts_str}] LOG [SUMMARYID {sid}]{tag}")
+            output_lines.append(f"[{ts_str}] LOG [SUMMARYID {sid}] RATING {s.get('rating', '?')}{tag}")
+            if s.get('patch_ids'):
+                output_lines.append(f"PATCHES: {_compress_ids(s['patch_ids'])}")
             if s.get('about'):
                 output_lines.append(f"ABOUT: {s['about']}")
             output_lines.append(s.get('text', '').strip())
@@ -2765,13 +2898,23 @@ if __name__ == "__main__":
         if found:
             msg = f"✅ Fetched {len(found)} summary(ies): {', '.join(map(str, found))}"
         else:
-            msg = "❌ No matching summaries found"
+            msg = "❌ No matching summaries found (error saved to clipboard.tmp - run promptpack -c)"
+            append_to_clipboard_tmp("❌ No matching summaries found")
         if missing:
             msg += f" | ⚠️ Not found: {', '.join(map(str, missing))}"
         if bad:
             msg += f" | ⚠️ Not a number: {', '.join(bad)}"
         print(msg)
         sys.exit(0 if found else 1)
+    if args.complete_log:
+        note, lines = build_worklog_lines(complete=True)
+        if not lines:
+            append_to_clipboard_tmp("❌ No summaries or patches found")
+            print("❌ No summaries or patches found (error saved to clipboard.tmp - run promptpack -c)")
+            sys.exit(1)
+        append_to_clipboard_tmp(note + "\n" + "\n".join(lines))
+        print(f"✅ Complete log: {len(lines)} lines copied to clipboard.tmp - run promptpack -c")
+        sys.exit(0)
     if args.instructions:
         try:
             with open('promptpack_instructions.txt', 'w', encoding='utf-8') as out:
@@ -2804,21 +2947,6 @@ if __name__ == "__main__":
                 print(f"\nIncluded {file_count} files")
                 print(f"File size: {file_size:,} bytes")
                 print(f"Tokensize: {total_tokens:,} tokens")
-                print(f"\nModel capacity:")
-
-                models = {
-                    'DeepSeek': 128000,
-                    'Grok': 128000,
-                    'GPT-4': 32768,
-                    'GPT-5': 128000,
-                    'Claude': 200000,
-                    'Qwen': 128000
-                }
-
-                for model, max_tokens in models.items():
-                    pct = (total_tokens / max_tokens) * 100
-                    status = '✅' if total_tokens <= max_tokens else '🔴'
-                    print(f"{status} {pct:5.1f}%\t{model}")
 
             except Exception as e:
                 print(f"❌ Error reading {filename}: {e}")
