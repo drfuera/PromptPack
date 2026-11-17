@@ -34,6 +34,72 @@ SUMMARY_HISTORY_FILE = Path('summary.json')
 CLIPBOARD_TMP_FILE = Path('clipboard.tmp')
 TEXT_CHECK_BYTES = 8192
 
+def _rel_path(p):
+    """Path relative to the current directory, for display only. Falls back to
+    the path itself when it lies outside cwd (absolute path elsewhere, symlink
+    pointing out of the project) instead of raising ValueError."""
+    p = Path(p)
+    try:
+        return p.relative_to(Path.cwd())
+    except ValueError:
+        return p
+
+class HistoryCorruptError(Exception):
+    """patch.json / summary.json exists but cannot be read as a JSON list."""
+
+def _atomic_write_text(path, text):
+    """Write text so a crash/Ctrl-C can never leave a half-written file:
+    write to <name>.tmp, fsync, then os.replace (atomic on the same filesystem)."""
+    path = Path(path)
+    tmp = path.with_name(path.name + '.tmp')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+def _backup_corrupt_file(path):
+    """Keep a copy of an unreadable history file (name carries a content hash,
+    so repeated runs do not pile up identical copies). Returns the name or None."""
+    try:
+        data = path.read_bytes()
+        backup = path.with_name(f"{path.name}.corrupt-{hashlib.sha256(data).hexdigest()[:8]}")
+        if not backup.exists():
+            backup.write_bytes(data)
+        return backup.name
+    except OSError:
+        return None
+
+def _load_json_history(path):
+    """Load a history file. [] only when the file does not exist. A file that
+    exists but is unreadable raises HistoryCorruptError instead of silently
+    returning [] - the next save would overwrite the whole history and PATCHIDs /
+    SUMMARYIDs the AI has already seen would be handed out again."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("top-level JSON value is not a list")
+        return data
+    except OSError as e:
+        raise HistoryCorruptError(f"Cannot read {path.name}: {e}. Nothing was changed.")
+    except ValueError as e:   # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        backup = _backup_corrupt_file(path)
+        saved = f" A copy was saved as {backup}." if backup else ""
+        raise HistoryCorruptError(
+            f"{path.name} is corrupt ({e}). Nothing was changed and no new history was started.{saved} "
+            f"Repair {path.name} (a JSON list) or delete it to start a fresh history, then resend the command.")
+
 def tidy_file(pattern):
     """Remove whitespace-only lines and reduce multiple empty lines to max 1"""
     import glob
@@ -85,7 +151,7 @@ def tidy_file(pattern):
                 if tidied and tidied[-1]:  # Add final newline if file is not empty
                     f.write('\n')
 
-            rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+            rel_path = _rel_path(filepath)
             stats = f"Removed {removed_lines} duplicate empty lines, {original_whitespace} trailing whitespace chars"
             results.append(f"✅ Tidied {rel_path} | {stats}")
             success_count += 1
@@ -320,7 +386,7 @@ def read_lines_to_clipboard(line_range, filepath):
 
 
 
-        rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+        rel_path = _rel_path(filepath)
 
         if start < 1 or start > end:
             error_msg = f"❌ {rel_path}: Invalid range {start},{end} (file has {len(lines)} lines)"
@@ -349,7 +415,10 @@ def read_lines_to_clipboard(line_range, filepath):
 
 
 # Unambiguous regex chars: escaped meta-chars, groups, quantifiers — never in literal searches
-_REGEX_HINT = re.compile(r'\\[|sSwWdDbBtnr]|\(\?|(?<![*?])[+{]')
+_STRONG_REGEX_HINT = re.compile(r'\\[|sSwWdDbBtnr]|\(\?')
+# '+' and '{' are ambiguous: they are just as common in code ("a + b", "i += 1", "n++")
+_WEAK_REGEX_HINT = re.compile(r'(?<![*?])[+{]')
+_REGEX_HINT = re.compile(_STRONG_REGEX_HINT.pattern + '|' + _WEAK_REGEX_HINT.pattern)
 
 def _grep_to_python_regex(s):
     """Convert grep-style regex escapes to Python: \| → |"""
@@ -358,7 +427,7 @@ def _grep_to_python_regex(s):
 def _resolve_search(s):
     """Return (pattern, use_regex, auto_promoted).
     - explicit 'regex:' prefix  → regex, not auto
-    - unambiguous regex escapes → regex, auto (silent)
+    - unambiguous regex escapes → regex, auto (see _search_strategies)
     - wildcards (* ?)           → glob, not regex
     - else                      → literal
     """
@@ -367,6 +436,34 @@ def _resolve_search(s):
     if _REGEX_HINT.search(s):
         return _grep_to_python_regex(s), True, True   # auto-promote silently
     return s, False, False     # glob or literal, decided by caller
+
+def _search_strategies(raw):
+    """Ordered list of (search_type, shown_string, match_func) to try for a -s/-fs
+    search string; the first strategy that finds anything wins. Raises re.error
+    for an invalid explicit 'regex:' pattern.
+    - 'regex:' prefix            -> regex only
+    - strong regex escapes (\\s \\d (?: ...) -> regex first, literal text as fallback
+    - only '+' / '{' (ambiguous)  -> LITERAL first, regex as fallback, so searching
+                                    for "i += 1" or "a + b" finds that exact text
+    - wildcards (* ?)            -> glob;  anything else -> literal"""
+    pattern, use_regex, auto = _resolve_search(raw)
+    low = raw.lower()
+    literal = ('literal', raw, lambda line: low in line.lower())
+    if use_regex:
+        try:
+            rx = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            if not auto:
+                raise
+            return [literal]
+        regex = ('regex', pattern, lambda line: rx.search(line) is not None)
+        if not auto:
+            return [regex]
+        return [literal, regex] if not _STRONG_REGEX_HINT.search(raw) else [regex, literal]
+    if '*' in pattern or '?' in pattern:
+        wl = pattern.lower()
+        return [('wildcard', pattern, lambda line: fnmatch.fnmatch(line.lower(), f"*{wl}*"))]
+    return [literal]
 
 def search_and_read_lines(search_string, offset_range, filepath):
     """Search for string and show lines with offset. Supports wildcards (* ?) and regex (prefix with 'regex:')"""
@@ -379,24 +476,14 @@ def search_and_read_lines(search_string, offset_range, filepath):
         return False, error_msg
 
 
-    search_string, use_regex, auto_promoted = _resolve_search(search_string)
-    has_wildcards = not use_regex and ('*' in search_string or '?' in search_string)
-
-    if use_regex:
-        try:
-            pattern = re.compile(search_string, re.IGNORECASE)
-        except re.error as e:
-            error_msg = f"❌ Invalid regex pattern: {e}"
-            append_to_clipboard_tmp(error_msg)
-            return False, error_msg
-        def match_func(line):
-            return pattern.search(line) is not None
-    elif has_wildcards:
-        def match_func(line):
-            return fnmatch.fnmatch(line.lower(), f"*{search_string.lower()}*")
-    else:
-        def match_func(line):
-            return search_string.lower() in line.lower()
+    try:
+        strategies = _search_strategies(search_string)
+    except re.error as e:
+        error_msg = f"❌ Invalid regex pattern: {e}"
+        append_to_clipboard_tmp(error_msg)
+        return False, error_msg
+    first_string = strategies[0][1]
+    has_wildcards = strategies[0][0] == 'wildcard'
 
     try:
         # Parse offset range (e.g., "10,30" means 10 lines before, 30 lines after)
@@ -406,17 +493,19 @@ def search_and_read_lines(search_string, offset_range, filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
-        # Find all occurrences using match function
+        # Find all occurrences; ambiguous patterns are tried as literal text AND as regex
         match_lines = []
-        for i, line in enumerate(lines, start=1):
-            if match_func(line):
-                match_lines.append(i)
-
+        for search_type, search_string, match_func in strategies:
+            match_lines = [i for i, line in enumerate(lines, start=1) if match_func(line)]
+            if match_lines:
+                break
 
         if not match_lines:
-            error_msg = f"String '{search_string}' not found in {filepath}"
+            error_msg = f"String '{first_string}' not found in {filepath}"
+            if len(strategies) > 1:
+                error_msg += " (tried as literal text and as regex; prefix with 'regex:' to force regex)"
             if has_wildcards:
-                error_msg += f"\n⚠️  If this was a regex pattern, prefix with 'regex:' — e.g. regex:{search_string}"
+                error_msg += f"\n⚠️  If this was a regex pattern, prefix with 'regex:' — e.g. regex:{first_string}"
             append_to_clipboard_tmp(error_msg)
             return False, error_msg
 
@@ -428,9 +517,8 @@ def search_and_read_lines(search_string, offset_range, filepath):
         start = max(1, match_line - before)
         end = min(len(lines), match_line + after)
 
-        rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+        rel_path = _rel_path(filepath)
 
-        search_type = "regex" if use_regex else ("wildcard" if has_wildcards else "literal")
         uniqueness_info = "" if is_unique else f" | Search pattern is not unique, has {len(match_lines)} hits"
         header = f"\n------ {rel_path} (found '{search_string}' [{search_type}] at line {match_line}{uniqueness_info}) ------\n"
         selected_with_numbers = header
@@ -469,25 +557,13 @@ def file_search(search_term, pattern):
 
 
 
-    search_term, use_regex, auto_promoted = _resolve_search(search_term)
-    has_wildcards = not use_regex and ('*' in search_term or '?' in search_term)
-
-    if use_regex:
-        try:
-            regex_pattern = re.compile(search_term, re.IGNORECASE)
-
-        except re.error as e:
-            error_msg = f"❌ Invalid regex pattern: {e}"
-            append_to_clipboard_tmp(error_msg)
-            return False, error_msg
-        def match_func(line):
-            return regex_pattern.search(line) is not None
-    elif has_wildcards:
-        def match_func(line):
-            return fnmatch.fnmatch(line.lower(), f"*{search_term.lower()}*")
-    else:
-        def match_func(line):
-            return search_term.lower() in line.lower()
+    try:
+        strategies = _search_strategies(search_term)
+    except re.error as e:
+        error_msg = f"❌ Invalid regex pattern: {e}"
+        append_to_clipboard_tmp(error_msg)
+        return False, error_msg
+    search_term = strategies[0][1]
 
     # Make pattern recursive if it doesn't already contain **
     if '**' not in pattern:
@@ -520,33 +596,41 @@ def file_search(search_term, pattern):
         append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
-    # Search in each file
-    results = []
-    total_hits = 0
+    # Search in each file; ambiguous patterns are tried as literal text AND as regex
+    def _scan(match_func):
+        results = []
+        total_hits = 0
 
-    for filepath in sorted(text_files):
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+        for filepath in sorted(text_files):
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
 
-            # Find all occurrences in this file
-            file_hits = []
-            for line_num, line in enumerate(lines, start=1):
-                if match_func(line):
-                    file_hits.append((line_num, line.rstrip()))
+                # Find all occurrences in this file
+                file_hits = []
+                for line_num, line in enumerate(lines, start=1):
+                    if match_func(line):
+                        file_hits.append((line_num, line.rstrip()))
 
-            if file_hits:
-                rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
-                results.append({
-                    'file': rel_path,
-                    'hits': file_hits,
-                    'count': len(file_hits)
-                })
-                total_hits += len(file_hits)
+                if file_hits:
+                    rel_path = _rel_path(filepath)
+                    results.append({
+                        'file': rel_path,
+                        'hits': file_hits,
+                        'count': len(file_hits)
+                    })
+                    total_hits += len(file_hits)
 
-        except Exception as e:
-            # Skip files that can't be read
-            continue
+            except Exception as e:
+                # Skip files that can't be read
+                continue
+        return results, total_hits
+
+    results, total_hits = [], 0
+    for _type, _shown, match_func in strategies:
+        results, total_hits = _scan(match_func)
+        if results:
+            break
 
     if not results:
         error_msg = f"❌ No matches found for '{search_term}' in {len(text_files)} file(s)"
@@ -576,7 +660,7 @@ def read_file_to_clipboard(filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        rel_path = filepath.relative_to(Path.cwd()) if filepath.is_absolute() else filepath
+        rel_path = _rel_path(filepath)
         header = f"\n------ {rel_path} ------\n"
         content_with_header = header + content
 
@@ -615,21 +699,13 @@ def log_error_to_file(context, detail):
         pass
 
 def load_summary_history():
-    """Load summary history from JSON"""
-    if not SUMMARY_HISTORY_FILE.exists():
-        return []
-    try:
-        with open(SUMMARY_HISTORY_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Warning: Could not load summary history: {e}")
-        return []
+    """Load summary history from JSON (raises HistoryCorruptError if unreadable)"""
+    return _load_json_history(SUMMARY_HISTORY_FILE)
 
 def save_summary_history(history):
-    """Save summary history to JSON"""
+    """Save summary history to JSON (atomic)"""
     try:
-        with open(SUMMARY_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
+        _atomic_write_text(SUMMARY_HISTORY_FILE, json.dumps(history, indent=2, ensure_ascii=False))
         return True
     except Exception as e:
         print(f"Error saving summary history: {e}")
@@ -719,21 +795,13 @@ def copy_to_clipboard(text):
     return False
 
 def load_patch_history():
-    """Load patch history from JSON"""
-    if not PATCH_HISTORY_FILE.exists():
-        return []
-    try:
-        with open(PATCH_HISTORY_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Warning: Could not load patch history: {e}")
-        return []
+    """Load patch history from JSON (raises HistoryCorruptError if unreadable)"""
+    return _load_json_history(PATCH_HISTORY_FILE)
 
 def save_patch_history(history):
-    """Save patch history to JSON"""
+    """Save patch history to JSON (atomic)"""
     try:
-        with open(PATCH_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
+        _atomic_write_text(PATCH_HISTORY_FILE, json.dumps(history, indent=2, ensure_ascii=False))
         return True
     except Exception as e:
         print(f"Error saving patch history: {e}")
@@ -769,56 +837,144 @@ def tidy_text(text):
 
     return '\n'.join(tidied)
 
-def fix_indentation_errors(content):
+def _scan_code_lines(content):
+    """Classify each physical line of Python source with a small scanner
+    (tokenize cannot be used: it raises on the very indentation errors we repair).
+    Returns one (protected, ends_stmt, last_sig) tuple per line:
+      protected - line starts inside a (triple-)quoted string, inside brackets or
+                  after a backslash continuation: its leading whitespace is data
+                  or alignment, never block structure
+      ends_stmt - a logical statement ends on this physical line
+      last_sig  - last significant character of the code on the line
+                  (comments excluded), '' if none"""
+    info = []
+    state = None        # None, or the quote string ("'", '"', "'''", '"""') we are inside
+    depth = 0
+    cont = False
+    for line in content.splitlines(keepends=True):
+        protected = state is not None or depth > 0 or cont
+        cont = False
+        last_sig = ''
+        esc_nl = False
+        j, L = 0, len(line)
+        while j < L:
+            ch = line[j]
+            if state is not None:
+                if ch == '\\':
+                    if j + 1 >= L or line[j + 1] in '\r\n':
+                        esc_nl = True
+                    j += 2
+                    continue
+                if line.startswith(state, j):
+                    j += len(state)
+                    state = None
+                    last_sig = '"'
+                    continue
+                j += 1
+                continue
+            if ch == '#':
+                break
+            if ch in '\'"':
+                q = ch * 3 if line.startswith(ch * 3, j) else ch
+                state = q
+                j += len(q)
+                continue
+            if ch in '([{':
+                depth += 1
+            elif ch in ')]}':
+                depth = max(0, depth - 1)
+            if ch == '\\' and line[j + 1:].strip('\r\n') == '':
+                cont = True
+                j += 1
+                continue
+            if not ch.isspace():
+                last_sig = ch
+            j += 1
+        if state is not None and len(state) == 1 and not esc_nl:
+            state = None            # unterminated single-line string: syntax error anyway
+        info.append((protected, state is None and depth == 0 and not cont, last_sig))
+    return info
 
+def _guess_indent_unit(lines, info, span):
+    """Indent width used by the file itself (taken from lines outside the patch
+    span that open a block); 4 if it cannot be determined."""
+    counts = {}
+    prev_indent, prev_opener = None, False
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        protected, ends_stmt, last_sig = info[i]
+        if not stripped.strip() or (not protected and stripped.startswith('#')):
+            continue
+        cur = len(line) - len(stripped)
+        if (not protected and prev_opener and prev_indent is not None and cur > prev_indent
+                and not (span[0] <= i < span[1])):
+            counts[cur - prev_indent] = counts.get(cur - prev_indent, 0) + 1
+        if not protected:
+            prev_indent = cur
+        prev_opener = ends_stmt and last_sig == ':'
+    return max(counts, key=counts.get) if counts else 4
+
+def fix_indentation_errors(content, span=None):
     """
-    Fixes ONLY indentation errors by analyzing Python structure.
-    Does NOT change code logic, ONLY whitespace at the beginning of lines.
+    Repairs indentation errors in the lines the patch just wrote.
+    span = (first_line_index, end_line_index_exclusive) of the patched lines;
+    without a span nothing is changed.
+    ONLY leading whitespace of lines inside the span is touched. Lines outside the
+    span, blank lines, comments, string/docstring bodies, lines inside brackets and
+    backslash continuations are never modified. Files indented with tabs are not
+    handled (nothing is changed, so the caller reports the syntax error).
     Returns: (fixed_content: str, was_fixed: bool)
     """
+    if span is None or span[0] >= span[1]:
+        return content, False
 
     lines = content.splitlines(keepends=True)
-    fixed_lines = []
-    indent_stack = [0]  # Stack to keep track of indent levels
+    info = _scan_code_lines(content)
+    for i, line in enumerate(lines):
+        if not info[i][0] and '\t' in line[:len(line) - len(line.lstrip())]:
+            return content, False
+
+    unit = _guess_indent_unit(lines, info, span)
+    out = list(lines)
+    stack = [0]
+    prev_opener = False
 
     for i, line in enumerate(lines):
         stripped = line.lstrip()
-
-        # Keep empty lines and comments as-is
-        if not stripped or stripped.startswith('#'):
-            fixed_lines.append(line)
+        protected, ends_stmt, last_sig = info[i]
+        if not stripped.strip() or (not protected and stripped.startswith('#')):
+            continue
+        if protected:
+            prev_opener = ends_stmt and last_sig == ':'
             continue
 
-        # Count current indent
-        current_indent = len(line) - len(stripped)
-
-        # Check if previous line ended with :
-        if fixed_lines:
-            prev_line = fixed_lines[-1].rstrip()
-            if prev_line.endswith(':'):
-                # Expect increased indent
-                expected_indent = indent_stack[-1] + 4
-                indent_stack.append(expected_indent)
+        cur = len(line) - len(stripped)
+        if span[0] <= i < span[1]:
+            if prev_opener:
+                target = stack[-1] + unit
+                stack.append(target)
             else:
-                # Check if we should decrease indent (dedent)
-                # If current indent is less than stack, pop
-                while len(indent_stack) > 1 and current_indent < indent_stack[-1]:
-                    indent_stack.pop()
-
-                expected_indent = indent_stack[-1]
+                while len(stack) > 1 and cur < stack[-1]:
+                    stack.pop()
+                target = stack[-1]
+            if cur != target:
+                out[i] = ' ' * target + stripped
         else:
-            expected_indent = 0
+            # outside the patch: what is on disk is the truth, only track it
+            if prev_opener:
+                if cur > stack[-1]:
+                    stack.append(cur)
+            else:
+                while len(stack) > 1 and cur < stack[-1]:
+                    stack.pop()
+        prev_opener = ends_stmt and last_sig == ':'
 
-        # Apply correct indent
-        fixed_line = ' ' * expected_indent + stripped
-        fixed_lines.append(fixed_line)
-
-    fixed_content = ''.join(fixed_lines)
+    fixed_content = ''.join(out)
     return fixed_content, fixed_content != content
 
-def validate_and_fix_python_syntax(filepath, content):
+def validate_and_fix_python_syntax(filepath, content, span=None):
     """
-    Validates Python syntax and fixes indentation errors automatically.
+    Validates Python syntax and fixes indentation errors in the patched lines (span).
     Returns: (fixed_content: str, was_fixed: bool, error_msg: str)
     """
 
@@ -832,7 +988,7 @@ def validate_and_fix_python_syntax(filepath, content):
     except IndentationError:
         # Try to fix indentation errors
         try:
-            fixed_content, was_fixed = fix_indentation_errors(content)
+            fixed_content, was_fixed = fix_indentation_errors(content, span)
 
             # Verify that the fix works
             ast.parse(fixed_content)
@@ -844,6 +1000,15 @@ def validate_and_fix_python_syntax(filepath, content):
         return content, False, f"SyntaxError at line {e.lineno}: {e.msg}"
     except Exception as e:
         return content, False, ""
+
+def _line_span(content, pos, text):
+    """(first_line_index, end_line_index_exclusive) of the lines that `text`,
+    inserted at character offset `pos`, occupies in `content`."""
+    start = content.count('\n', 0, pos)
+    return (start, start + len(text.splitlines()))
+
+def _changed_lines(before, after):
+    return sum(1 for a, b in zip(before.splitlines(), after.splitlines()) if a != b)
 
 def _synced_new_text(new_content, validated_content, pos, new_text):
     """After an indentation auto-fix, the text stored in patch history must
@@ -879,6 +1044,96 @@ def _delete_anchor(content, start, end, context_chars=60):
     after = content[end:end + context_chars]
     return before, after
 
+def _flexible_pattern(old_text, new_text=''):
+    """Regex for whitespace-agnostic matching of old_text (or None).
+    Whitespace BETWEEN tokens matches any whitespace run. Whitespace at the very
+    start/end of old_text must not become a greedy \\s+: that used to swallow the
+    blank lines and indentation of the neighbouring lines. Instead a trailing
+    newline consumes only the rest of that line plus one line break. Extra blank
+    lines at the end of old_text are consumed only when new_text ends with blank
+    lines too (or deletes the text), so a stray empty line in old_text cannot
+    delete the blank line between two functions. Leading indentation consumes the
+    file's real indentation of that line."""
+    m = re.match(r'(\s*)(.*?)(\s*)\Z', old_text, re.S)
+    lead, core, trail = m.groups()
+    if not core:
+        return None
+    body = r'\s+'.join(re.escape(part) for part in re.split(r'\s+', core))
+    lead_indent = lead.rsplit('\n', 1)[-1]
+    prefix = r'(?:(?<![^\n])[ \t]*)?' if lead_indent else ''
+    nl = trail.count('\n')
+    if nl:
+        new_nl = new_text[len(new_text.rstrip()):].count('\n')
+        blanks = nl - 1 if not new_text.strip() else max(0, min(nl, new_nl) - 1)
+        suffix = r'[ \t]*(?:\n|\Z)' + (r'(?:[ \t]*\n){0,%d}' % blanks if blanks else '')
+    elif trail:
+        suffix = r'[ \t]*'
+    else:
+        suffix = ''
+    return prefix + body + suffix
+
+# split in two on purpose: promptpack refuses the literal marker in a patch's new_text,
+# and this file is itself patched with promptpack
+_WILDCARD_MARK = '***WILDCARD_' + 'PROMPTPACK***'
+
+_CTX_CHARS = 80     # how much text on each side of a patch is remembered
+
+def _record_context(content, new_text, hint):
+    """(ctx_before, ctx_after): the text directly around new_text as it now sits in
+    `content`, at the occurrence closest to offset `hint`. (None, None) if new_text
+    is empty or not found."""
+    if not new_text:
+        return None, None
+    best = None
+    i = content.find(new_text)
+    while i != -1:
+        if best is None or abs(i - hint) < abs(best - hint):
+            best = i
+        i = content.find(new_text, i + 1)
+    if best is None:
+        return None, None
+    end = best + len(new_text)
+    return content[max(0, best - _CTX_CHARS):best], content[end:end + _CTX_CHARS]
+
+def _locate_patch(content, patch):
+    """Offsets where patch['new_text'] sits in `content` together with the text that
+    surrounded it when it was applied. Either side is enough, so a neighbouring
+    patch that changed one side does not hide it; identical text somewhere else is
+    not accepted. Entries without recorded context (older history) fall back to a
+    guarded plain search."""
+    new = patch['new_text']
+    cb, ca = patch.get('ctx_before'), patch.get('ctx_after')
+    found = []
+    if not cb and not ca:
+        # Older entry without recorded context: the position cannot be checked, but if
+        # the text this patch replaced is back in the file (and new_text does not
+        # contain it) the patch is gone - git checkout or a manual edit.
+        old = patch.get('actual_old_text') or patch.get('old_text', '')
+        if old and _WILDCARD_MARK not in old and old not in new and old in content:
+            return found
+    i = content.find(new)
+    while i != -1:
+        if not cb and not ca:
+            found.append(i)
+        else:
+            ok_b = bool(cb) and content[max(0, i - len(cb)):i] == cb
+            ok_a = bool(ca) and content[i + len(new):i + len(new) + len(ca)] == ca
+            if ok_b or ok_a:
+                found.append(i)
+        i = content.find(new, i + 1)
+    return found
+
+def _patch_still_in_effect(prev, content):
+    """Is an 'applied' history entry really still present in the file? False when
+    the file was restored or edited outside promptpack (git checkout, manual edit)."""
+    new = prev.get('new_text', '')
+    if new:
+        return bool(_locate_patch(content, prev))
+    old = prev.get('actual_old_text') or prev.get('old_text', '')
+    if not old or _WILDCARD_MARK in old:
+        return True     # cannot tell
+    return old not in content
+
 def apply_patch(filepath, description, old_text, new_text):
     """
     Apply a patch and save in history
@@ -888,7 +1143,7 @@ def apply_patch(filepath, description, old_text, new_text):
     filepath = Path(filepath).resolve()
 
     if not filepath.exists():
-        rel_path = Path(filepath).relative_to(Path.cwd())
+        rel_path = _rel_path(Path(filepath))
         error_msg = f"File not found: {rel_path}"
         append_to_clipboard_tmp(error_msg)
         return False, error_msg
@@ -902,7 +1157,7 @@ def apply_patch(filepath, description, old_text, new_text):
 
     WILDCARD = '***WILDCARD_PROMPTPACK***'
     if WILDCARD in new_text:
-        rel_path = filepath.relative_to(Path.cwd())
+        rel_path = _rel_path(filepath)
         file_col = f"{rel_path}".ljust(40)
         desc_col = f"{description}".ljust(50)
         error_msg = f"❌ {file_col} {desc_col} ***WILDCARD_PROMPTPACK*** is not allowed in new_text"
@@ -915,17 +1170,28 @@ def apply_patch(filepath, description, old_text, new_text):
 
         # Fail-safe: reject a patch identical to one that is already applied
         _norm_new = new_text[1:] if new_text.startswith('\n') else new_text
-        for _prev in load_patch_history():
+        _hist = load_patch_history()
+        _stale = False
+        for _prev in _hist:
             if (_prev.get('applied')
                     and _prev.get('filepath') == str(filepath)
                     and _prev.get('old_text') == old_text
                     and _prev.get('new_text') in (new_text, _norm_new)):
-                _rel = filepath.relative_to(Path.cwd())
+                if not _patch_still_in_effect(_prev, original_content):
+                    # file was restored/edited outside promptpack: this entry is stale
+                    # and must not lock the same patch out forever
+                    _prev['applied'] = False
+                    _prev['stale'] = True
+                    _stale = True
+                    continue
+                _rel = _rel_path(filepath)
                 error_msg = (f"❌ {str(_rel).ljust(40)} {description.ljust(50)} "
                              f"Duplicate patch: identical patch already applied "
                              f"[PATCHID {_prev['id']}] - undo it first with -u if you want to reapply")
                 append_to_clipboard_tmp(error_msg)
                 return False, error_msg
+        if _stale:
+            save_patch_history(_hist)
 
 
         # Wildcard mode: split old_text on placeholder, match prefix + anything + suffix
@@ -945,7 +1211,7 @@ def apply_patch(filepath, description, old_text, new_text):
                 matches.append((pre_pos, suf_pos + len(wc_suffix)))
                 search_start = pre_pos + 1
 
-            rel_path = filepath.relative_to(Path.cwd())
+            rel_path = _rel_path(filepath)
             file_col = f"{rel_path}".ljust(40)
             desc_col = f"{description}".ljust(50)
 
@@ -969,9 +1235,15 @@ def apply_patch(filepath, description, old_text, new_text):
                 delete_anchor_before, delete_anchor_after = None, None
             new_content = original_content[:wc_start] + new_text + original_content[wc_end:]
 
-            validated_content, was_fixed, err = validate_and_fix_python_syntax(filepath, new_content)
+            validated_content, was_fixed, err = validate_and_fix_python_syntax(
+                filepath, new_content, _line_span(new_content, wc_start, new_text))
             if err:
                 full_error = f"❌ {file_col} {desc_col} {err}"
+                append_to_clipboard_tmp(full_error)
+                return False, full_error
+
+            if validated_content == original_content:
+                full_error = f"❌ {file_col} {desc_col} Patch changes nothing: the matched text already equals new_text (file left untouched)"
                 append_to_clipboard_tmp(full_error)
                 return False, full_error
 
@@ -981,6 +1253,7 @@ def apply_patch(filepath, description, old_text, new_text):
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(validated_content)
 
+            ctx_before, ctx_after = _record_context(validated_content, new_text, wc_start)
             history = load_patch_history()
             patch_id = get_next_patch_id()
             history.append({
@@ -992,6 +1265,8 @@ def apply_patch(filepath, description, old_text, new_text):
                 'old_text': old_text,
                 'actual_old_text': original_content[wc_start:wc_end],
                 'new_text': new_text,
+                'ctx_before': ctx_before,
+                'ctx_after': ctx_after,
                 'delete_anchor_before': delete_anchor_before,
                 'delete_anchor_after': delete_anchor_after,
                 'applied': True
@@ -1001,7 +1276,7 @@ def apply_patch(filepath, description, old_text, new_text):
             icon = "🔧" if was_fixed else "🧩"
             indicators_wc = ["wildcard match"]
             if was_fixed:
-                indicators_wc.append("indentation auto-fixed")
+                indicators_wc.append(f"indentation auto-fixed: {_changed_lines(new_content, validated_content)} line(s)")
             if desc_truncated:
                 indicators_wc.append("description truncated to 10 words")
             indicator_str = f" ({', '.join(indicators_wc)})"
@@ -1009,7 +1284,7 @@ def apply_patch(filepath, description, old_text, new_text):
             return True, success_msg
 
         if old_text == '':
-            rel_path = filepath.relative_to(Path.cwd())
+            rel_path = _rel_path(filepath)
             file_col = f"{rel_path}".ljust(40)
             desc_col = f"{description}".ljust(50)
             error_msg = f"❌ {file_col} {desc_col} old_text is empty — nothing to match (use NEW FILE for pure insertions)"
@@ -1019,26 +1294,26 @@ def apply_patch(filepath, description, old_text, new_text):
         # Try exact match first
         used_flexible_whitespace = False
         used_tidy_matching = False
+        match_start = None
 
         if old_text in original_content:
             count = original_content.count(old_text)
 
             if count > 1:
-                rel_path = filepath.relative_to(Path.cwd())
+                rel_path = _rel_path(filepath)
                 file_col = f"{rel_path}".ljust(40)
                 desc_col = f"{description}".ljust(50)
                 error_msg = f"❌ {file_col} {desc_col} Old text appears {count} times in file (must be unique)"
                 append_to_clipboard_tmp(error_msg)
                 return False, error_msg
             actual_old_text = old_text
+            match_start = original_content.index(old_text)
 
         else:
             # Try whitespace-agnostic matching
             used_flexible_whitespace = True
-            pattern = re.sub(r'\s+', '\x00WHITESPACE\x00', old_text)
-            pattern = re.escape(pattern)
-            pattern = pattern.replace('\x00WHITESPACE\x00', r'\s+')
-            matches = list(re.finditer(pattern, original_content))
+            pattern = _flexible_pattern(old_text, new_text)
+            matches = list(re.finditer(pattern, original_content)) if pattern else []
 
             if len(matches) == 0:
                 # Try tidy matching as last resort
@@ -1050,7 +1325,7 @@ def apply_patch(filepath, description, old_text, new_text):
                     count = tidied_content.count(tidied_old)
 
                     if count > 1:
-                        rel_path = filepath.relative_to(Path.cwd())
+                        rel_path = _rel_path(filepath)
                         file_col = f"{rel_path}".ljust(40)
                         desc_col = f"{description}".ljust(50)
                         error_msg = f"❌ {file_col} {desc_col} Old text appears {count} times in file after tidy (must be unique)"
@@ -1089,14 +1364,14 @@ def apply_patch(filepath, description, old_text, new_text):
                             actual_old_text = ''.join(original_lines[start_orig:end_orig + 1])
                             break
                     else:
-                        rel_path = filepath.relative_to(Path.cwd())
+                        rel_path = _rel_path(filepath)
                         file_col = f"{rel_path}".ljust(40)
                         desc_col = f"{description}".ljust(50)
                         error_msg = f"❌ {file_col} {desc_col} Old text not found in file (even with tidy matching)"
                         append_to_clipboard_tmp(error_msg)
                         return False, error_msg
                 else:
-                    rel_path = filepath.relative_to(Path.cwd())
+                    rel_path = _rel_path(filepath)
                     file_col = f"{rel_path}".ljust(40)
                     desc_col = f"{description}".ljust(50)
                     error_msg = f"❌ {file_col} {desc_col} Old text not found in file (even with flexible whitespace and tidy)"
@@ -1105,7 +1380,7 @@ def apply_patch(filepath, description, old_text, new_text):
 
             elif len(matches) > 1:
 
-                rel_path = filepath.relative_to(Path.cwd())
+                rel_path = _rel_path(filepath)
                 file_col = f"{rel_path}".ljust(40)
                 desc_col = f"{description}".ljust(50)
                 error_msg = f"❌ {file_col} {desc_col} Old text appears {len(matches)} times in file (must be unique)"
@@ -1116,6 +1391,18 @@ def apply_patch(filepath, description, old_text, new_text):
             else:
                 # Use the actual text from file (with correct whitespace)
                 actual_old_text = matches[0].group(0)
+                match_start = matches[0].start()
+
+        if match_start is None:
+            # tidy matching found the text; locate it by position
+            match_start = original_content.find(actual_old_text)
+            if match_start == -1:
+                rel_path = _rel_path(filepath)
+                file_col = f"{rel_path}".ljust(40)
+                desc_col = f"{description}".ljust(50)
+                error_msg = f"❌ {file_col} {desc_col} Old text matched only after tidy but could not be located in the file"
+                append_to_clipboard_tmp(error_msg)
+                return False, error_msg
 
         # Apply tidy to new_text if tidy matching was used
         if used_tidy_matching:
@@ -1125,32 +1412,42 @@ def apply_patch(filepath, description, old_text, new_text):
         if new_text.startswith('\n'):
             new_text = new_text[1:]
         if new_text == '':
-            _del_start = original_content.index(actual_old_text)
             delete_anchor_before, delete_anchor_after = _delete_anchor(
-                original_content, _del_start, _del_start + len(actual_old_text))
+                original_content, match_start, match_start + len(actual_old_text))
         else:
             delete_anchor_before, delete_anchor_after = None, None
-        new_content = original_content.replace(actual_old_text, new_text)
+        new_content = original_content[:match_start] + new_text + original_content[match_start + len(actual_old_text):]
 
-        # Validate and auto-fix Python syntax
-        validated_content, was_fixed, error_msg = validate_and_fix_python_syntax(filepath, new_content)
+        # Validate and auto-fix Python syntax (only the patched lines may be re-indented)
+        validated_content, was_fixed, error_msg = validate_and_fix_python_syntax(
+            filepath, new_content, _line_span(new_content, match_start, new_text))
 
         # If validation failed, abort the patch
 
         if error_msg:
-            rel_path = filepath.relative_to(Path.cwd())
+            rel_path = _rel_path(filepath)
             file_col = f"{rel_path}".ljust(40)
             desc_col = f"{description}".ljust(30)
             full_error = f"❌ {file_col} {desc_col} {error_msg}"
             append_to_clipboard_tmp(full_error)
             return False, full_error
 
+        # A patch that leaves the file byte-identical is not a success
+        if validated_content == original_content:
+            rel_path = _rel_path(filepath)
+            file_col = f"{rel_path}".ljust(40)
+            desc_col = f"{description}".ljust(50)
+            full_error = f"❌ {file_col} {desc_col} Patch changes nothing: the matched text already equals new_text (file left untouched)"
+            append_to_clipboard_tmp(full_error)
+            return False, full_error
+
         if was_fixed:
-            new_text = _synced_new_text(new_content, validated_content, original_content.index(actual_old_text), new_text)
+            new_text = _synced_new_text(new_content, validated_content, match_start, new_text)
 
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(validated_content)
 
+        ctx_before, ctx_after = _record_context(validated_content, new_text, match_start)
         history = load_patch_history()
         patch_id = get_next_patch_id()
 
@@ -1160,7 +1457,10 @@ def apply_patch(filepath, description, old_text, new_text):
             'filepath': str(filepath),
             'description': description,
             'old_text': old_text,
+            'actual_old_text': actual_old_text,
             'new_text': new_text,
+            'ctx_before': ctx_before,
+            'ctx_after': ctx_after,
             'delete_anchor_before': delete_anchor_before,
             'delete_anchor_after': delete_anchor_after,
             'applied': True
@@ -1169,7 +1469,7 @@ def apply_patch(filepath, description, old_text, new_text):
         history.append(patch_entry)
         save_patch_history(history)
 
-        rel_path = filepath.relative_to(Path.cwd())
+        rel_path = _rel_path(filepath)
 
         # Format output with column alignment
         icon = "🔧" if was_fixed else "🧩"
@@ -1181,7 +1481,7 @@ def apply_patch(filepath, description, old_text, new_text):
         if used_tidy_matching:
             indicators.append("tidy matching")
         if was_fixed:
-            indicators.append("indentation auto-fixed")
+            indicators.append(f"indentation auto-fixed: {_changed_lines(new_content, validated_content)} line(s)")
         if desc_truncated:
             indicators.append("description truncated to 10 words")
 
@@ -1191,8 +1491,13 @@ def apply_patch(filepath, description, old_text, new_text):
         success_msg = f"{icon} {file_col} {desc_col} Applied successfully{indicator_str} [PATCHID {patch_id}]"
         return True, success_msg
 
+    except HistoryCorruptError as e:
+        error_msg = str(e)
+        append_to_clipboard_tmp(error_msg)
+        return False, error_msg
+
     except Exception as e:
-        rel_path = filepath.relative_to(Path.cwd())
+        rel_path = _rel_path(filepath)
         error_msg = f"{rel_path}\t\t'{description}': Error: {e}"
         append_to_clipboard_tmp(error_msg)
         return False, error_msg
@@ -1224,7 +1529,7 @@ def unapply_patch(patch_id):
 
     filepath = Path(patch['filepath'])
     if not filepath.exists():
-        rel_path = Path(patch['filepath']).relative_to(Path.cwd())
+        rel_path = _rel_path(Path(patch['filepath']))
         error_msg = f"File not found: {rel_path}"
         append_to_clipboard_tmp(error_msg)
         log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
@@ -1262,8 +1567,18 @@ def unapply_patch(patch_id):
             restore_text = patch.get('actual_old_text', patch['old_text'])
             insert_at = content.index(anchor) + len(anchor_before)
             content = content[:insert_at] + restore_text + content[insert_at:]
+            fix_span = _line_span(content, insert_at, restore_text)
         else:
-            new_text_count = content.count(patch['new_text'])
+            _positions = _locate_patch(content, patch)
+            new_text_count = len(_positions)
+            if new_text_count == 0 and patch['new_text'] in content:
+                error_msg = ("Cannot unpatch: the new text exists but not at this patch's original position "
+                             "(the file was restored or edited outside promptpack, or later patches changed "
+                             "the lines on both sides) - nothing was changed. Re-send the patch if the file "
+                             "was restored, otherwise unapply the later patches first")
+                append_to_clipboard_tmp(error_msg)
+                log_error_to_file(f"Undo failed for patch #{patch_id}", error_msg)
+                return False, error_msg
             if new_text_count == 0:
                 error_msg = f"Cannot unpatch: new text not found in file"
                 append_to_clipboard_tmp(error_msg)
@@ -1276,9 +1591,11 @@ def unapply_patch(patch_id):
                 return False, error_msg
 
             restore_text = patch.get('actual_old_text', patch['old_text'])
-            content = content.replace(patch['new_text'], restore_text, 1)
+            _pos = _positions[0]
+            content = content[:_pos] + restore_text + content[_pos + len(patch['new_text']):]
+            fix_span = _line_span(content, _pos, restore_text)
 
-        validated_content, was_fixed, syntax_err = validate_and_fix_python_syntax(filepath, content)
+        validated_content, was_fixed, syntax_err = validate_and_fix_python_syntax(filepath, content, fix_span)
         if syntax_err:
             patch['unpatch_error'] = True
             save_patch_history(history)
@@ -1362,7 +1679,7 @@ def reapply_patch(patch_id):
 
     filepath = Path(patch['filepath'])
     if not filepath.exists():
-        rel_path = Path(patch['filepath']).relative_to(Path.cwd())
+        rel_path = _rel_path(Path(patch['filepath']))
         error_msg = f"File not found: {rel_path}"
         append_to_clipboard_tmp(error_msg)
         log_error_to_file(f"Reapply failed for patch #{patch_id}", error_msg)
@@ -1388,7 +1705,8 @@ def reapply_patch(patch_id):
         pos = content.index(restore_text)
         new_content = content.replace(restore_text, patch['new_text'], 1)
 
-        validated_content, was_fixed, error_msg = validate_and_fix_python_syntax(filepath, new_content)
+        validated_content, was_fixed, error_msg = validate_and_fix_python_syntax(
+            filepath, new_content, _line_span(new_content, pos, patch['new_text']))
         if error_msg:
             patch['unpatch_error'] = True
             save_patch_history(history)
@@ -1424,7 +1742,7 @@ def format_patch_detail(p):
     used by -ph when the AI needs to inspect a specific patch closely.
     Returns a list of lines (no trailing separator)."""
     try:
-        rel_path = Path(p['filepath']).relative_to(Path.cwd())
+        rel_path = _rel_path(Path(p['filepath']))
     except Exception:
         rel_path = p['filepath']
     try:
@@ -1489,7 +1807,7 @@ def create_work_log():
             except Exception:
                 datetime_str = p.get('timestamp', 'unknown time')
             try:
-                rel_path = Path(p['filepath']).relative_to(Path.cwd())
+                rel_path = _rel_path(Path(p['filepath']))
             except Exception:
                 rel_path = p['filepath']
             lines.append(f"{datetime_str}  #{p['id']}  {rel_path}  {p.get('description', '')}")
@@ -1505,7 +1823,7 @@ def create_work_log():
         else:
             p = item
             try:
-                rel_path = Path(p['filepath']).relative_to(Path.cwd())
+                rel_path = _rel_path(Path(p['filepath']))
             except Exception:
                 rel_path = p['filepath']
             lines.append(f"[{datetime_str}] PATCH #{p['id']} - {rel_path} - {p.get('description', '')}")
@@ -1614,7 +1932,7 @@ def write_project_tree(out, marked_files):
     from collections import defaultdict
     groups = defaultdict(list)
     for file_path in marked_files:
-        rel_path = file_path.relative_to(Path.cwd())
+        rel_path = _rel_path(file_path)
         parent = str(rel_path.parent)
         groups[parent].append(rel_path.name)
     for directory, files in sorted(groups.items()):
@@ -1896,6 +2214,9 @@ corrected line in new_text.
 - Assume whitespace/indentation mismatch as the likely cause of a SyntaxError,
   not that the file is unknown or has changed. Do not blame special characters
   (å, ä, ö, ≈ etc.) without evidence.
+- "Patch changes nothing" = old_text and new_text give the same file (blank
+  lines you want kept must also appear in new_text). Send a new_text that
+  really differs, or drop the patch.
 - Repair block for a failed patch = NO `--summary`. Just the corrected -p
   command(s) + the block's one closing `-c`. Original task's summary already
   covers it.
@@ -1931,6 +2252,10 @@ promptpack -c
 No `--summary` needed for a plain undo — the original task's summary already
 covers it. If undo fails because the new text isn't unique, undo the more
 recent overlapping patches first (highest PATCHID down), then retry.
+Undo only works where the patch really sits: if the file was restored or
+edited outside promptpack (git checkout, manual edit), undo refuses with
+"not at this patch's original position" and changes nothing. Do not retry -u
+then: re-send the patch instead — the stale history entry no longer blocks it.
 
 # UNDO SUMMARY
 Marks a summary entry as reverted — a historical annotation only. Does NOT
@@ -2267,7 +2592,7 @@ Use 'promptpack -r path' whenever you need to read a file's full content.
 
         for file_path in marked_files:
             try:
-                rel_path = file_path.relative_to(Path.cwd())
+                rel_path = _rel_path(file_path)
 
                 try:
                     if file_path.stat().st_size > CTAGS_MAX_BYTES:
@@ -2308,7 +2633,7 @@ Use 'promptpack -r path' whenever you need to read a file's full content.
             except subprocess.CalledProcessError:
                 pass
             except Exception as e:
-                out.write(f"\n### {file_path.relative_to(Path.cwd())}\n")
+                out.write(f"\n### {_rel_path(file_path)}\n")
                 out.write(f"# Error running ctags: {e}\n")
 
         worklog_note, worklog_lines = build_worklog_lines()
@@ -2329,7 +2654,7 @@ def get_all_py_files(root):
         if not node.is_dir:
             if node.path.suffix == '.py':
                 try:
-                    rel = node.path.relative_to(Path.cwd())
+                    rel = _rel_path(node.path)
                     parts = list(rel.parts)
                     if parts[-1] == '__init__.py':
                         module_name = '.'.join(parts[:-1])
@@ -2481,6 +2806,15 @@ def main(stdscr):
                     cached_tokens = calculate_total_tokens(marked_files)
 
 if __name__ == "__main__":
+    _orig_excepthook = sys.excepthook
+    def _history_excepthook(etype, value, tb):
+        if issubclass(etype, HistoryCorruptError):
+            append_to_clipboard_tmp(f"❌ {value}")
+            print(f"❌ {err_note(str(value))}", file=sys.stderr)
+        else:
+            _orig_excepthook(etype, value, tb)
+    sys.excepthook = _history_excepthook
+
     class ClipboardArgumentParser(argparse.ArgumentParser):
         def error(self, message):
             cmd = 'promptpack ' + ' '.join(sys.argv[1:])
