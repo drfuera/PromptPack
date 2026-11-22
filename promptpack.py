@@ -153,14 +153,14 @@ def tidy_file(pattern):
 
             rel_path = _rel_path(filepath)
             stats = f"Removed {removed_lines} duplicate empty lines, {original_whitespace} trailing whitespace chars"
-            results.append(f"✅ Tidied {rel_path} | {stats}")
+            results.append(f"✅ 🧹 Tidied {rel_path} | {stats}")
             success_count += 1
 
         except Exception as e:
             results.append(f"❌ Error tidying {filepath}: {e}")
             error_count += 1
 
-    summary = f"\n✅ Tidied {success_count} file(s)" + (f", ❌ {error_count} error(s)" if error_count > 0 else "")
+    summary = f"\n✅ 🧹 Tidied {success_count} file(s)" + (f", ❌ {error_count} error(s)" if error_count > 0 else "")
     full_message = '\n'.join(results) + summary
 
     return error_count == 0, full_message
@@ -397,7 +397,7 @@ def read_lines_to_clipboard(line_range, filepath):
         for i, line in enumerate(lines[start-1:end], start=start):
             selected_with_numbers += f"{i}: {line}"
 
-        success_msg = f"✅ Read lines {start}-{end} from {rel_path}"
+        success_msg = f"📄 Read lines {start}-{end} from {rel_path}"
         append_to_clipboard_tmp(selected_with_numbers)
         return True, success_msg
 
@@ -533,7 +533,7 @@ def search_and_read_lines(search_string, offset_range, filepath):
                 selected_with_numbers += f"Hit line number #{idx}: {hit_line}\n"
 
         uniqueness_note = "" if is_unique else f" (not unique: {len(match_lines)} occurrences)"
-        success_msg = f"✅ Found '{search_string}' [{search_type}] at line {match_line}{uniqueness_note}, showing lines {start}-{end} from {rel_path}"
+        success_msg = f"🔍 Found '{search_string}' [{search_type}] at line {match_line}{uniqueness_note}, showing lines {start}-{end} from {rel_path}"
         append_to_clipboard_tmp(selected_with_numbers)
         return True, success_msg
 
@@ -633,7 +633,7 @@ def file_search(search_term, pattern):
             break
 
     if not results:
-        error_msg = f"❌ No matches found for '{search_term}' in {len(text_files)} file(s)"
+        error_msg = f"⚠️ No matches found for '{search_term}' in {len(text_files)} file(s)"
         append_to_clipboard_tmp(error_msg)
         return False, error_msg
 
@@ -644,7 +644,7 @@ def file_search(search_term, pattern):
             output += f"{result['file']}:{line_num}: {line_text}\n"
 
     append_to_clipboard_tmp(output)
-    return True, f"✅ Found {total_hits} match(es) in {len(results)} file(s)"
+    return True, f"🔍 Found {total_hits} match(es) in {len(results)} file(s)"
 
 
 def read_file_to_clipboard(filepath):
@@ -665,7 +665,7 @@ def read_file_to_clipboard(filepath):
         content_with_header = header + content
 
 
-        success_msg = f"✅ Read {len(content)} bytes from {rel_path}"
+        success_msg = f"📄 Read {len(content)} bytes from {rel_path}"
         append_to_clipboard_tmp(content_with_header)
         return True, success_msg
 
@@ -748,7 +748,7 @@ def append_to_summary_file(text, about, rating):
         })
         save_summary_history(history)
 
-        success_msg = f"✅ Summary saved [SUMMARYID {summary_id}] (rating {rating}, {len(patch_ids)} patch(es) linked)"
+        success_msg = f"💾 Summary saved [SUMMARYID {summary_id}] (rating {rating}, {len(patch_ids)} patch(es) linked)"
         append_to_clipboard_tmp(success_msg)
         return True, success_msg
     except Exception as e:
@@ -1649,7 +1649,7 @@ def unapply_summary(summary_id):
     entry['reverted'] = True
     entry['reverted_at'] = datetime.now().isoformat()
     save_summary_history(history)
-    success_msg = f"✅ Summary #{summary_id} marked as reverted (no patches touched — use -u <PATCHID> to undo specific code changes)"
+    success_msg = f"🏷️ Summary #{summary_id} marked as reverted (no patches touched — use -u <PATCHID> to undo specific code changes)"
     append_to_clipboard_tmp(success_msg)
     return True, success_msg
 def reapply_patch(patch_id):
@@ -1831,7 +1831,7 @@ def create_work_log():
     try:
         with open('work.txt', 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
-        return True, "✅ work.txt created"
+        return True, "📜 work.txt created"
     except Exception as e:
         return False, f"❌ Error writing work.txt: {e}"
 def mark_from_promptpack(root, promptpack_paths):
@@ -2140,7 +2140,7 @@ Follows directly:
    Use `-r` / `-n` / `-s` only for files NOT already in this doc.
 
 # FIRST REPLY
-List commands in a table: #patch, #undo, #reset, #done, #outsource, #ask, #dumb, #ideas, #test, #name.
+List commands in a table: #patch, #undo, #reset, #done, #outsource, #ask, #dumb, #ideas, #audit, #optimize, #name.
 
 # GENERAL RULES
 - MANDATORY: every task block (i.e. not a pure repair of a failed patch, and
@@ -2442,23 +2442,36 @@ need the history behind an old decision. Then fetch details with -log / -ph.
 - `#dumb` = rewrite last message in plain non-technical terms.
 - `#outsource` = write a prompt for another AI: what you're doing, the problem, expected result, request structured analysis. End with `promptpack -r` of relevant files.
 - `#ideas` = list alternative solutions/ideas for the current problem, no code.
-- `#test` = structured review of code from the current work, in three modes. Report only: never write patches while running #test; patch afterwards, and only after the user okays it. Two steps:
+- `#audit` = structured bug and risk review of code (formerly `#test`, which is still accepted as an alias). Report only: never write patches while running #audit; patch afterwards, and only after the user okays it. It runs autonomously: no questions to the user, no waiting for approval between steps, and no step where the user must run something and paste output back. When something is unclear, make a reasonable assumption, state it in one line and continue.
   - Modes (`full` is a reserved word, never a target name):
-    - `#test` = the patches you wrote in this session plus directly affected code (callers and callees of the changed functions). You may read one or two clearly relevant include or import files, but do not wander further.
-    - `#test <target>` = a named function, class or file, whether or not it changed in this session, plus directly affected code.
-    - `#test full` = the whole codebase, but never in one reply. Plan from the ctags list, prioritize risky parts (parsing, file I/O, shell), review one module per round over several rounds, and state clearly what was reviewed and what was not reached.
-  - Locate the code: in session mode you wrote the patches yourself, so use the [PATCHID n] lines in output the user pasted back. Only if the session was restarted via #done, take the patch IDs listed under the latest LOG lines in # WORKLOG and fetch them with `promptpack -ph <IDs>`. In every mode, read the actual current code with -r/-n even if it was shown earlier, because indentation may have been auto-corrected when patching.
-  - Mindset: review as if someone else wrote the code. Trace real values through it instead of writing "looks correct".
-  - STEP 1 = pure reasoning, passes 1-7 in this fixed order, no extra round. Each pass uses the results of the earlier ones. A pass may be skipped only if you state the reason in one line, never silently. Pass 8 is always mandatory, pass 2 too in session mode.
-    1. Scope: list what is under review (files, functions). Callers of changed functions need a search, so list them here as SUSPECTED and put the search in the step 2 block.
-    2. Requirements: in session mode, did the change do exactly what was asked, no more and no less? If not, report it, skip passes 3-7 and still run step 2 and the final report. In target and full mode there is no request to compare with: compare the code with its purpose (docstring, README, function name) or skip the pass with a stated reason.
+    - `#audit` = the patches you wrote in this session plus directly affected code (callers and callees of the changed functions). You may read one or two clearly relevant include or import files, but do not wander further.
+    - `#audit <target>` = a named function, class or file, whether or not it changed in this session, plus directly affected code.
+    - `#audit full` = the whole codebase, but never in one reply. Plan from the ctags list, prioritize risky parts (parsing, file I/O, shell), review one module per round over several rounds, and state clearly what was reviewed and what was not reached. End every round with one line naming the next module, so a plain 'continue' resumes.
+  - Locate and fetch: in session mode you wrote the patches yourself, so use the [PATCHID n] lines in output the user pasted back. Only if the session was restarted via #done, take the patch IDs listed under the latest LOG lines in # WORKLOG and fetch them with `promptpack -ph <IDs>`. Collect everything the review needs into ONE promptpack block: the current code with -r/-n (even if it was shown earlier, because indentation may have been auto-corrected when patching) and -fs searches for callers and callees of the changed functions. Skip the block if everything is already in the conversation. This single fetch is the only round trip; after the output comes back, run to the final report without asking anything else.
+  - Mindset: review as if someone else wrote the code. Trace real values through it instead of writing 'looks correct'.
+  - STEP 1 = pure reasoning, passes 1-7 in this fixed order. Each pass uses the results of the earlier ones. A pass may be skipped only if you state the reason in one line, never silently. Pass 8 is always mandatory, pass 2 too in session mode.
+    1. Scope: list what is under review (files, functions) and the callers and callees found by the fetch.
+    2. Requirements: in session mode, did the change do exactly what was asked, no more and no less? If not, report it, skip passes 3-7 and still run pass 8 and the final report. In target and full mode there is no request to compare with: compare the code with its purpose (docstring, README, function name) or skip the pass with a stated reason.
     3. Design by Contract: derive preconditions, postconditions and invariants of each changed function. Passes 4, 5 and 6 build on them.
     4. Boundary analysis: probe the edges of those contracts (empty, None, one element, extreme values, Unicode, missing files) and walk each case through with concrete values.
     5. Pre-mortem: assume this crashes in a month. Build 3-5 realistic failures from the suspicions in 3-4, plus failure paths (error halfway through, leftover state, resources not closed).
     6. OWASP/CWE/CERT: only if the changed code touches input, files, paths, shell or parsing. Check input validation, injection/shell quoting, paths, secrets, resource and error handling, starting from the input sources found in 3.
     7. Consistency and design: does it follow the project's own patterns and error handling; names, needless complexity, unused imports, leftover debug prints; in session mode, does the summary match what the patches really do?
   - Every finding: file and line, severity (bug = wrong result or data loss / risk / minor remark), status VERIFIED or SUSPECTED. A bug needs a concrete input that triggers it. Speculation is always SUSPECTED. A pass without findings must say so explicitly.
-  - STEP 2 = pass 8, verification and final report: collect ALL SUSPECTED findings into ONE bash block using -r/-n/-s/-fs/-e (for example pyflakes or ruff, tests if present, a search for callers of changed functions), ending with the block's one -c. Even with no SUSPECTED findings the block holds at least a syntax check (for example py_compile of the files under review). No --summary, since nothing is patched. The user runs it once and pastes the output back; then give the final report with each finding VERIFIED or dropped.
+  - STEP 2 = pass 8, verification and final report. Run the checks yourself in your own environment (code execution tool, sandbox or shell), on copies of the code you were shown: syntax check, linter (pyflakes/ruff or the language's equivalent), existing tests, and a small reproduction for every SUSPECTED bug. Never hand the user a verification block and do not use promptpack -e for it. If you have no execution environment, do not ask the user to run anything: verify by hand-tracing concrete values, keep what cannot be confirmed as SUSPECTED and write 'not executed' in the report. Then give the final report with each finding VERIFIED or dropped. No --summary, since nothing is patched.
+- `#optimize` = structured, language-independent performance review of code, from HTML to C#, GUI to network. Same ground rules as #audit: report only (never write patches while running #optimize; patch afterwards, and only after the user okays it), fully autonomous (no questions, one fetch round at most, measurements run by you in your own environment), the same three modes (`#optimize`, `#optimize <target>`, `#optimize full` with the same limits) and the same locate-and-fetch rules. Work from evidence, never from intuition: no change is recommended on a hunch alone.
+  - Core model: total cost = how many times something runs x what each run costs, spent on some resource (CPU, memory, disk, network, GPU, locks or waiting, or the user's perceived latency). Every pass reduces one of the two factors or the resource they burn.
+  - STEP 1 = pure reasoning, passes 1-7 in this fixed order. A pass may be skipped only if you state the reason in one line, never silently. Pass 8 is always mandatory.
+    1. Goal and metric: what should get better (frame time, latency, throughput, memory, startup time, size, battery) and for which input size or scenario. If the user gave no metric, pick the most plausible one from the code's purpose and state it as an assumption.
+    2. Domain and toolchain: identify language, runtime, framework and domain (for example GUI/TUI, OpenGL or other graphics, game loop, web front-end, web back-end, database, network, CLI or batch, embedded) from the files, imports and ctags; a project can be several. Pick the matching measurement tools and recall the typical bottlenecks of those domains from your own knowledge. Every domain claim must be tied to a concrete line of code.
+    3. Resource analysis: where does the cost go (CPU, allocation and memory, disk I/O, network round trips, GPU, lock contention or waiting, rendering and layout, startup)? Find the hot path (loops, per-frame, per-request or per-event code, anything called N times) and rank candidates by their expected share of the total cost. Amdahl: speeding up a 2% part is not worth the change. Hotspot hypotheses are SUSPECTED until measured.
+    4. Workload and complexity: for each hotspot, how often does it run and on how much data? Check Big-O in time and memory, nested loops, repeated scans where a map, set or index fits, repeated sorting, work that grows with history or size. Trace concrete sizes (n = 10, 10000, 1000000).
+    5. The eight levers, applied per hotspot in this order (cheapest and safest first): (a) remove the work; (b) do it less often (cache, memoize, dirty flags, debounce); (c) move it out of the hot path (hoist invariants, precompute, initialize once); (d) do it in bulk (batching, buffering, instancing, bulk queries, fewer round trips); (e) do it lazily (on demand, paging, streaming); (f) do it cheaper (better algorithm or data structure, fewer allocations and copies, built-ins, vectorized or native libraries); (g) do it concurrently or off the critical thread (async, workers, GPU), only for a proven bottleneck; (h) do it approximately (lower precision, resolution or level of detail) when an exact result is not required.
+    6. Domain bottlenecks: apply the known typical problems of the domains from pass 2, for example N+1 queries and missing indexes, draw calls, state changes and per-frame buffer uploads, UI thread blocking and redundant redraws, GC pressure, boxing and allocations in hot loops, render-blocking resources and layout thrashing, connection reuse, serialization cost and compression. Report only what this code actually shows.
+    7. Cost and risk: for every candidate, state expected gain, risk of changed behavior, and added complexity or lost readability. Reject candidates whose gain is marginal or unmeasurable. Also flag existing optimizations that are premature or counterproductive.
+  - Every finding: file and line, category (algorithmic / redundant work / memory and I/O / concurrency / domain-specific), expected gain (high / medium / low, with the measured figure once available), risk (low / medium / high), status VERIFIED (measured, or proven by a trace or count such as a call count) or SUSPECTED (plausible but not measured). A pass without findings must say so explicitly.
+  - STEP 2 = pass 8, measurement and final report. Measure yourself in your own environment (code execution tool, sandbox or shell) on copies of the code you were shown: take a baseline first, then a profiler or timer on the isolated hotspot with realistic input sizes, call counts, a complexity check by timing at n and 10n, and memory measurement where relevant. Where possible, test the candidate change on the same inputs and confirm the output is identical to the original. If the code needs something you do not have (GPU, display, database, network, hardware), measure the pure-logic parts you can isolate and state what stays unmeasured. If you have no execution environment, do not ask the user to run anything: keep findings SUSPECTED, write 'not measured' and never invent numbers. A gain that is not confirmed is dropped or kept SUSPECTED.
+  - Final report: candidates ranked by gain divided by risk, each with status, measured or estimated figure and the proposed change in one sentence (no patch code), followed by what was not reviewed. After the user okays: one optimization per patch task, behavior unchanged; if the gain turns out marginal after patching, recommend #undo.
 - `#name` = suggest a short (3–8 word) internal codename for "this version" —
   a fun but specific label summarizing the code or problem currently being
   worked on. For versioning/reference only; never written into code or files
@@ -2900,7 +2913,7 @@ if __name__ == "__main__":
                 error_count += 1
                 print(message)
 
-        print(f"\n✅ Tidied {success_count} file(s)" + (f", ❌ {error_count} error(s)" if error_count else ""))
+        print(f"\n✅ 🧹 Tidied {success_count} file(s)" + (f", ❌ {error_count} error(s)" if error_count else ""))
         sys.exit(0 if error_count == 0 else 1)
 
     if args.tidy:
@@ -2931,12 +2944,12 @@ if __name__ == "__main__":
                 if content.strip():
                     if copy_clipboard_tmp_to_clipboard():
                         copied_kb = len(content.encode('utf-8')) / 1024
-                        print(f"✅ Copied to clipboard: {copied_kb:,.1f} KB, {calculate_tokens(content):,} tokens")
+                        print(f"📋 Copied to clipboard: {copied_kb:,.1f} KB, {calculate_tokens(content):,} tokens")
                         try:
                             CLIPBOARD_TMP_FILE.unlink()
                             sys.exit(0)
                         except Exception as e:
-                            print(f"✅ File copied but could not remove: {e}")
+                            print(f"⚠️ File copied but could not remove: {e}")
                             sys.exit(0)
                     else:
                         print("❌ Could not copy to clipboard (install xclip, xsel, or pbcopy)")
@@ -3013,7 +3026,7 @@ if __name__ == "__main__":
         BLACKLIST = ['rm', 'rmdir', 'dd', 'chmod', ':(){', 'truncate', 'shred', 'mv']
         for term in BLACKLIST:
             if re.search(r'\b' + re.escape(term) + r'\b', command):
-                error_msg = f"❌ Blocked: command contains blacklisted term '{term}'"
+                error_msg = f"🚫 Blocked: command contains blacklisted term '{term}'"
                 append_to_clipboard_tmp(error_msg)
                 print(error_msg)
                 sys.exit(1)
@@ -3063,7 +3076,7 @@ if __name__ == "__main__":
 
             if process.returncode != 0:
                 append_to_clipboard_tmp(f"\n[Command exited with code {process.returncode}]")
-            print(f"✅ Command executed, output in clipboard.tmp")
+            print(f"⚙️ Command executed, output in clipboard.tmp")
 
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -3072,7 +3085,7 @@ if __name__ == "__main__":
             if process.poll() is None:
                 process.kill()
             append_to_clipboard_tmp(f"\n[Command timed out after {timeout} seconds]")
-            print(f"⚠️ Command timed out, output captured up to timeout in clipboard.tmp")
+            print(f"⏳ Command timed out, output captured up to timeout in clipboard.tmp")
         except Exception as e:
             error_msg = f"\n[Error executing command: {e}]"
             append_to_clipboard_tmp(error_msg)
@@ -3129,7 +3142,7 @@ if __name__ == "__main__":
     if args.undo is not None:
         success, message = unapply_patch(args.undo)
         if success:
-            print(f"✅ {message}")
+            print(f"✅ ↩️ {message}")
             sys.exit(0)
         else:
             print(f"❌ {err_note(message)}")
@@ -3188,10 +3201,10 @@ if __name__ == "__main__":
         if output_lines:
             append_to_clipboard_tmp("\n".join(output_lines))
         if found:
-            msg = f"✅ Fetched {len(found)} patch(es): {', '.join(map(str, found))}"
+            msg = f"📜 Fetched {len(found)} patch(es): {', '.join(map(str, found))}"
         else:
-            msg = "❌ No matching patches found (error saved to clipboard.tmp - run promptpack -c)"
-            append_to_clipboard_tmp("❌ No matching patches found")
+            msg = "⚠️ No matching patches found (error saved to clipboard.tmp - run promptpack -c)"
+            append_to_clipboard_tmp("⚠️ No matching patches found")
         if missing:
             msg += f" | ⚠️ Not found: {', '.join(map(str, missing))}"
         print(msg)
@@ -3230,10 +3243,10 @@ if __name__ == "__main__":
         if output_lines:
             append_to_clipboard_tmp("\n".join(output_lines))
         if found:
-            msg = f"✅ Fetched {len(found)} summary(ies): {', '.join(map(str, found))}"
+            msg = f"📜 Fetched {len(found)} summary(ies): {', '.join(map(str, found))}"
         else:
-            msg = "❌ No matching summaries found (error saved to clipboard.tmp - run promptpack -c)"
-            append_to_clipboard_tmp("❌ No matching summaries found")
+            msg = "⚠️ No matching summaries found (error saved to clipboard.tmp - run promptpack -c)"
+            append_to_clipboard_tmp("⚠️ No matching summaries found")
         if missing:
             msg += f" | ⚠️ Not found: {', '.join(map(str, missing))}"
         if bad:
@@ -3243,17 +3256,17 @@ if __name__ == "__main__":
     if args.complete_log:
         note, lines = build_worklog_lines(complete=True)
         if not lines:
-            append_to_clipboard_tmp("❌ No summaries or patches found")
-            print("❌ No summaries or patches found (error saved to clipboard.tmp - run promptpack -c)")
+            append_to_clipboard_tmp("⚠️ No summaries or patches found")
+            print("⚠️ No summaries or patches found (error saved to clipboard.tmp - run promptpack -c)")
             sys.exit(1)
         append_to_clipboard_tmp(note + "\n" + "\n".join(lines))
-        print(f"✅ Complete log: {len(lines)} lines copied to clipboard.tmp - run promptpack -c")
+        print(f"📜 Complete log: {len(lines)} lines copied to clipboard.tmp - run promptpack -c")
         sys.exit(0)
     if args.instructions:
         try:
             with open('promptpack_instructions.txt', 'w', encoding='utf-8') as out:
                 out.write(PROMPTPACK_CORE_INSTRUCTIONS)
-            print("✅ promptpack_instructions.txt created!")
+            print("📦 promptpack_instructions.txt created!")
             sys.exit(0)
         except Exception as e:
             print(f"❌ Error creating promptpack_instructions.txt: {e}")
@@ -3277,7 +3290,7 @@ if __name__ == "__main__":
                 file_size = len(content)
                 total_tokens = calculate_tokens(content)
 
-                print(f"✅ {filename} created!")
+                print(f"📦 {filename} created!")
                 print(f"\nIncluded {file_count} files")
                 print(f"File size: {file_size:,} bytes")
                 print(f"Tokensize: {total_tokens:,} tokens")
