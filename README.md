@@ -720,7 +720,9 @@ Or use `xsel` (Linux) or `pbcopy` (macOS, built-in).
 
 ## License
 
-This project is open source. See the LICENSE file for details.
+PromptPack is free software, released under the [GNU General Public License v3.0](LICENSE) (GPL-3.0). You may use, study, modify and share it. If you distribute a modified version, it must also be released under the GPL v3 with its source code available. See the [LICENSE](LICENSE) file for the full text.
+
+The GPL applies to PromptPack itself. Using PromptPack on your own projects does not make those projects subject to the GPL.
 
 ---
 
