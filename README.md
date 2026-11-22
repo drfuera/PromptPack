@@ -1,8 +1,17 @@
 # PromptPack
 
-**A powerful CLI tool for AI-assisted development workflows**
+**A CLI tool that lets any AI assistant read, search and patch your codebase, with you in control of every change.**
 
-PromptPack helps you package your codebase for AI assistants (Claude, GPT, DeepSeek, etc.) and apply AI-generated patches with precision. Built for developers who want AI coding assistance while keeping full control over their codebase.
+Working with an AI chat usually means pasting files back and forth and applying its suggestions by hand. PromptPack replaces that with a safe loop: the AI asks for the files it needs and replies with exact patches, and you run them from your terminal. The AI never touches your filesystem. It only tells you which `promptpack` commands to run, and nothing changes unless you run them.
+
+1. **Pack:** mark your files and generate `ctags.txt` (a project overview plus the embedded AI instructions)
+2. **Ask:** send it to any AI chat (Claude, GPT, DeepSeek, Grok or anything else you can paste into) and describe what you want
+3. **Apply:** run the commands the AI gives you, review the result and undo any single patch if needed
+
+- **Exact, undoable patches:** every change is recorded and can be reverted one patch at a time
+- **Project memory:** a built-in worklog gives the AI a compact history of earlier work
+- **Built-in review:** `#audit` for bugs and risks, `#optimize` for performance
+- **Free software:** released under the GPL v3
 
 ---
 
