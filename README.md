@@ -6,6 +6,45 @@ PromptPack helps you package your codebase for AI assistants (Claude, GPT, DeepS
 
 ---
 
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Usage Guide](#usage-guide)
+  - [Interactive TUI Controls](#-interactive-tui-controls)
+  - [Patching Files](#-patching-files)
+  - [Wildcard Patching](#-wildcard-patching)
+  - [Undoing and Redoing Patches](#undo-redo-patches)
+  - [Working with Summaries & Work Log](#-working-with-summaries--work-log)
+  - [Search Operations](#-search-operations)
+  - [Running Shell Commands](#running-shell-commands)
+  - [Code Maintenance](#-code-maintenance-1)
+  - [Clipboard Management](#-clipboard-management)
+- [AI Workflow Integration](#ai-workflow-integration)
+  - [The PromptPack Workflow](#the-promptpack-workflow)
+  - [Special AI Commands](#special-ai-commands-embedded-in-ctagstxt)
+  - [Reviewing Changes with `#audit`](#reviewing-changes-with-audit)
+  - [Optimizing with `#optimize`](#optimizing-with-optimize)
+  - [Example AI Interaction](#example-ai-interaction)
+- [Optional: X11 Middle-Click Paste+Submit](#optional-x11-middle-click-pastesubmit-x11)
+- [Configuration](#configuration)
+  - [File Selection Storage](#file-selection-storage)
+  - [Patch History](#patch-history)
+  - [Summary History](#summary-history)
+- [Advanced Features](#advanced-features)
+  - [Smart Patch Matching](#smart-patch-matching)
+  - [Python Syntax Auto-Fix](#python-syntax-auto-fix)
+  - [Python Dependency Import Tracking](#python-dependency-import-tracking)
+  - [Work Log & On-Demand Patch Detail](#work-log--on-demand-patch-detail)
+  - [Token Estimation](#token-estimation)
+- [Troubleshooting](#troubleshooting)
+- [Best Practices](#best-practices)
+- [License](#license)
+- [Credits](#credits)
+
+---
+
 ## Features
 
 ### 📦 Smart Code Packaging
@@ -62,6 +101,13 @@ PromptPack helps you package your codebase for AI assistants (Claude, GPT, DeepS
 
 - **Run shell commands (`-e`)**: Execute a bash command (optionally with a timeout) with output captured live into `clipboard.tmp`
 - **Safety blacklist**: Destructive commands (`rm`, `rmdir`, `dd`, `chmod`, `mv`, `truncate`, `shred`, fork bombs) are blocked outright
+
+### 🔬 AI Code Review & Optimization
+
+- **`#audit`**: Structured bug and risk review with fixed passes (requirements, contracts, boundary values, pre-mortem, security, consistency). `#test` still works as an alias
+- **`#optimize`**: Language-independent performance review (goal and metric, domain, resource analysis, complexity, eight optimization levers, measurement) for anything from HTML to C#, GUI to network code
+- **Autonomous by design**: Both run without user input — one single fetch round, then the AI verifies or measures in its own environment instead of asking you to run anything
+- **Report only**: Nothing is patched until you approve it
 
 ### 📄 Instruction Export
 
@@ -212,7 +258,7 @@ promptpack -c
 
 ---
 
-### ↩️ Undoing and Redoing Patches
+### ↩️ <a id="undo-redo-patches"></a>Undoing and Redoing Patches
 
 **Undo a specific patch by its PATCHID:**
 
@@ -342,7 +388,7 @@ promptpack -c
 
 ---
 
-### 🖥️ Running Shell Commands
+### 🖥️ <a id="running-shell-commands"></a>Running Shell Commands
 
 ````bash
 # No timeout
@@ -418,19 +464,42 @@ promptpack -c   # Copy all results to clipboard, remove clipboard.tmp
 | `#outsource` | AI writes a detailed prompt for another AI to solve the problem, ending with the `promptpack -r` commands needed to gather relevant files |
 | `#dumb` | Rewrite the last message in plain non-technical language |
 | `#ideas` | List alternative solutions/ideas, no code |
-| `#test` | Structured review in three modes: `#test` (this session's patches), `#test <target>` (a named function, class or file) and `#test full` (whole codebase, one module per round) — fixed passes (requirements, contracts, boundary values, pre-mortem, security, consistency), report only, no patches until you approve |
+| `#audit` | Structured bug and risk review in three modes: `#audit` (this session's patches), `#audit <target>` (a named function, class or file) and `#audit full` (whole codebase, one module per round). Fixed passes (requirements, contracts, boundary values, pre-mortem, security, consistency), runs autonomously, checks run in the AI's own environment, report only. `#test` is still accepted as an alias |
+| `#optimize` | Language-independent performance review in the same three modes. Passes for goal and metric, domain, resource analysis, complexity, eight optimization levers, domain bottlenecks and cost/risk, measured by the AI in its own environment, report only |
 | `#name` | Suggest a short (3–8 word) internal codename for the current version/problem — for reference only, never written into code |
 | `#done` | Wrap up session — AI generates a `PROMPTPACK Summary` for the next context window |
 
-### Reviewing Changes with `#test`
+### Reviewing Changes with `#audit`
 
-`#test` has three modes. Plain `#test` reviews the patches the AI wrote in the current session plus directly affected code (callers and callees; it may read one or two clearly relevant imported files, but does not wander further). `#test <target>` reviews a named function, class or file, whether or not it changed this session, plus directly affected code. `#test full` covers the whole codebase, but never in a single reply: the AI plans from the ctags list, prioritizes risky parts such as parsing, file I/O and shell calls, reviews one module per round, and states plainly what was reviewed and what was not reached. `full` is a reserved word, so it cannot be used as a target name.
+`#audit` (formerly `#test`, still accepted as an alias) is a structured bug and risk review. It runs autonomously: the AI asks no questions and waits for no approval between steps. Everything it needs is collected into one single `promptpack` block, the only time you have to run something and paste output back, and from there it works through to the final report.
 
-In session mode the AI knows its own patches from the `[PATCHID n]` lines you pasted back. Only if the session was restarted via `#done` does it fall back to the patch IDs under the latest `LOG` lines of the `# WORKLOG`, fetched with `-ph`. In every mode it reads the actual code with `-r`/`-n`, because patching can auto-correct indentation and the file may differ from the patch text.
+`#audit` has three modes. Plain `#audit` reviews the patches the AI wrote in the current session plus directly affected code (callers and callees; it may read one or two clearly relevant imported files, but does not wander further). `#audit <target>` reviews a named function, class or file, whether or not it changed this session, plus directly affected code. `#audit full` covers the whole codebase, but never in a single reply: the AI plans from the ctags list, prioritizes risky parts such as parsing, file I/O and shell calls, reviews one module per round, states plainly what was reviewed and what was not reached, and ends every round with a line naming the next module, so a plain "continue" resumes. `full` is a reserved word, so it cannot be used as a target name.
 
-Seven reasoning passes run in a fixed order, each using the results of the earlier ones: scope, requirements coverage, Design by Contract, boundary analysis, pre-mortem, OWASP/CWE/CERT (only if input, files, paths, shell or parsing are touched) and consistency/design. In session mode the requirements pass asks whether the change did exactly what was asked; if not, passes 3-7 are skipped but you still get a report. In `<target>` and `full` mode there is no request to compare with, so the code is compared with its purpose (docstring, README, function name) or the pass is skipped with a stated reason. Callers of changed functions are listed as `SUSPECTED` in the scope pass and checked by a search in the verification block. The check that the summary matches the patches applies only in session mode. The AI may skip a pass only by stating a reason in one line. Every finding has file and line, severity (bug, risk, minor remark) and status `VERIFIED` or `SUSPECTED`; bugs come with a concrete triggering input.
+In session mode the AI knows its own patches from the `[PATCHID n]` lines you pasted back. Only if the session was restarted via `#done` does it fall back to the patch IDs under the latest `LOG` lines of the `# WORKLOG`, fetched with `-ph`. In every mode it reads the actual code with `-r`/`-n` (even if shown earlier, because patching can auto-correct indentation and the file may differ from the patch text) and searches for callers and callees of the changed functions with `-fs`, all in one fetch block. The block is skipped if everything is already in the conversation.
 
-Then comes a single verification block: all `SUSPECTED` findings are collected into one bash block (`-r`, `-n`, `-s`, `-fs`, `-e`, for example `pyflakes`/`ruff`, tests or caller searches). Even with no `SUSPECTED` findings the block holds at least a syntax check such as `py_compile` of the files under review. You run it once and paste the output back, and the AI delivers the final report. No patches are written during `#test`; fixes come only after your okay, as a normal `#patch`.
+Seven reasoning passes run in a fixed order, each using the results of the earlier ones: scope, requirements coverage, Design by Contract, boundary analysis, pre-mortem, OWASP/CWE/CERT (only if input, files, paths, shell or parsing are touched) and consistency/design. In session mode the requirements pass asks whether the change did exactly what was asked; if not, passes 3-7 are skipped but you still get a report. In `<target>` and `full` mode there is no request to compare with, so the code is compared with its purpose (docstring, README, function name) or the pass is skipped with a stated reason. The check that the summary matches the patches applies only in session mode. The AI may skip a pass only by stating a reason in one line. Every finding has file and line, severity (bug, risk, minor remark) and status `VERIFIED` or `SUSPECTED`; bugs come with a concrete triggering input.
+
+The eighth pass, verification, is mandatory and is done by the AI itself, in its own environment (code execution tool, sandbox or shell), on copies of the code it was shown: a syntax check, a linter (`pyflakes`/`ruff` or the language's equivalent), existing tests, and a small reproduction for every `SUSPECTED` bug. You are never handed a verification block. If the AI has no execution environment it does not ask you to run anything: it verifies by hand-tracing concrete values, leaves what it cannot confirm as `SUSPECTED` and marks the report "not executed". No patches are written during `#audit`; fixes come only after your okay, as a normal `#patch`.
+
+### Optimizing with `#optimize`
+
+`#optimize` is a language-independent performance review, meant to work the same way for HTML, PHP, Python, C#, GUI and TUI code, OpenGL, network code and anything in between. It follows the same ground rules as `#audit`: report only, fully autonomous (no questions, at most one fetch round, measurements run by the AI in its own environment), the same three modes (`#optimize`, `#optimize <target>`, `#optimize full` with the same limits) and the same locate-and-fetch rules. It works from evidence, never from intuition: no change is recommended on a hunch alone.
+
+It rests on one model: total cost = how many times something runs × what each run costs, spent on some resource (CPU, memory, disk, network, GPU, locks or waiting, or the user's perceived latency). Every pass reduces one of the two factors or the resource they burn. Seven reasoning passes run in a fixed order:
+
+1. **Goal and metric**: what should get better (frame time, latency, throughput, memory, startup time, size, battery) and for which input size or scenario
+2. **Domain and toolchain**: language, runtime, framework and domain (GUI/TUI, graphics, web front-end or back-end, database, network, CLI, embedded and so on) identified from files, imports and ctags, with the matching measurement tools and typical bottlenecks; every domain claim must point at a concrete line
+3. **Resource analysis**: where the cost goes and which hot path dominates, ranked by expected share of the total cost (Amdahl: speeding up a 2% part is not worth the change)
+4. **Workload and complexity**: how often each hotspot runs and on how much data, Big-O in time and memory, nested loops, repeated scans, repeated sorting
+5. **The eight levers**, cheapest and safest first: remove the work; do it less often (cache, memoize, dirty flags); move it out of the hot path; do it in bulk (batching, buffering, instancing); do it lazily; do it cheaper (better algorithm or data structure, fewer allocations); do it concurrently or off the critical thread (only for a proven bottleneck); do it approximately when an exact result is not required
+6. **Domain bottlenecks**: the known typical problems of the identified domains, such as N+1 queries, draw calls and per-frame buffer uploads, UI thread blocking, GC pressure in hot loops, render-blocking resources or connection reuse. Only what the code actually shows is reported
+7. **Cost and risk**: expected gain, risk of changed behavior and added complexity for every candidate; marginal or unmeasurable candidates are rejected, and premature optimizations already in the code are flagged
+
+Every finding has file and line, a category (algorithmic, redundant work, memory and I/O, concurrency, domain-specific), expected gain, risk and a status: `VERIFIED` (measured, or proven by a trace or count such as a call count) or `SUSPECTED` (plausible but not measured).
+
+The eighth pass, measurement, is again done by the AI in its own environment: a baseline first, then a profiler or timer on the isolated hotspot with realistic input sizes, call counts, a complexity check by timing at n and 10n, memory measurement where relevant, and where possible the candidate change tested on the same inputs with the output compared to the original. If the code needs something the AI does not have (GPU, display, database, network, hardware), it measures the pure-logic parts it can isolate and states what stays unmeasured. Without an execution environment it never asks you to run anything and never invents numbers: findings stay `SUSPECTED` and are marked "not measured".
+
+The final report ranks candidates by gain divided by risk, each with status, a measured or estimated figure and the proposed change in one sentence, followed by what was not reviewed. No patches are written during `#optimize`. After your okay, each optimization is applied as its own patch task with behavior unchanged; if the gain turns out marginal after patching, the AI recommends `#undo`.
 
 ### Example AI Interaction
 
