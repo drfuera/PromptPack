@@ -27,8 +27,19 @@ from datetime import datetime
 import ast
 import re
 import fnmatch
+import hmac
+import secrets
+import tempfile
+import textwrap
+import threading
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PROMPTPACK_FILE = Path.home() / '.promptpack'
+PROMPTPACK_FILE = Path(__file__).resolve().parent / 'files.json'
+PROMPTPACK_LEGACY_FILES = [Path(__file__).resolve().parent / '.promptpack',   # old line format
+                           Path.home() / '.promptpack']
+
 PATCH_HISTORY_FILE = Path('patch.json')
 SUMMARY_HISTORY_FILE = Path('summary.json')
 CLIPBOARD_TMP_FILE = Path('clipboard.tmp')
@@ -261,81 +272,93 @@ def compute_file_hash(filepath):
             h.update(chunk)
     return h.hexdigest()
 
-def load_promptpack():
-    """Load cached entries for files under the current project.
-    Line format: HASH|TOKENS|ABSPATH. Old bare-path lines are still accepted,
-    with hash/tokens set to None so they get recomputed once."""
-    if not PROMPTPACK_FILE.exists():
-        return {}
+def _read_legacy_lines():
+    """Old .promptpack line format (HASH|TOKENS|ABSPATH), read once for conversion."""
+    entries = {}
+    for legacy in PROMPTPACK_LEGACY_FILES:
+        if not legacy.exists():
+            continue
+        try:
+            text = legacy.read_text(encoding='utf-8')
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split('|', 2)
+            file_hash, tokens, path_str = None, None, line
+            if len(parts) == 3:
+                try:
+                    file_hash, tokens, path_str = parts[0], int(parts[1]), parts[2]
+                except ValueError:
+                    pass
+            entries.setdefault(path_str.strip(), {'hash': file_hash, 'tokens': tokens})
+    return entries
 
+def _write_json_cache(files):
+    """Write files.json (atomic). Entries are sorted by path so diffs stay small."""
+    data = {'version': 1, 'files': dict(sorted(files.items()))}
+    _atomic_write_text(PROMPTPACK_FILE, json.dumps(data, indent=2, ensure_ascii=False) + '\n')
+
+def _read_files_cache():
+    """The "files" section of files.json: {absolute path: {"hash", "tokens"}}. When files.json
+    does not exist yet, the old .promptpack files are converted once and written as files.json."""
+    if PROMPTPACK_FILE.exists():
+        try:
+            with open(PROMPTPACK_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        files = data.get('files') if isinstance(data, dict) else None
+        return files if isinstance(files, dict) else {}
+    legacy = _read_legacy_lines()
+    if legacy:
+        try:
+            _write_json_cache(legacy)
+        except OSError:
+            pass
+    return legacy
+
+def load_promptpack():
+    """Cached entries for files under the current project: {absolute Path: {'hash', 'tokens'}}."""
     try:
         cwd = Path.cwd().resolve()
         entries = {}
-
-        with open(PROMPTPACK_FILE, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.rstrip('\n')
-                if not line.strip():
-                    continue
-
-                parts = line.split('|', 2)
-                if len(parts) == 3:
-                    file_hash, tokens_str, path_str = parts
-                    try:
-                        tokens = int(tokens_str)
-                    except ValueError:
-                        file_hash, tokens, path_str = None, None, line
-                else:
-                    file_hash, tokens, path_str = None, None, line
-
-                path = Path(path_str.strip())
-                if not path.is_absolute():
-                    continue
-
-                abs_path = path.resolve()
-
-                try:
-                    abs_path.relative_to(cwd)
-                    if abs_path.exists():
-                        entries[abs_path] = {'hash': file_hash, 'tokens': tokens}
-                except (ValueError, OSError):
-                    pass
-
+        for path_str, info in _read_files_cache().items():
+            path = Path(path_str)
+            if not path.is_absolute() or not isinstance(info, dict):
+                continue
+            abs_path = path.resolve()
+            try:
+                abs_path.relative_to(cwd)
+            except ValueError:
+                continue
+            if abs_path.exists():
+                entries[abs_path] = {'hash': info.get('hash'), 'tokens': info.get('tokens')}
         return entries
-    except:
+    except Exception:
         return {}
 
 def save_promptpack(marked_files):
-    """Persist marked files with content-hash + token cache so unchanged
-    files never get re-tokenized. Returns total tokens for marked_files."""
+    """Write the marked files to files.json with content hash and token count, so unchanged
+    files never get re-tokenized. Entries for other projects are kept. Returns total tokens."""
     try:
         cwd = Path.cwd().resolve()
         old_cache = load_promptpack()
 
-        existing_other_projects = []
-        if PROMPTPACK_FILE.exists():
-            with open(PROMPTPACK_FILE, 'r', encoding='utf-8') as f:
-                for raw_line in f:
-                    line = raw_line.rstrip('\n')
-                    if not line.strip():
-                        continue
-
-                    parts = line.split('|', 2)
-                    path_str = parts[2] if len(parts) == 3 else line
-                    path = Path(path_str.strip())
-                    if not path.is_absolute():
-                        continue
-
-                    abs_path = path.resolve()
-
-                    try:
-                        abs_path.relative_to(cwd)
-                    except ValueError:
-                        if abs_path.exists():
-                            existing_other_projects.append(line)
+        merged = {}
+        for path_str, info in _read_files_cache().items():
+            path = Path(path_str)
+            if not path.is_absolute():
+                continue
+            abs_path = path.resolve()
+            try:
+                abs_path.relative_to(cwd)
+            except ValueError:
+                if abs_path.exists():
+                    merged[path_str] = info
 
         total_tokens = 0
-        new_lines = []
         for fp in marked_files:
             resolved = fp.resolve()
             try:
@@ -348,22 +371,15 @@ def save_promptpack(marked_files):
                     tokens = calculate_tokens(content)
             except Exception:
                 file_hash, tokens = '', 0
-
             total_tokens += tokens
-            new_lines.append(f"{file_hash}|{tokens}|{resolved}")
+            merged[str(resolved)] = {'hash': file_hash, 'tokens': tokens}
 
-        with open(PROMPTPACK_FILE, 'w', encoding='utf-8') as f:
-            for line in sorted(existing_other_projects):
-                f.write(f"{line}\n")
-            for line in sorted(new_lines):
-                f.write(f"{line}\n")
-
+        _write_json_cache(merged)
         return total_tokens
 
     except Exception as e:
-        append_to_clipboard_tmp(f"⚠️ Warning: Could not save .promptpack: {e}")
+        append_to_clipboard_tmp(f"⚠️ Warning: Could not save files.json: {e}")
         return 0
-
 
 def read_lines_to_clipboard(line_range, filepath):
     """Read specific lines and copy to clipboard"""
@@ -676,6 +692,12 @@ def read_file_to_clipboard(filepath):
 
 def append_to_clipboard_tmp(message):
     """Append message to clipboard.tmp"""
+    buffer_path = os.environ.get('PROMPTPACK_MCP_BUFFER')
+    if buffer_path:
+        # MCP mode: the server collects this command's output instead of clipboard.tmp
+        with open(buffer_path, 'a', encoding='utf-8') as f:
+            f.write(message if message.endswith('\n') else message + '\n')
+        return True
     try:
         with open(CLIPBOARD_TMP_FILE, 'a', encoding='utf-8') as f:
             f.write(message if message.endswith('\n') else message + '\n')
@@ -686,6 +708,8 @@ def append_to_clipboard_tmp(message):
 
 def err_note(message):
     """Append a terminal-only notice that the error is saved in clipboard.tmp"""
+    if os.environ.get('PROMPTPACK_MCP_BUFFER'):
+        return message     # MCP mode: the result goes back to the AI, not to clipboard.tmp
     return f"{message}\n   ↳ error saved to clipboard.tmp - run promptpack -c"
 
 def log_error_to_file(context, detail):
@@ -1960,7 +1984,7 @@ def show_patch_history(stdscr):
         stdscr.clear()
         height, width = stdscr.getmaxyx()
 
-        title = "Patch History - ↑↓: Navigate | PgUp/PgDn: Jump | Delete: Toggle | q: Back"
+        title = "Patch History - ↑↓: Navigate | PgUp/PgDn: Jump | Delete: Toggle | Esc: Back"
         stdscr.addstr(0, 0, title.ljust(width-1)[:width-1], curses.A_REVERSE)
 
         header = f"{'ID':<5} {'Status':<10} {'Date':<20} {'Description':<60} {'File'}"
@@ -1997,7 +2021,7 @@ def show_patch_history(stdscr):
         stdscr.refresh()
         key = stdscr.getch()
 
-        if key == ord('q') or key == ord('Q'):
+        if key == 27:
             break
         elif key == curses.KEY_UP:
             selected = max(0, selected - 1)
@@ -2037,7 +2061,7 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset, total_tokens):
     visible_nodes = flatten_visible_tree(root)
 
 
-    title = "↑↓: Navigate | PgUp/PgDn: Jump | ←→: Expand | Space: Mark | i: Import deps | F1: ctags | F12: patches | q: Quit"
+    title = "↑↓: Navigate | PgUp/PgDn: Jump | ←→: Expand | Space: Mark | i: Import deps | F1: ctags | F6: MCP | F12: patches | Esc: Quit"
     stdscr.addstr(0, 0, title.ljust(width-1)[:width-1], curses.A_REVERSE)
 
     display_height = height - 2
@@ -2442,36 +2466,44 @@ need the history behind an old decision. Then fetch details with -log / -ph.
 - `#dumb` = rewrite last message in plain non-technical terms.
 - `#outsource` = write a prompt for another AI: what you're doing, the problem, expected result, request structured analysis. End with `promptpack -r` of relevant files.
 - `#ideas` = list alternative solutions/ideas for the current problem, no code.
-- `#audit` = structured bug and risk review of code (formerly `#test`, which is still accepted as an alias). Report only: never write patches while running #audit; patch afterwards, and only after the user okays it. It runs autonomously: no questions to the user, no waiting for approval between steps, and no step where the user must run something and paste output back. When something is unclear, make a reasonable assumption, state it in one line and continue.
-  - Modes (`full` is a reserved word, never a target name):
-    - `#audit` = the patches you wrote in this session plus directly affected code (callers and callees of the changed functions). You may read one or two clearly relevant include or import files, but do not wander further.
-    - `#audit <target>` = a named function, class or file, whether or not it changed in this session, plus directly affected code.
-    - `#audit full` = the whole codebase, but never in one reply. Plan from the ctags list, prioritize risky parts (parsing, file I/O, shell), review one module per round over several rounds, and state clearly what was reviewed and what was not reached. End every round with one line naming the next module, so a plain 'continue' resumes.
-  - Locate and fetch: in session mode you wrote the patches yourself, so use the [PATCHID n] lines in output the user pasted back. Only if the session was restarted via #done, take the patch IDs listed under the latest LOG lines in # WORKLOG and fetch them with `promptpack -ph <IDs>`. Collect everything the review needs into ONE promptpack block: the current code with -r/-n (even if it was shown earlier, because indentation may have been auto-corrected when patching) and -fs searches for callers and callees of the changed functions. Skip the block if everything is already in the conversation. This single fetch is the only round trip; after the output comes back, run to the final report without asking anything else.
-  - Mindset: review as if someone else wrote the code. Trace real values through it instead of writing 'looks correct'.
-  - STEP 1 = pure reasoning, passes 1-7 in this fixed order. Each pass uses the results of the earlier ones. A pass may be skipped only if you state the reason in one line, never silently. Pass 8 is always mandatory, pass 2 too in session mode.
-    1. Scope: list what is under review (files, functions) and the callers and callees found by the fetch.
-    2. Requirements: in session mode, did the change do exactly what was asked, no more and no less? If not, report it, skip passes 3-7 and still run pass 8 and the final report. In target and full mode there is no request to compare with: compare the code with its purpose (docstring, README, function name) or skip the pass with a stated reason.
-    3. Design by Contract: derive preconditions, postconditions and invariants of each changed function. Passes 4, 5 and 6 build on them.
-    4. Boundary analysis: probe the edges of those contracts (empty, None, one element, extreme values, Unicode, missing files) and walk each case through with concrete values.
-    5. Pre-mortem: assume this crashes in a month. Build 3-5 realistic failures from the suspicions in 3-4, plus failure paths (error halfway through, leftover state, resources not closed).
-    6. OWASP/CWE/CERT: only if the changed code touches input, files, paths, shell or parsing. Check input validation, injection/shell quoting, paths, secrets, resource and error handling, starting from the input sources found in 3.
-    7. Consistency and design: does it follow the project's own patterns and error handling; names, needless complexity, unused imports, leftover debug prints; in session mode, does the summary match what the patches really do?
-  - Every finding: file and line, severity (bug = wrong result or data loss / risk / minor remark), status VERIFIED or SUSPECTED. A bug needs a concrete input that triggers it. Speculation is always SUSPECTED. A pass without findings must say so explicitly.
-  - STEP 2 = pass 8, verification and final report. Run the checks yourself in your own environment (code execution tool, sandbox or shell), on copies of the code you were shown: syntax check, linter (pyflakes/ruff or the language's equivalent), existing tests, and a small reproduction for every SUSPECTED bug. Never hand the user a verification block and do not use promptpack -e for it. If you have no execution environment, do not ask the user to run anything: verify by hand-tracing concrete values, keep what cannot be confirmed as SUSPECTED and write 'not executed' in the report. Then give the final report with each finding VERIFIED or dropped. No --summary, since nothing is patched.
-- `#optimize` = structured, language-independent performance review of code, from HTML to C#, GUI to network. Same ground rules as #audit: report only (never write patches while running #optimize; patch afterwards, and only after the user okays it), fully autonomous (no questions, one fetch round at most, measurements run by you in your own environment), the same three modes (`#optimize`, `#optimize <target>`, `#optimize full` with the same limits) and the same locate-and-fetch rules. Work from evidence, never from intuition: no change is recommended on a hunch alone.
-  - Core model: total cost = how many times something runs x what each run costs, spent on some resource (CPU, memory, disk, network, GPU, locks or waiting, or the user's perceived latency). Every pass reduces one of the two factors or the resource they burn.
-  - STEP 1 = pure reasoning, passes 1-7 in this fixed order. A pass may be skipped only if you state the reason in one line, never silently. Pass 8 is always mandatory.
-    1. Goal and metric: what should get better (frame time, latency, throughput, memory, startup time, size, battery) and for which input size or scenario. If the user gave no metric, pick the most plausible one from the code's purpose and state it as an assumption.
-    2. Domain and toolchain: identify language, runtime, framework and domain (for example GUI/TUI, OpenGL or other graphics, game loop, web front-end, web back-end, database, network, CLI or batch, embedded) from the files, imports and ctags; a project can be several. Pick the matching measurement tools and recall the typical bottlenecks of those domains from your own knowledge. Every domain claim must be tied to a concrete line of code.
-    3. Resource analysis: where does the cost go (CPU, allocation and memory, disk I/O, network round trips, GPU, lock contention or waiting, rendering and layout, startup)? Find the hot path (loops, per-frame, per-request or per-event code, anything called N times) and rank candidates by their expected share of the total cost. Amdahl: speeding up a 2% part is not worth the change. Hotspot hypotheses are SUSPECTED until measured.
-    4. Workload and complexity: for each hotspot, how often does it run and on how much data? Check Big-O in time and memory, nested loops, repeated scans where a map, set or index fits, repeated sorting, work that grows with history or size. Trace concrete sizes (n = 10, 10000, 1000000).
-    5. The eight levers, applied per hotspot in this order (cheapest and safest first): (a) remove the work; (b) do it less often (cache, memoize, dirty flags, debounce); (c) move it out of the hot path (hoist invariants, precompute, initialize once); (d) do it in bulk (batching, buffering, instancing, bulk queries, fewer round trips); (e) do it lazily (on demand, paging, streaming); (f) do it cheaper (better algorithm or data structure, fewer allocations and copies, built-ins, vectorized or native libraries); (g) do it concurrently or off the critical thread (async, workers, GPU), only for a proven bottleneck; (h) do it approximately (lower precision, resolution or level of detail) when an exact result is not required.
-    6. Domain bottlenecks: apply the known typical problems of the domains from pass 2, for example N+1 queries and missing indexes, draw calls, state changes and per-frame buffer uploads, UI thread blocking and redundant redraws, GC pressure, boxing and allocations in hot loops, render-blocking resources and layout thrashing, connection reuse, serialization cost and compression. Report only what this code actually shows.
-    7. Cost and risk: for every candidate, state expected gain, risk of changed behavior, and added complexity or lost readability. Reject candidates whose gain is marginal or unmeasurable. Also flag existing optimizations that are premature or counterproductive.
-  - Every finding: file and line, category (algorithmic / redundant work / memory and I/O / concurrency / domain-specific), expected gain (high / medium / low, with the measured figure once available), risk (low / medium / high), status VERIFIED (measured, or proven by a trace or count such as a call count) or SUSPECTED (plausible but not measured). A pass without findings must say so explicitly.
-  - STEP 2 = pass 8, measurement and final report. Measure yourself in your own environment (code execution tool, sandbox or shell) on copies of the code you were shown: take a baseline first, then a profiler or timer on the isolated hotspot with realistic input sizes, call counts, a complexity check by timing at n and 10n, and memory measurement where relevant. Where possible, test the candidate change on the same inputs and confirm the output is identical to the original. If the code needs something you do not have (GPU, display, database, network, hardware), measure the pure-logic parts you can isolate and state what stays unmeasured. If you have no execution environment, do not ask the user to run anything: keep findings SUSPECTED, write 'not measured' and never invent numbers. A gain that is not confirmed is dropped or kept SUSPECTED.
-  - Final report: candidates ranked by gain divided by risk, each with status, measured or estimated figure and the proposed change in one sentence (no patch code), followed by what was not reviewed. After the user okays: one optimization per patch task, behavior unchanged; if the gain turns out marginal after patching, recommend #undo.
+- `#audit` = structured bug and risk review of code (formerly `#test`, still accepted as an alias).
+- `#optimize` = structured, language-independent performance review of code, from HTML to C#, GUI to network. Work from evidence: no change is recommended on a hunch alone.
+  - Shared rules for #audit and #optimize:
+    - Report only. Never write patches while reviewing; patch afterwards, and only after the user okays it. No --summary, since nothing is patched.
+    - Fully autonomous: no questions, no waiting for approval between steps, never ask the user to run something or paste output back. When something is unclear, make a reasonable assumption, state it in one line and continue.
+    - Modes (`full` is a reserved word, never a target name):
+      - `<cmd>` = the patches you wrote in this session plus directly affected code (callers and callees of the changed functions). You may read one or two clearly relevant include or import files, but do not wander further.
+      - `<cmd> <target>` = a named function, class or file, changed in this session or not, plus directly affected code.
+      - `<cmd> full` = the whole codebase, never in one reply. Plan from the ctags list, prioritize risky parts (#audit: parsing, file I/O, shell; #optimize: likely hot paths), one module per round over several rounds, and state what was reviewed and what was not reached. End every round with one line naming the next module, so a plain 'continue' resumes.
+    - Locate and fetch: in session mode use the [PATCHID n] lines in output the user pasted back. Only if the session was restarted via #done, take the patch IDs under the latest LOG lines in # WORKLOG and fetch them with `promptpack -ph <IDs>`. Collect everything needed into ONE promptpack block: current code with -r/-n (even if shown earlier, because indentation may have been auto-corrected when patching) and -fs searches for callers and callees. Skip the block if everything is already in the conversation. This is the only round trip; afterwards run to the final report.
+    - STEP 1 = pure reasoning, passes 1-7 in this fixed order, each using the results of the earlier ones. Skip a pass only with a one-line reason, never silently. STEP 2 = pass 8, always mandatory.
+    - Every finding: file and line, status VERIFIED or SUSPECTED, plus the fields listed per command. Speculation is always SUSPECTED. A pass without findings says so explicitly.
+    - Pass 8 runs in your own environment (code execution tool, sandbox or shell) on copies of the code you were shown. Without one, do not ask the user to run anything: hand-trace concrete values, keep unconfirmed findings SUSPECTED and write 'not executed' (#audit) or 'not measured' (#optimize). Never invent numbers. If something is missing (GPU, display, database, network, hardware), check the pure-logic parts you can isolate and state what stays unchecked.
+  - #audit
+    - Mindset: review as if someone else wrote the code. Trace real values through it instead of writing 'looks correct'.
+    - Extra finding fields: severity (bug = wrong result or data loss / risk / minor remark). A bug needs a concrete input that triggers it.
+    - Passes:
+      1. Scope: files, functions, and the callers and callees found by the fetch.
+      2. Requirements (mandatory in session mode): did the change do exactly what was asked, no more and no less? If not, report it, skip passes 3-7, still run pass 8. In target and full mode compare the code with its purpose (docstring, README, function name) or skip with a stated reason.
+      3. Design by Contract: preconditions, postconditions and invariants of each changed function. Passes 4-6 build on them.
+      4. Boundary analysis: probe the edges of those contracts (empty, None, one element, extreme values, Unicode, missing files) with concrete values.
+      5. Pre-mortem: assume this crashes in a month. Build 3-5 realistic failures from the suspicions in 3-4, plus failure paths (error halfway through, leftover state, resources not closed).
+      6. OWASP/CWE/CERT, only if the code touches input, files, paths, shell or parsing: input validation, injection and shell quoting, paths, secrets, resource and error handling, starting from the input sources found in 3.
+      7. Consistency and design: project patterns and error handling, names, needless complexity, unused imports, leftover debug prints; in session mode, does the summary match what the patches really do?
+      8. Verification: syntax check, linter (pyflakes/ruff or equivalent), existing tests, and a small reproduction for every SUSPECTED bug. Final report: each finding VERIFIED or dropped.
+  - #optimize
+    - Core model: total cost = how many times something runs x what each run costs, on some resource (CPU, memory, disk, network, GPU, locks or waiting, perceived latency). Every pass reduces one of the two factors or the resource.
+    - Extra finding fields: category (algorithmic / redundant work / memory and I/O / concurrency / domain-specific), expected gain (high / medium / low, with the measured figure once available), risk (low / medium / high). VERIFIED = measured or proven by a trace or count (e.g. call count).
+    - Passes:
+      1. Goal and metric: what should improve (frame time, latency, throughput, memory, startup, size, battery) and for which input size. If the user gave none, pick the most plausible and state it as an assumption.
+      2. Domain and toolchain: identify language, runtime, framework and domain(s) (GUI/TUI, graphics, game loop, web front-end or back-end, database, network, CLI/batch, embedded) from files, imports and ctags. Pick matching measurement tools. Every domain claim must be tied to a concrete line of code.
+      3. Resource analysis: where does the cost go? Find the hot path (loops, per-frame, per-request or per-event code, anything called N times) and rank candidates by expected share of total cost (Amdahl: a 2% part is not worth a change). Hotspot hypotheses are SUSPECTED until measured.
+      4. Workload and complexity: per hotspot, how often and on how much data? Check Big-O in time and memory, nested loops, repeated scans where a map, set or index fits, repeated sorting, work that grows with history. Trace n = 10, 10000, 1000000.
+      5. The eight levers, per hotspot, cheapest and safest first: (a) remove the work; (b) do it less often (cache, memoize, dirty flags, debounce); (c) move it out of the hot path (hoist, precompute, init once); (d) do it in bulk (batching, buffering, instancing, fewer round trips); (e) do it lazily (on demand, paging, streaming); (f) do it cheaper (better algorithm or structure, fewer allocations and copies, built-ins, vectorized or native libraries); (g) do it concurrently or off the critical thread, only for a proven bottleneck; (h) do it approximately (lower precision, resolution or level of detail) when exactness is not required.
+      6. Domain bottlenecks: apply the typical problems of the domains from pass 2 (N+1 queries, missing indexes, draw calls, state changes, per-frame uploads, UI-thread blocking, redundant redraws, GC pressure, boxing, render-blocking resources, layout thrashing, connection reuse, serialization, compression). Report only what this code actually shows.
+      7. Cost and risk: per candidate, expected gain, risk of changed behavior, added complexity. Reject marginal or unmeasurable gains. Flag existing optimizations that are premature or counterproductive.
+      8. Measurement: baseline first, then profiler or timer on the isolated hotspot with realistic sizes and call counts, complexity check by timing at n and 10n, memory where relevant. Where possible test the candidate on the same inputs and confirm identical output. Unconfirmed gains are dropped or stay SUSPECTED.
+    - Final report: candidates ranked by gain divided by risk, each with status, measured or estimated figure and the change in one sentence (no patch code), then what was not reviewed. After the user okays: one optimization per patch task, behavior unchanged; if the gain turns out marginal after patching, recommend #undo.
 - `#name` = suggest a short (3–8 word) internal codename for "this version" —
   a fun but specific label summarizing the code or problem currently being
   worked on. For versioning/reference only; never written into code or files
@@ -2736,9 +2768,1594 @@ def get_dep_nodes(node, root, visited=None, module_map=None):
 
     return result
 
+# ---------------------------------------------------------------------------
+# MCP server (promptpack --mcp): an HTTP server on 127.0.0.1 that AI clients
+# reach through the MCP tools protocol. It exposes one tool, `promptpack`,
+# which runs promptpack's own CLI in a child process, so every command behaves
+# exactly as it does in the terminal. Output is logged in the terminal.
+# ---------------------------------------------------------------------------
+
+MCP_CONFIG_FILE = Path(__file__).resolve().parent / 'mcp.json'
+MCP_DEFAULT_PORT = 47829
+MCP_CMD_TIMEOUT = 300   # seconds allowed for one promptpack command
+MCP_LOG_MAX_BYTES = 2 * 1024       # output the terminal shows per command, the AI always gets all of it
+MCP_PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05']
+MCP_NOTICE = (
+    "You are connected to promptpack through MCP. Do not ask the user to run promptpack "
+    "commands: call the tool `promptpack` with `commands`, a list where each item has "
+    "`args` (the promptpack arguments as strings, e.g. [\"-r\", \"main.py\"]) and, for "
+    "commands that read stdin (-p, -f, --summary), `stdin` (the text you would otherwise pipe in). "
+    "Several commands can go in one call and run in order. -c is not needed: results come back "
+    "in the tool result. The project spec below is the user's standing workflow; follow it, "
+    "except that wherever it tells you to ask the user to run commands, to paste output back or to "
+    "end with -c, you call the tool yourself instead. Start working with the tool right away "
+    "(for example -r on the files you need) instead of asking the user to do it."
+)
+
+
+def load_mcp_config(exit_on_error=True):
+    """Read mcp.json (port and access token) next to promptpack.py. Created with
+    defaults and a random token on first use. Other keys are kept as they are,
+    so later settings (OpenRouter) can live in the same file."""
+    config = {}
+    if MCP_CONFIG_FILE.exists():
+        try:
+            with open(MCP_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            if not isinstance(config, dict):
+                raise ValueError("top-level JSON value is not an object")
+        except (OSError, ValueError) as e:
+            if not exit_on_error:
+                raise
+            print(f"❌ {MCP_CONFIG_FILE.name} is unreadable: {e}")
+            print("   Repair the file, or delete it to get a new port and token.")
+            sys.exit(1)
+    changed = False
+    if not isinstance(config.get('port'), int):
+        config['port'] = MCP_DEFAULT_PORT
+        changed = True
+    if not isinstance(config.get('token'), str) or not config['token']:
+        config['token'] = secrets.token_urlsafe(24)
+        changed = True
+    if changed:
+        _atomic_write_text(MCP_CONFIG_FILE, json.dumps(config, indent=2, ensure_ascii=False) + '\n')
+    return config
+
+
+def build_mcp_instructions(root):
+    """Text sent to the AI when it connects: MCP_NOTICE plus ctags.txt, the same
+    file F1 creates. It is regenerated now so the structure is current."""
+    ctags_text = ''
+    marked_files = get_marked_files(root) if root is not None else []
+    if marked_files:
+        try:
+            if create_ctags_file(root) and Path('ctags.txt').exists():
+                ctags_text = Path('ctags.txt').read_text(encoding='utf-8')
+        except HistoryCorruptError as e:
+            ctags_text = f"(ctags.txt not created: {e})"
+    # ctags.txt opens with "# ABOUT THIS FILE", written for a chat where the user runs the
+    # commands. MCP_NOTICE replaces that part, so everything from "# LANGUAGE" on is sent.
+    cut = ctags_text.find('# LANGUAGE')
+    if cut >= 0:
+        ctags_text = ctags_text[cut:]
+    else:
+        # Empty folder, nothing marked or ctags.txt failed: the full spec is still sent,
+        # only the file list and the worklog are missing.
+        core = PROMPTPACK_CORE_INSTRUCTIONS
+        note = ctags_text or ("(The project is empty or no files are marked, so there is no file list "
+                              "or worklog yet. Create new files with -f. Files marked with Space in "
+                              "promptpack are included after a restart of promptpack --mcp.)")
+        ctags_text = core[max(0, core.find('# LANGUAGE')):] + "\n" + note
+    return MCP_NOTICE + "\n\n" + ctags_text
+
+
+class _MCPHandler(BaseHTTPRequestHandler):
+    """HTTP side of the MCP server: one JSON-RPC message per POST to /mcp."""
+    server_version = 'promptpack-mcp'
+
+    def log_message(self, format, *args):
+        pass    # the server prints its own log, see _MCPServer.say
+
+    def _reply(self, code, payload=None):
+        body = b'' if payload is None else json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._reply(405, {'error': 'use POST /mcp'})
+
+    def do_POST(self):
+        srv = self.server
+        if self.path.split('?', 1)[0] != '/mcp':
+            self._reply(404, {'error': 'not found'})
+            return
+        origin = self.headers.get('Origin', '')
+        if origin and not origin.startswith(('http://127.0.0.1', 'http://localhost')):
+            srv.say(f"✖ rejected request from origin {origin}")
+            self._reply(403, {'error': 'origin not allowed'})
+            return
+        given = self.headers.get('Authorization', '').encode('utf-8')
+        if not hmac.compare_digest(given, f"Bearer {srv.token}".encode('utf-8')):
+            srv.say("✖ rejected request with a missing or wrong token")
+            self._reply(401, {'error': 'unauthorized'})
+            return
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            msg = json.loads(self.rfile.read(length).decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            self._reply(400, {'jsonrpc': '2.0', 'id': None,
+                              'error': {'code': -32700, 'message': 'Parse error'}})
+            return
+        if not isinstance(msg, dict):
+            self._reply(400, {'jsonrpc': '2.0', 'id': None,
+                              'error': {'code': -32600, 'message': 'Expected one JSON-RPC message'}})
+            return
+        response = srv.handle_rpc(msg)
+        if response is None:
+            self._reply(202)
+        else:
+            self._reply(200, response)
+
+
+class _MCPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, token, instructions):
+        super().__init__(address, _MCPHandler)
+        self.token = token
+        self.instructions = instructions
+        # Tool calls run one at a time: they write patch.json and summary.json.
+        self.lock = threading.Lock()
+
+    def say(self, text):
+        mcp_log(text)
+
+    @staticmethod
+    def _rpc_error(mid, code, message):
+        return {'jsonrpc': '2.0', 'id': mid, 'error': {'code': code, 'message': message}}
+
+    def handle_rpc(self, msg):
+        method = msg.get('method', '')
+        mid = msg.get('id')
+        if mid is None:
+            self.say(f"· notification {method}")
+            return None
+        params = msg.get('params') or {}
+        try:
+            if method == 'initialize':
+                result = self._initialize(params)
+            elif method == 'ping':
+                result = {}
+            elif method == 'tools/list':
+                result = {'tools': [self._tool_definition()]}
+            elif method == 'tools/call':
+                result = self._call_tool(params)
+            else:
+                return self._rpc_error(mid, -32601, f"Method not found: {method}")
+        except Exception as e:
+            self.say(f"✖ {method} failed: {e}")
+            return self._rpc_error(mid, -32603, str(e))
+        return {'jsonrpc': '2.0', 'id': mid, 'result': result}
+
+    def _initialize(self, params):
+        requested = params.get('protocolVersion')
+        version = requested if requested in MCP_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSIONS[0]
+        self.say(f"→ client connected (protocol {version})")
+        return {
+            'protocolVersion': version,
+            'capabilities': {'tools': {}},
+            'serverInfo': {'name': 'promptpack', 'version': '1.0'},
+            'instructions': self.instructions,
+        }
+
+    @staticmethod
+    def _tool_definition():
+        return {
+            'name': 'promptpack',
+            'description': ('Run promptpack commands in the project folder. Several commands can go in one call; '
+                            'they run in order and every result is returned. Same arguments as the terminal CLI.'),
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'commands': {
+                        'type': 'array',
+                        'minItems': 1,
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'args': {'type': 'array', 'items': {'type': 'string'},
+                                         'description': 'promptpack arguments, e.g. ["-r", "main.py"]'},
+                                'stdin': {'type': 'string',
+                                          'description': 'text for commands that read stdin (-p, -f, --summary)'},
+                            },
+                            'required': ['args'],
+                        },
+                    },
+                },
+                'required': ['commands'],
+            },
+        }
+
+    def _call_tool(self, params):
+        if params.get('name') != 'promptpack':
+            raise ValueError(f"unknown tool: {params.get('name')}")
+        commands = (params.get('arguments') or {}).get('commands')
+        if not isinstance(commands, list) or not commands:
+            raise ValueError("'commands' must be a non-empty list")
+        with self.lock:
+            texts = [self._run_command(item) for item in commands]
+        return {'content': [{'type': 'text', 'text': '\n\n'.join(texts)}]}
+
+    def _run_command(self, item):
+        return run_promptpack_command(item, self.say)
+
+
+OPENROUTER_API = 'https://openrouter.ai/api/v1'
+OPENROUTER_REQUEST_TIMEOUT = 600   # seconds to wait for one model answer
+OPENROUTER_MODELS_TIMEOUT = 30     # seconds to wait for the model list
+OPENROUTER_MAX_STEPS = 40          # tool-call rounds allowed for one user message
+CONTEXT_WARN_FRACTION = 0.80   # trim old tool results once the conversation reaches this share of the window
+CONTEXT_TRIM_FRACTION = 0.60   # trimming stops at this share of the window
+MODELS_MAX_AGE = 24 * 3600     # re-fetch the OpenRouter model list when older than this (seconds)
+MCP_SECURITY_NOTE = ("⚠️  The AI can run shell commands in this project (-e). The -e blacklist is a minimal "
+                     "guard, not a security boundary: only connect an AI you trust.")
+
+
+def save_mcp_config(config):
+    """Write mcp.json (atomic). It can hold an API key, so where the system supports it
+    the file is made readable by its owner only."""
+    _atomic_write_text(MCP_CONFIG_FILE, json.dumps(config, indent=2, ensure_ascii=False) + '\n')
+    try:
+        os.chmod(MCP_CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def mcp_ready(config):
+    """(ok, problem): may promptpack --mcp start with this config? A mode must be
+    chosen (F6) and its requirements met."""
+    mode = config.get('mode')
+    if mode == 'claude_desktop':
+        return True, ''
+    if mode == 'openrouter':
+        if not config.get('openrouter_key'):
+            return False, "OpenRouter needs an API key. Run promptpack, press F6, choose OpenRouter and enter the key."
+        if not config.get('openrouter_model'):
+            return False, "OpenRouter needs a model. Run promptpack, press F6, choose OpenRouter and pick a model."
+        return True, ''
+    return False, ("No MCP mode is chosen. Run promptpack, press F6, choose Claude Desktop or OpenRouter, "
+                   "then start promptpack --mcp again.")
+
+
+_ANSI = {'cyan': '\x1b[36m', 'green': '\x1b[32m', 'yellow': '\x1b[33m',
+         'red': '\x1b[31m', 'dim': '\x1b[2m', 'reset': '\x1b[0m'}
+_CURSES_PAIR = {'cyan': 4, 'green': 5, 'yellow': 6, 'red': 7}
+SPINNER_FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+SPINNER_INTERVAL = 0.08   # seconds per frame
+
+def _log_kind(text):
+    """Which colour a log line gets, from its leading symbol. None = plain."""
+    body = re.sub(r'^\[\d{2}:\d{2}:\d{2}\] ', '', text)
+    if body.startswith(('✖', '❌')):
+        return 'red'
+    if body.startswith('→'):
+        return 'cyan'
+    if body.startswith('←'):
+        return 'green'
+    if body.startswith('⚙'):
+        return 'yellow'
+    if body.startswith(('·', '⏳')):
+        return 'dim'
+    return None
+
+def mcp_log(text):
+    stamp = datetime.now().strftime('%H:%M:%S')
+    kind = _log_kind(text)
+    if kind and sys.stdout.isatty():
+        # ANSI colour only for a real terminal; the curses chat view colours by attribute instead
+        colour = _ANSI['dim'] if kind == 'dim' else _ANSI[kind]
+        print(f"{_ANSI['dim']}[{stamp}]{_ANSI['reset']} {colour}{text}{_ANSI['reset']}", flush=True)
+    else:
+        print(f"[{stamp}] {text}", flush=True)
+
+
+def run_promptpack_command(item, say):
+    """Run one {"args": [...], "stdin": "..."} item as a promptpack child process, exactly as
+    the terminal CLI would, and return the result as text. say(text) logs one line."""
+    args = item.get('args') if isinstance(item, dict) else None
+    if not isinstance(args, list) or not args or not all(isinstance(a, str) for a in args):
+        say(f"✖ invalid command rejected: {str(item)[:160]}")
+        return '✖ invalid command: expected {"args": [strings], "stdin": string}'
+    shown = 'promptpack ' + ' '.join(args)
+    if args in (['-c'], ['--clear']):
+        say(f"→ {shown} (skipped: not needed in MCP mode)")
+        return f"$ {shown}\n(skipped: -c is not needed, results are returned directly)"
+    if '--mcp' in args or '--mcp-bridge' in args:
+        say(f"✖ refused: {shown}")
+        return f"$ {shown}\n✖ refused: the MCP server cannot be started through the tool"
+    say(f"→ {shown}")
+    fd, buffer_path = tempfile.mkstemp(prefix='promptpack_mcp_', suffix='.txt')
+    os.close(fd)
+    env = dict(os.environ, PROMPTPACK_MCP_BUFFER=buffer_path, PYTHONIOENCODING='utf-8')
+    buffered, console, code = '', '', None
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), *args],
+            input=str(item.get('stdin') or ''), capture_output=True, text=True,
+            encoding='utf-8', errors='replace', env=env, timeout=MCP_CMD_TIMEOUT)
+        console, code = proc.stdout + proc.stderr, proc.returncode
+        with open(buffer_path, 'r', encoding='utf-8', errors='replace') as f:
+            buffered = f.read()
+    except subprocess.TimeoutExpired:
+        console = f"✖ timed out after {MCP_CMD_TIMEOUT} seconds"
+        code = -1
+    finally:
+        try:
+            os.unlink(buffer_path)
+        except OSError:
+            pass
+    # The command's messages are printed and also buffered. A console line is shown
+    # only when its text (without the leading emoji) is not already in the buffer.
+    extra = [line for line in console.splitlines()
+             if line.strip() and re.sub(r'^[^A-Za-z0-9]+', '', line.strip()) not in buffered]
+    body = '\n'.join(part for part in (buffered.strip('\n'), '\n'.join(extra).strip('\n')) if part)
+    say(f"← exit {code}")
+    if body:
+        print(_clip(body, MCP_LOG_MAX_BYTES, 'terminal'), flush=True)
+    return f"$ {shown}\n{body}\n[exit {code}]"
+
+
+def _openrouter_request(path, key=None, payload=None, timeout=OPENROUTER_REQUEST_TIMEOUT):
+    """GET (no payload) or POST JSON to OpenRouter and return the decoded JSON.
+    Raises RuntimeError with a readable message on any failure."""
+    headers = {'Content-Type': 'application/json', 'X-Title': 'PromptPack'}
+    if key:
+        headers['Authorization'] = f'Bearer {key}'
+    data = json.dumps(payload).encode('utf-8') if payload is not None else None
+    req = urllib.request.Request(OPENROUTER_API + path, data=data, headers=headers,
+                                 method='POST' if payload is not None else 'GET')
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            err = json.loads(raw.decode('utf-8', 'replace')).get('error')
+            detail = (err.get('message') if isinstance(err, dict) else str(err)) or str(err)
+        except (ValueError, AttributeError):
+            detail = raw[:200].decode('utf-8', 'replace')
+        raise RuntimeError(f"OpenRouter answered HTTP {e.code}: {detail}")
+    except OSError as e:
+        raise RuntimeError(f"cannot reach OpenRouter: {e}")
+    try:
+        return json.loads(raw.decode('utf-8'))
+    except ValueError:
+        raise RuntimeError("OpenRouter sent an answer that is not JSON")
+
+
+def _price_per_million(value):
+    """OpenRouter prices are USD per token, as text. Returns USD per million tokens,
+    or None when unknown or variable (negative, as for the auto router)."""
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price * 1000000 if price >= 0 else None
+
+
+def _fmt_price(price):
+    if price is None:
+        return 'var'
+    if price == 0:
+        return 'free'
+    return f"${price:.2f}" if price >= 0.01 else f"${price:.4f}"
+
+
+def _fmt_context(tokens):
+    if not tokens:
+        return '?'
+    return f"{tokens // 1000}K" if tokens < 1000000 else f"{tokens / 1000000:.1f}M"
+
+
+def fetch_openrouter_models():
+    """Download the model list and keep the models that can call tools (free and paid).
+    Sorted free first, then by name. Raises RuntimeError if the list cannot be fetched."""
+    data = _openrouter_request('/models', timeout=OPENROUTER_MODELS_TIMEOUT)
+    if not isinstance(data, dict):
+        raise RuntimeError("unexpected model list from OpenRouter")
+    models = []
+    for m in data.get('data') or []:
+        if not isinstance(m, dict) or not m.get('id'):
+            continue
+        if 'tools' not in (m.get('supported_parameters') or []):
+            continue
+        pricing = m.get('pricing') or {}
+        price_in = _price_per_million(pricing.get('prompt'))
+        price_out = _price_per_million(pricing.get('completion'))
+        models.append({
+            'id': m['id'],
+            'name': m.get('name') or m['id'],
+            'description': ' '.join(str(m.get('description') or '').split())[:400],
+            'context': m.get('context_length') or 0,
+            'prompt': price_in,
+            'completion': price_out,
+            'free': str(m['id']).endswith(':free') or (price_in == 0 and price_out == 0),
+        })
+    models.sort(key=lambda m: (not m['free'], m['name'].lower()))
+    return models
+
+
+def _fmt_count(n):
+    """1234 -> 1.2K, 2500000 -> 2.50M, small numbers as they are."""
+    if n < 1000:
+        return str(n)
+    return f"{n / 1000:.1f}K" if n < 1000000 else f"{n / 1000000:.2f}M"
+
+
+def _join_row(left, right, width):
+    """One header row: left text, right text flush to the right edge. When the two do not
+    fit, the left text is cut so the right text still shows."""
+    if len(left) + len(right) <= width:
+        return left.ljust(width - len(right)) + right
+    return left[:max(0, width - len(right) - 1)] + ' ' + right
+
+
+class _MCPHeader:
+    """Pinned two-row header for promptpack --mcp, drawn with ANSI escape codes. The rows
+    below it form a scroll region, so the log and the chat scroll under the header without
+    touching it. Does nothing when stdout is not a terminal. In OpenRouter mode row 2 shows
+    the token usage and cost of the session, taken from the usage OpenRouter sends with every
+    answer (estimated from the model's prices when an answer has no cost). Claude Desktop does
+    not report usage to an MCP server, so there row 2 holds a note instead."""
+
+    def __init__(self, title, note=''):
+        self.title = title
+        self.note = note
+        self.prices = None      # (USD per million tokens in, out) of the model, or None
+        self.context = 0        # context window of the model, in tokens
+        self.free = False
+        self.requests = 0
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.last_in = 0        # prompt size of the latest request = how full the context is
+        self.cost = 0.0
+        self.estimated = False  # part of the cost is calculated from prices, not reported
+        self.cost_unknown = False
+        self.active = False
+        self._size = None
+        self._lock = threading.Lock()
+
+    def set_model(self, info):
+        """info: a model entry from the cached OpenRouter list (or None)."""
+        if not info:
+            return
+        price_in, price_out = info.get('prompt'), info.get('completion')
+        if price_in is not None and price_out is not None:
+            self.prices = (price_in, price_out)
+        self.context = info.get('context') or 0
+        self.free = bool(info.get('free'))
+
+    def _lines(self, width):
+        line1 = _join_row(f" PromptPack MCP | {self.title}", f"{Path.cwd()} ", width)
+        if self.note:
+            return line1, _join_row(" " + self.note, "Ctrl+C: Stop ", width)
+        if self.free:
+            cost = 'free ($0)'
+        else:
+            cost = f"{'~' if self.estimated else ''}${self.cost:.4f}{'+' if self.cost_unknown else ''}"
+        ctx = _fmt_count(self.last_in) + (f"/{_fmt_context(self.context)}" if self.context else '')
+        # "billed in" is the whole context sent with each request, so it grows faster than the chat
+        line2 = (f" Billed in: {_fmt_count(self.tokens_in)} | Out: {_fmt_count(self.tokens_out)} | "
+                 f"Context now: {ctx} | Cost: {cost} | Requests: {self.requests}")
+        return line1, _join_row(line2, "Ctrl+C: Stop ", width)
+
+    def start(self):
+        if not sys.stdout.isatty() or os.environ.get('TERM') == 'dumb':
+            return
+        if shutil.get_terminal_size((80, 24)).lines < 6:
+            return
+        if sys.platform == 'win32':
+            os.system('')   # switches the Windows console to ANSI mode
+        self.active = True
+        self._size = None
+        sys.stdout.write("\x1b[2J\x1b[H")
+        self.draw()
+        sys.stdout.write("\x1b[3;1H")   # first line of the scrolling area
+        sys.stdout.flush()
+
+    def draw(self):
+        if not self.active:
+            return
+        with self._lock:
+            size = shutil.get_terminal_size((80, 24))
+            width, height = size.columns, size.lines
+            if height < 6:
+                return
+            line1, line2 = self._lines(width)
+            out = ["\x1b7"]                      # save the cursor
+            if self._size != (width, height):    # first draw or the window was resized
+                out.append(f"\x1b[3;{height}r")
+                self._size = (width, height)
+            out.append(f"\x1b[1;1H\x1b[7m{line1.ljust(width)[:width]}\x1b[0m")
+            out.append(f"\x1b[2;1H\x1b[7m{line2.ljust(width)[:width]}\x1b[0m")
+            out.append("\x1b8")                  # restore the cursor
+            sys.stdout.write(''.join(out))
+            sys.stdout.flush()
+
+    def add_usage(self, usage):
+        """Count one OpenRouter answer. usage is the 'usage' object of the response."""
+        if not isinstance(usage, dict):
+            usage = {}
+
+        def count(name):
+            value = usage.get(name)
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        tokens_in, tokens_out = count('prompt_tokens'), count('completion_tokens')
+        reported = usage.get('cost')
+        with self._lock:
+            self.requests += 1
+            self.tokens_in += tokens_in
+            self.tokens_out += tokens_out
+            self.last_in = tokens_in
+            if isinstance(reported, (int, float)):
+                self.cost += float(reported)
+            elif self.prices:
+                self.cost += (tokens_in * self.prices[0] + tokens_out * self.prices[1]) / 1000000
+                self.estimated = True
+            else:
+                self.cost_unknown = True
+        self.draw()
+
+    def stop(self):
+        if not self.active:
+            return
+        self.active = False
+        height = shutil.get_terminal_size((80, 24)).lines
+        sys.stdout.write(f"\x1b[r\x1b[{height};1H\n")   # remove the scroll region, cursor to the bottom
+        sys.stdout.flush()
+
+
+def _make_mcp_header(config):
+    """The header that fits the chosen MCP mode."""
+    if config.get('mode') == 'openrouter':
+        model = config.get('openrouter_model')
+        header = _MCPHeader(f"OpenRouter | {model}")
+        header.set_model(next((m for m in config.get('openrouter_models') or [] if m.get('id') == model), None))
+        return header
+    return _MCPHeader("Claude Desktop", note="Claude Desktop does not report token usage or cost to MCP servers: see the usage in Claude Desktop itself.")
+
+
+def _lock_terminal_input():
+    """Read-only terminal: typed characters are not echoed. Returns a function that
+    restores the terminal and throws away anything typed meanwhile. Does nothing
+    where termios is missing (Windows) or stdin is not a terminal."""
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        new[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+    except Exception:
+        return lambda: None
+
+    def restore():
+        try:
+            termios.tcflush(fd, termios.TCIFLUSH)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+    return restore
+
+
+def _display_width(text):
+    """Columns a string takes in a terminal: wide characters (CJK, most emoji) count 2,
+    combining marks and zero-width joiners 0."""
+    import unicodedata
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch) or ch in '\u200b\u200d\ufe0f':
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+    return width
+
+
+def _pad_to(text, width, align='l'):
+    """Pad text with spaces to width columns; align is l, r or c."""
+    gap = max(0, width - _display_width(text))
+    if align == 'r':
+        return ' ' * gap + text
+    if align == 'c':
+        return ' ' * (gap // 2) + text + ' ' * (gap - gap // 2)
+    return text + ' ' * gap
+
+
+def _wrap_cell(text, width):
+    """Word-wrap one table cell to width columns. Returns a list of lines, at least one."""
+    out = []
+    for part in text.split('\n'):
+        line = ''
+        for word in part.split():
+            while _display_width(word) > width:   # a word wider than the column is cut
+                used = cut = 0
+                for ch in word:
+                    w = _display_width(ch)
+                    if used + w > width and cut:
+                        break
+                    used += w
+                    cut += 1
+                if line:
+                    out.append(line)
+                    line = ''
+                out.append(word[:cut])
+                word = word[cut:]
+            if not word:
+                continue
+            if not line:
+                line = word
+            elif _display_width(line) + 1 + _display_width(word) <= width:
+                line += ' ' + word
+            else:
+                out.append(line)
+                line = word
+        out.append(line)
+    return out or ['']
+
+
+_TABLE_SEP = re.compile(r'^:?-+:?$')
+
+
+def _split_table_row(line):
+    """Cells of a markdown table row like | a | b |, or None when the line is not one."""
+    s = line.strip()
+    if len(s) < 2 or not (s.startswith('|') and s.endswith('|')):
+        return None
+    cells = re.split(r'(?<!\\)\|', s)[1:-1]
+    return [c.strip().replace('\\|', '|') for c in cells]
+
+
+def _clean_cell(text):
+    """Inline markdown that cannot be shown in a terminal cell is dropped."""
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.I)
+    text = re.sub(r'`([^`]*)`', r'\1', text)
+    return re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+
+
+def _render_table(header, aligns, body, width):
+    """Draw a markdown table as an aligned box that fits in width columns. Returns a list of
+    (text, is_header_row), or None when it cannot fit even with the narrowest columns."""
+    ncols = len(header)
+    aligns = (aligns + ['l'] * ncols)[:ncols]
+    rows = [[_clean_cell(c) for c in (r + [''] * ncols)[:ncols]] for r in [header] + body]
+    widths = [max(1, max(_display_width(line) for row in rows for line in row[c].split('\n')))
+              for c in range(ncols)]
+    limits = [min(w, 4) for w in widths]
+    overhead = 3 * ncols + 1
+    while sum(widths) + overhead > width:
+        shrinkable = [c for c in range(ncols) if widths[c] > limits[c]]
+        if not shrinkable:
+            return None
+        widest = max(shrinkable, key=lambda c: widths[c])
+        widths[widest] -= 1
+    wrapped = [[_wrap_cell(cell, widths[c]) for c, cell in enumerate(row)] for row in rows]
+    tall = any(len(cell) > 1 for row in wrapped for cell in row)
+
+    def border(left, mid, right):
+        return left + mid.join('─' * (w + 2) for w in widths) + right
+
+    out = [(border('┌', '┬', '┐'), False)]
+    for r, cells in enumerate(wrapped):
+        for k in range(max(len(cell) for cell in cells)):
+            parts = [' ' + _pad_to(cell[k] if k < len(cell) else '', widths[c], aligns[c]) + ' '
+                     for c, cell in enumerate(cells)]
+            out.append(('│' + '│'.join(parts) + '│', r == 0))
+        if r == 0 or (tall and r < len(wrapped) - 1):
+            out.append((border('├', '┼', '┤'), False))
+    out.append((border('└', '┴', '┘'), False))
+    return out
+
+
+def _wrap_lines(lines, width):
+    """Turn logical lines [(text, attr)] into display rows [(text, attr)] of at most width
+    columns. A markdown table (header row, |---| row, body rows) is drawn as an aligned box."""
+    rows = []
+    i = 0
+    while i < len(lines):
+        text, attr = lines[i]
+        if _split_table_row(text) is not None:
+            j = i
+            block = []
+            while j < len(lines) and _split_table_row(lines[j][0]) is not None:
+                block.append(_split_table_row(lines[j][0]))
+                j += 1
+            if len(block) >= 2 and all(_TABLE_SEP.match(c) for c in block[1]):
+                aligns = ['c' if c.startswith(':') and c.endswith(':') else 'r' if c.endswith(':') else 'l'
+                          for c in block[1]]
+                drawn = _render_table(block[0], aligns, block[2:], width)
+                if drawn is not None:
+                    for line, bold in drawn:
+                        rows.append((line, curses.A_BOLD if bold else attr))
+                    i = j
+                    continue
+        if not text:
+            rows.append(('', attr))
+        else:
+            for k in range(0, len(text), width):
+                rows.append((text[k:k + width], attr))
+        i += 1
+    return rows
+
+
+class _ChatView:
+    """Full-screen curses view for the OpenRouter chat: the two-row header on top, the chat and
+    the log in a scrollable area, one input line at the bottom. While it runs, everything
+    written to stdout and stderr (print, mcp_log, command output) goes into the scroll buffer
+    instead of the terminal. The model works in a background thread, so scrolling stays
+    possible while the AI is busy."""
+
+    MAX_LINES = 20000
+    encoding = 'utf-8'
+
+    def __init__(self, header):
+        self.header = header
+        self.spin = 0           # index into SPINNER_FRAMES while the AI works
+        self.lines = []          # logical lines: (text, attr)
+        self.partial = ''        # written text that has no newline yet
+        self.lock = threading.Lock()
+        self.busy = False
+        self.offset = 0          # wrapped rows scrolled up from the bottom (0 = follow)
+        self.text = ''           # the input line
+        self.pos = 0             # cursor position in the input line
+        self._rows = []          # wrapped rows of lines[:_wrapped]
+        self._wrapped = 0
+        self._width = 0
+        self._trimmed = False
+
+    # --- file-like side: used as sys.stdout and sys.stderr while the view runs ---
+    def isatty(self):
+        return False
+
+    def flush(self):
+        pass
+
+    def write(self, data):
+        if not data:
+            return 0
+        with self.lock:
+            parts = (self.partial + data.replace('\r\n', '\n').replace('\r', '\n')).split('\n')
+            self.partial = parts.pop()
+            for part in parts:
+                self._add(part)
+        return len(data)
+
+    def _add(self, text):
+        attr = curses.A_NORMAL
+        body = re.sub(r'^\[\d{2}:\d{2}:\d{2}\] ', '', text)
+        kind = _log_kind(text)
+        if text.startswith('you>') or body.startswith('ai>'):
+            attr = curses.A_BOLD
+        elif kind in _CURSES_PAIR:
+            attr = curses.color_pair(_CURSES_PAIR[kind])
+        elif kind == 'dim' or text.startswith('['):
+            attr = curses.A_DIM
+        self.lines.append((text.expandtabs(4), attr))
+        if len(self.lines) > self.MAX_LINES:
+            del self.lines[:self.MAX_LINES // 10]
+            self._trimmed = True
+
+    # --- drawing ---
+    def _wrap(self, width):
+        """Wrap new lines into rows of at most width characters (cached)."""
+        with self.lock:
+            if width != self._width or self._trimmed:
+                self._rows, self._wrapped, self._width, self._trimmed = [], 0, width, False
+            fresh = self._wrapped == 0
+            before = len(self._rows)
+            self._rows.extend(_wrap_lines(self.lines[self._wrapped:], width))
+            self._wrapped = len(self.lines)
+            if self.offset and not fresh:
+                self.offset += len(self._rows) - before   # keep the view still while scrolled up
+
+    def _draw(self, stdscr):
+        height, width = stdscr.getmaxyx()
+        stdscr.erase()
+        if height < 6 or width < 24:
+            _put(stdscr, 0, 0, "Window too small")
+            stdscr.refresh()
+            return
+        line1, line2 = self.header._lines(width)
+        _put(stdscr, 0, 0, line1.ljust(width - 1)[:width - 1], curses.A_REVERSE)
+        _put(stdscr, 1, 0, line2.ljust(width - 1)[:width - 1], curses.A_REVERSE)
+        body_h = height - 4
+        self._wrap(width - 1)
+        total = len(self._rows)
+        self.offset = max(0, min(self.offset, max(0, total - body_h)))
+        end = total - self.offset
+        for i, (text, attr) in enumerate(self._rows[max(0, end - body_h):end]):
+            _put(stdscr, 2 + i, 0, text, attr)
+        if self.offset:
+            status = f" ↑ scrolled up, {self.offset} rows below | End: back to the bottom"
+        else:
+            status = " PgUp/PgDn, Up/Down or the mouse wheel scroll | Home: top | End: bottom"
+        if self.busy:
+            frame = SPINNER_FRAMES[self.spin % len(SPINNER_FRAMES)]
+            status = f" {frame} the AI is working |" + status
+        _put(stdscr, height - 2, 0, status, curses.A_DIM)
+        label = "you> "
+        room = max(1, width - len(label) - 2)
+        shown = self.text.replace('\n', '⏎')
+        first = max(0, self.pos - room + 1)
+        _put(stdscr, height - 1, 0, label + shown[first:first + room], curses.A_BOLD)
+        try:
+            stdscr.move(height - 1, min(width - 2, len(label) + self.pos - first))
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+    # --- main loop ---
+    def _work(self, on_submit, text):
+        try:
+            on_submit(text)
+        except Exception as e:
+            print(f"❌ unexpected error: {e}", flush=True)
+        finally:
+            self.busy = False
+
+    def run(self, stdscr, on_submit):
+        curses.curs_set(1)
+        stdscr.keypad(True)
+        if curses.has_colors():
+            try:
+                curses.start_color()
+                curses.use_default_colors()
+                bg = -1
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            for pair, colour in ((4, curses.COLOR_CYAN), (5, curses.COLOR_GREEN),
+                                 (6, curses.COLOR_YELLOW), (7, curses.COLOR_RED)):
+                curses.init_pair(pair, colour, bg)
+        stdscr.timeout(100)      # wake up often: the worker thread adds lines meanwhile
+        while True:
+            self._draw(stdscr)
+            if self.busy:
+                self.spin += 1
+            try:
+                ch = stdscr.get_wch()
+            except curses.error:
+                continue
+            page = max(1, stdscr.getmaxyx()[0] - 5)
+            if ch == curses.KEY_PPAGE:
+                self.offset += page
+            elif ch == curses.KEY_NPAGE:
+                self.offset -= page
+            elif ch == curses.KEY_UP:
+                self.offset += 3
+            elif ch == curses.KEY_DOWN:
+                self.offset -= 3
+            elif ch == curses.KEY_HOME:
+                self.offset = 10 ** 9
+            elif ch == curses.KEY_END:
+                self.offset = 0
+            elif ch == curses.KEY_LEFT:
+                self.pos = max(0, self.pos - 1)
+            elif ch == curses.KEY_RIGHT:
+                self.pos = min(len(self.text), self.pos + 1)
+            elif ch == '\x01':
+                self.pos = 0
+            elif ch == '\x05':
+                self.pos = len(self.text)
+            elif ch == '\x15':
+                self.text, self.pos = '', 0
+            elif ch == '\x04' and not self.text:
+                return
+            elif ch in ('\x7f', '\b') or ch == curses.KEY_BACKSPACE:
+                if self.pos:
+                    self.text = self.text[:self.pos - 1] + self.text[self.pos:]
+                    self.pos -= 1
+            elif ch == curses.KEY_DC:
+                self.text = self.text[:self.pos] + self.text[self.pos + 1:]
+            elif ch in ('\n', '\r') or ch == curses.KEY_ENTER:
+                stdscr.timeout(0)
+                try:
+                    pending = stdscr.get_wch()
+                except curses.error:
+                    pending = None
+                stdscr.timeout(100)
+                if pending is not None:
+                    # more input follows at once: pasted text, so keep the line break
+                    curses.unget_wch(pending)
+                    self.text = self.text[:self.pos] + '\n' + self.text[self.pos:]
+                    self.pos += 1
+                    continue
+                text = self.text.strip()
+                if not text:
+                    continue
+                if self.busy:
+                    print("⏳ The AI is still working: send the next message when it has answered.", flush=True)
+                    continue
+                self.text, self.pos, self.offset = '', 0, 0
+                print(f"you> {text}", flush=True)
+                self.busy = True
+                threading.Thread(target=self._work, args=(on_submit, text), daemon=True).start()
+            elif isinstance(ch, str) and ch.isprintable():
+                self.text = self.text[:self.pos] + ch + self.text[self.pos:]
+                self.pos += 1
+
+    def start(self, on_submit, intro):
+        """Run the view until Ctrl+C or Ctrl+D. intro() prints the opening lines into it."""
+        saved = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = self
+        try:
+            intro()
+            curses.wrapper(self.run, on_submit)
+        finally:
+            sys.stdout, sys.stderr = saved
+
+
+def _clip(text, limit, what='output'):
+    """Cut text to limit bytes for display only. The footer gives the full size."""
+    raw = text.encode('utf-8')
+    if len(raw) <= limit:
+        return text
+    shown = raw[:limit].decode('utf-8', 'ignore').rstrip('\n')
+    return (f"{shown}\n\n--- {what}: showing {limit / 1024:.1f} of {len(raw) / 1024:.1f} kB. "
+            f"The AI received all of it. ---")
+
+def _history_tokens(messages):
+    """Tokens the whole conversation takes, estimated the same way as the other counts."""
+    return calculate_tokens(json.dumps(messages, ensure_ascii=False))
+
+def _trim_history(messages, limit):
+    """Shorten the conversation in place until it is under CONTEXT_TRIM_FRACTION of the window.
+    The oldest tool results are replaced by a one-line note with their size. The system prompt
+    and the user and assistant text stay. Returns how many results were replaced."""
+    target = int(limit * CONTEXT_TRIM_FRACTION)
+    total = _history_tokens(messages)
+    trimmed = 0
+    # the tool results of the latest round are what the model is working on now: never trimmed
+    latest = max((i for i, m in enumerate(messages) if m.get('role') == 'assistant'), default=len(messages))
+    for msg in messages[:latest]:
+        if total <= target:
+            break
+        if msg.get('role') != 'tool' or str(msg.get('content', '')).startswith('[trimmed'):
+            continue
+        before = calculate_tokens(json.dumps(msg, ensure_ascii=False))
+        size = len(str(msg.get('content', '')).encode('utf-8'))
+        msg['content'] = (f"[trimmed to save context: this tool result was {size / 1024:.1f} kB. "
+                          f"Run the command again if you need it.]")
+        total -= before - calculate_tokens(json.dumps(msg, ensure_ascii=False))
+        trimmed += 1
+    return trimmed
+
+def _models_age(config):
+    """Seconds since the OpenRouter model list was fetched, or None when that is unknown."""
+    try:
+        stamp = datetime.fromisoformat(config.get('openrouter_models_time') or '')
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (datetime.now() - stamp).total_seconds())
+
+def _models_stale(config):
+    age = _models_age(config)
+    return age is None or age > MODELS_MAX_AGE
+
+def _fmt_age(seconds):
+    if seconds is None:
+        return 'of unknown age'
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min old"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} h old"
+    return f"{int(seconds // 86400)} days old"
+
+def _openrouter_turn(key, model, tools, messages, header=None):
+    """Send the conversation, run the tool calls the model asks for and repeat until it
+    answers in text. messages is extended in place. Raises RuntimeError on failure."""
+    for _ in range(OPENROUTER_MAX_STEPS):
+        limit = header.context if header else 0
+        if limit:
+            used = _history_tokens(messages)
+            if used > limit * CONTEXT_WARN_FRACTION:
+                trimmed = _trim_history(messages, limit)
+                after = _history_tokens(messages)
+                print(f"⚠ context {used / limit:.0%} full: {trimmed} old tool result(s) trimmed, "
+                      f"now about {after:,} of {limit:,} tokens", flush=True)
+                if after > limit * CONTEXT_WARN_FRACTION:
+                    print("⚠ still close to the limit: type /new to start a fresh conversation", flush=True)
+        mcp_log(f"→ OpenRouter ({model})")
+        data = _openrouter_request('/chat/completions', key, {
+            'model': model, 'messages': messages, 'tools': tools, 'usage': {'include': True}})
+        choices = data.get('choices') if isinstance(data, dict) else None
+        if not choices or not isinstance(choices[0], dict):
+            err = data.get('error') if isinstance(data, dict) else None
+            raise RuntimeError(f"unexpected answer from OpenRouter: {err or str(data)[:200]}")
+        message = choices[0].get('message') or {}
+        text = message.get('content') or ''
+        calls = message.get('tool_calls') or []
+        usage = data.get('usage') or {}
+        mcp_log(f"← {usage.get('prompt_tokens', '?')} tokens in, {usage.get('completion_tokens', '?')} out")
+        if header:
+            header.add_usage(usage)
+        entry = {'role': 'assistant', 'content': text}
+        if calls:
+            entry['tool_calls'] = calls
+        messages.append(entry)
+        if calls:
+            mcp_log(f"· model asked for {len(calls)} tool call(s)")
+        if text.strip():
+            print(f"\nai> {text.strip()}", flush=True)
+        if not calls:
+            if not text.strip():
+                print("\nai> (empty answer)", flush=True)
+            return
+        for call in calls:
+            fn = call.get('function') or {}
+            try:
+                arguments = json.loads(fn.get('arguments') or '{}')
+            except ValueError:
+                arguments = None
+            if (fn.get('name') != 'promptpack' or not isinstance(arguments, dict)
+                    or not isinstance(arguments.get('commands'), list) or not arguments['commands']):
+                mcp_log(f"✖ invalid tool call from model: name={fn.get('name')!r}, arguments={str(fn.get('arguments'))[:160]}")
+                result = "✖ invalid tool call: use the tool promptpack with a non-empty commands list"
+            else:
+                result = '\n\n'.join(run_promptpack_command(item, mcp_log) for item in arguments['commands'])
+            messages.append({'role': 'tool', 'tool_call_id': call.get('id'), 'content': result})
+    raise RuntimeError(f"stopped after {OPENROUTER_MAX_STEPS} tool rounds without a final answer")
+
+
+def run_openrouter_chat(config, instructions, marked, header=None):
+    """promptpack --mcp in OpenRouter mode: this terminal is both the chat and the log.
+    The model gets the same tool and the same spec as a Claude Desktop connection; its tool
+    calls run locally through run_promptpack_command. In a terminal the chat runs in a
+    scrollable curses view (_ChatView); otherwise a plain input() loop is used.
+    Ctrl+C (or Ctrl+D) stops."""
+    try:
+        import readline   # noqa: F401  (line editing and history for input() where available)
+    except ImportError:
+        pass
+    key, model = config['openrouter_key'], config['openrouter_model']
+    spec = _MCPServer._tool_definition()
+    tools = [{'type': 'function', 'function': {
+        'name': spec['name'], 'description': spec['description'], 'parameters': spec['inputSchema']}}]
+    start = [{'role': 'system', 'content': instructions}]
+    messages = list(start)
+
+    def intro():
+        print("🔌 promptpack MCP chat (OpenRouter)")
+        print(f"   project: {Path.cwd()}")
+        print(f"   model:   {model}")
+        print(f"   config:  {MCP_CONFIG_FILE}")
+        print(f"   marked files in spec: {marked}")
+        print("   Type a message and press Enter. /new starts a new conversation. Ctrl+C stops.")
+        print("   PgUp/PgDn, Up/Down or the mouse wheel scroll, Home/End jump to the top or bottom.")
+        if _models_stale(config):
+            print(f"⚠ The model list is {_fmt_age(_models_age(config))}: press F6, OpenRouter, then r to refresh it.", flush=True)
+        print("   Every tool call, patch and result is logged here as it happens.")
+        print(f"   {MCP_SECURITY_NOTE}", flush=True)
+
+    def handle(user_text):
+        nonlocal messages
+        if user_text == '/new':
+            messages = list(start)
+            print("↺ New conversation started.", flush=True)
+            return
+        messages.append({'role': 'user', 'content': user_text})
+        try:
+            _openrouter_turn(key, model, tools, messages, header)
+        except RuntimeError as e:
+            if messages[-1]['role'] == 'user':
+                messages.pop()
+                hint = "Your message was not added to the conversation: send it again."
+            else:
+                hint = "The work done so far is kept: type continue to go on."
+            print(f"❌ {e}\n   {hint}", flush=True)
+
+    if sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get('TERM') != 'dumb':
+        try:
+            _ChatView(header).start(handle, intro)
+            print("\n⏹ Chat stopped", flush=True)
+            return
+        except (EOFError, KeyboardInterrupt):
+            print("\n⏹ Chat stopped", flush=True)
+            return
+        except curses.error as e:
+            print(f"⚠ The curses chat view is not available here ({e}): using the plain terminal.", flush=True)
+    intro()
+    while True:
+        try:
+            user_text = input("\nyou> ").strip()
+            if not user_text:
+                continue
+            handle(user_text)
+        except (EOFError, KeyboardInterrupt):
+            print("\n⏹ Chat stopped", flush=True)
+            return
+
+
+def claude_desktop_snippet():
+    """JSON for claude_desktop_config.json, built from the paths of this running copy
+    of promptpack, so it is correct on any machine and in any folder."""
+    entry = {'mcpServers': {'promptpack': {
+        'command': sys.executable,
+        'args': [os.path.abspath(__file__), '--mcp-bridge'],
+    }}}
+    return json.dumps(entry, indent=2, ensure_ascii=False)
+
+
+def claude_desktop_config_hint():
+    """Where Claude Desktop keeps its config file on this operating system."""
+    if sys.platform == 'win32':
+        return r'%APPDATA%\Claude\claude_desktop_config.json'
+    if sys.platform == 'darwin':
+        return '~/Library/Application Support/Claude/claude_desktop_config.json'
+    return 'claude_desktop_config.json in the Claude Desktop config folder (no official Linux build)'
+
+
+def _put(stdscr, y, x, text, attr=curses.A_NORMAL):
+    """addstr that never raises: clipped to the window, ignores a window that is too small."""
+    height, width = stdscr.getmaxyx()
+    if y < 0 or y >= height or x >= width - 1:
+        return
+    try:
+        stdscr.addstr(y, x, text[:width - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def _curses_input(stdscr, row, label, initial=''):
+    """One-line text field on the given row. Enter saves, Esc cancels.
+    Returns the new text, or None when cancelled."""
+    text = initial
+    curses.curs_set(1)
+    try:
+        while True:
+            height, width = stdscr.getmaxyx()
+            visible = text[-max(1, width - len(label) - 2):]
+            try:
+                stdscr.move(row, 0)
+                stdscr.clrtoeol()
+            except curses.error:
+                pass
+            _put(stdscr, row, 0, label + visible)
+            try:
+                stdscr.move(row, min(width - 2, len(label) + len(visible)))
+            except curses.error:
+                pass
+            stdscr.refresh()
+            try:
+                ch = stdscr.get_wch()
+            except curses.error:
+                continue
+            if ch in ('\n', '\r') or ch == curses.KEY_ENTER:
+                return text.strip()
+            if ch == '\x1b':
+                return None
+            if ch in ('\x7f', '\b') or ch == curses.KEY_BACKSPACE:
+                text = text[:-1]
+            elif isinstance(ch, str) and ch.isprintable():
+                text += ch
+    finally:
+        curses.curs_set(0)
+
+
+def _curses_key_modal(stdscr, current=''):
+    """Small centered box for pasting an API key. Enter saves, Esc cancels, Ctrl+U clears.
+    Returns the key without any whitespace ('' means remove the key), or None when cancelled."""
+    text = current
+    curses.curs_set(1)
+    try:
+        while True:
+            height, width = stdscr.getmaxyx()
+            box_w = max(20, min(width - 2, 78))
+            box_h = 7
+            top = max(0, (height - box_h) // 2)
+            left = max(0, (width - box_w) // 2)
+            inner = box_w - 4
+            _put(stdscr, top, left, '┌' + '─' * (box_w - 2) + '┐')
+            for r in range(1, box_h - 1):
+                _put(stdscr, top + r, left, '│' + ' ' * (box_w - 2) + '│')
+            _put(stdscr, top + box_h - 1, left, '└' + '─' * (box_w - 2) + '┘')
+            _put(stdscr, top + 1, left + 2, "OpenRouter API key"[:inner], curses.A_BOLD)
+            _put(stdscr, top + 2, left + 2, "Paste the key into the field (Ctrl+Shift+V)."[:inner])
+            label = "Key: "
+            visible = text[-max(1, inner - len(label) - 1):]
+            _put(stdscr, top + 4, left + 2, (label + visible).ljust(inner)[:inner], curses.A_REVERSE)
+            _put(stdscr, top + 5, left + 2, "Enter: save | Esc: cancel | Ctrl+U: clear"[:inner])
+            try:
+                stdscr.move(top + 4, min(width - 2, left + 2 + len(label) + len(visible)))
+            except curses.error:
+                pass
+            stdscr.refresh()
+            try:
+                ch = stdscr.get_wch()
+            except curses.error:
+                continue
+            if ch in ('\n', '\r') or ch == curses.KEY_ENTER:
+                return ''.join(text.split())
+            if ch == '\x1b':
+                return None
+            if ch == '\x15':
+                text = ''
+            elif ch in ('\x7f', '\b') or ch == curses.KEY_BACKSPACE:
+                text = text[:-1]
+            elif isinstance(ch, str) and ch.isprintable():
+                text += ch
+    finally:
+        curses.curs_set(0)
+
+
+def _curses_message(stdscr, title, lines):
+    """Full-screen notice, any key returns."""
+    curses.curs_set(0)
+    stdscr.clear()
+    height, width = stdscr.getmaxyx()
+    _put(stdscr, 0, 0, title.ljust(width - 1), curses.A_REVERSE)
+    row = 2
+    for line in lines:
+        for part in (textwrap.wrap(line, max(10, width - 2)) or ['']):
+            if row >= height - 2:
+                break
+            _put(stdscr, row, 1, part)
+            row += 1
+    _put(stdscr, height - 1, 0, "Press any key to return...".ljust(width - 1), curses.A_REVERSE)
+    stdscr.refresh()
+    stdscr.getch()
+
+
+def _show_claude_desktop_notice(stdscr):
+    """Shown when Claude Desktop is activated. Nothing is written to Claude's own config."""
+    _curses_message(stdscr, "MCP - Claude Desktop", [
+        "Claude Desktop mode is active.",
+        "",
+        "Nothing is written to Claude's config automatically. Add this under mcpServers in " + claude_desktop_config_hint() + ":",
+        "",
+        *claude_desktop_snippet().splitlines(),
+        "",
+        "Restart Claude Desktop. Then run promptpack --mcp in the project folder and keep that terminal open: it is a read-only log, Ctrl+C stops it. The same snippet is printed when promptpack --mcp starts, so you can copy it from there.",
+        "",
+        MCP_SECURITY_NOTE,
+    ])
+
+
+def show_openrouter_settings(stdscr, config):
+    """OpenRouter settings: an API key field (shown in clear text) above the list of models
+    that can call tools, free and paid. Every change is saved to mcp.json at once. Leaving
+    the page with both key and model set makes OpenRouter the active MCP mode."""
+    curses.curs_set(0)
+    state = {'filter': 'all', 'status': ''}
+
+    def models_shown():
+        models = config.get('openrouter_models') or []
+        if state['filter'] == 'free':
+            return [m for m in models if m.get('free')]
+        if state['filter'] == 'paid':
+            return [m for m in models if not m.get('free')]
+        return models
+
+    def save():
+        try:
+            save_mcp_config(config)
+            return True
+        except OSError as e:
+            state['status'] = f"❌ could not save {MCP_CONFIG_FILE.name}: {e}"
+            return False
+
+    def reload_models():
+        stdscr.clear()
+        _put(stdscr, 0, 0, "Fetching the model list from OpenRouter...", curses.A_BOLD)
+        stdscr.refresh()
+        try:
+            config['openrouter_models'] = fetch_openrouter_models()
+            config['openrouter_models_time'] = datetime.now().isoformat(timespec='seconds')
+            if save():
+                state['status'] = f"{len(config['openrouter_models'])} models with tool support loaded"
+        except RuntimeError as e:
+            state['status'] = f"❌ {e}"
+
+    def settle():
+        config['mode'] = 'openrouter'
+        missing = []
+        if not config.get('openrouter_key'):
+            missing.append("an API key (press k)")
+        if not config.get('openrouter_model'):
+            missing.append("a model (press Space on one)")
+        if missing:
+            ok_text = "Saved. OpenRouter is selected but still needs " + " and ".join(missing) + "."
+        else:
+            ok_text = "Saved. OpenRouter is the active mode: start promptpack --mcp in the project folder."
+        if save():
+            state['status'] = ok_text
+
+    def edit_key():
+        new_key = _curses_key_modal(stdscr, config.get('openrouter_key') or '')
+        if new_key is None:
+            return
+        if new_key:
+            config['openrouter_key'] = new_key
+        else:
+            config.pop('openrouter_key', None)
+        settle()
+
+    if not config.get('openrouter_models') or _models_stale(config):
+        reload_models()
+    selected, scroll = 0, 0
+    for i, m in enumerate(models_shown()):
+        if m['id'] == config.get('openrouter_model'):
+            selected = i + 1
+            break
+
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+        models = models_shown()
+        selected = min(selected, len(models))
+        list_height = max(1, height - 6)
+        idx = selected - 1
+        if idx >= 0:
+            if idx < scroll:
+                scroll = idx
+            elif idx >= scroll + list_height:
+                scroll = idx - list_height + 1
+        scroll = max(0, min(scroll, max(0, len(models) - list_height)))
+
+        title = "OpenRouter - ↑↓: Navigate | Space: Choose model | k: API key | f: Filter | r: Refresh list | Esc: Back"
+        _put(stdscr, 0, 0, title.ljust(width - 1), curses.A_REVERSE)
+        key_row = f"API key: {config.get('openrouter_key') or '(not set - press k to paste it)'}"
+        _put(stdscr, 1, 0, key_row.ljust(width - 1), curses.A_REVERSE if selected == 0 else curses.A_BOLD)
+        header = f"  {'Kind':<5} {'In $/M':>8} {'Out $/M':>8} {'Context':>8}  Model (id)   [filter: {state['filter']}]"
+        _put(stdscr, 2, 0, header, curses.A_BOLD)
+
+        if not models:
+            _put(stdscr, 3, 0, "No models to show. Press r to fetch the list from OpenRouter.")
+        for i in range(list_height):
+            mi = scroll + i
+            if mi >= len(models):
+                break
+            m = models[mi]
+            chosen = m['id'] == config.get('openrouter_model')
+            line = (f"{'✓' if chosen else ' '} {'Free' if m.get('free') else 'Paid':<5} "
+                    f"{_fmt_price(m.get('prompt')):>8} {_fmt_price(m.get('completion')):>8} "
+                    f"{_fmt_context(m.get('context')):>8}  {m.get('name')} ({m['id']})")
+            attr = curses.A_REVERSE if mi == idx else curses.A_NORMAL
+            if chosen:
+                attr |= curses.color_pair(1)
+            _put(stdscr, 3 + i, 0, line.ljust(width - 1) if mi == idx else line, attr)
+
+        if idx >= 0 and models:
+            m = models[idx]
+            detail = f"{m['id']} - {m.get('description') or '(no description)'}"
+        else:
+            detail = "The API key is saved in clear text in mcp.json, next to promptpack.py."
+        for n, part in enumerate(textwrap.wrap(detail, max(10, width - 2))[:2]):
+            _put(stdscr, height - 3 + n, 0, part)
+        status = state['status'] or f"{len(models)} models, list {_fmt_age(_models_age(config))} (tool-capable only)"
+        _put(stdscr, height - 1, 0, status.ljust(width - 1), curses.A_REVERSE)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:
+            break
+        elif key == curses.KEY_UP:
+            selected = max(0, selected - 1)
+        elif key == curses.KEY_DOWN:
+            selected = min(len(models), selected + 1)
+        elif key == curses.KEY_PPAGE:
+            selected = max(0, selected - list_height)
+        elif key == curses.KEY_NPAGE:
+            selected = min(len(models), selected + list_height)
+        elif key == ord(' '):
+            if selected == 0:
+                edit_key()
+            elif models:
+                config['openrouter_model'] = models[idx]['id']
+                settle()
+        elif key in (ord('k'), ord('K')):
+            edit_key()
+        elif key in (ord('f'), ord('F')):
+            order = ['all', 'free', 'paid']
+            state['filter'] = order[(order.index(state['filter']) + 1) % len(order)]
+            selected = 1 if models_shown() else 0
+            scroll = 0
+        elif key in (ord('r'), ord('R')):
+            reload_models()
+
+    if config.get('openrouter_key') and config.get('openrouter_model') and config.get('mode') != 'openrouter':
+        config['mode'] = 'openrouter'
+        try:
+            save_mcp_config(config)
+        except OSError:
+            pass
+
+
+def show_mcp_menu(stdscr):
+    """F6: choose how an AI reaches promptpack. Claude Desktop has no settings, OpenRouter
+    has its own page. The choice is saved in mcp.json and promptpack --mcp follows it."""
+    curses.curs_set(0)
+    try:
+        config = load_mcp_config(exit_on_error=False)
+    except (OSError, ValueError) as e:
+        _curses_message(stdscr, "MCP", [f"Cannot read or write {MCP_CONFIG_FILE}: {e}", "",
+                                        "Repair the file, or delete it to get a new port and token."])
+        return
+    selected = 0
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+        _put(stdscr, 0, 0, "MCP - ↑↓: Navigate | Space: Choose | Esc: Back".ljust(width - 1), curses.A_REVERSE)
+        mode = config.get('mode')
+        ready, problem = mcp_ready(config)
+        items = [
+            ('claude_desktop', 'Claude Desktop',
+             'No settings. Reached through a bridge; this terminal becomes a read-only log.'),
+            ('openrouter', 'OpenRouter',
+             f"Chat with a model in this terminal. Model: {config.get('openrouter_model') or '(none chosen)'}"),
+        ]
+        for i, (name, label, desc) in enumerate(items):
+            chosen = mode == name
+            line = f"[{'✓' if chosen else ' '}] {label:<16} {desc}"
+            attr = curses.A_REVERSE if i == selected else curses.A_NORMAL
+            if chosen:
+                attr |= curses.color_pair(1)
+            _put(stdscr, 2 + i, 0, line.ljust(width - 1) if i == selected else line, attr)
+        row = 5
+        status = "Ready: promptpack --mcp will start in the chosen mode." if ready else f"Not ready: {problem}"
+        for part in textwrap.wrap(status, max(10, width - 2)):
+            _put(stdscr, row, 0, part, curses.color_pair(1) if ready else curses.color_pair(3))
+            row += 1
+        _put(stdscr, row + 1, 0, f"Settings are saved in {MCP_CONFIG_FILE}")
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:
+            return
+        elif key == curses.KEY_UP:
+            selected = max(0, selected - 1)
+        elif key == curses.KEY_DOWN:
+            selected = min(len(items) - 1, selected + 1)
+        elif key == ord(' '):
+            if selected == 0:
+                config['mode'] = 'claude_desktop'
+                try:
+                    save_mcp_config(config)
+                except OSError as e:
+                    _curses_message(stdscr, "MCP", [f"Could not save {MCP_CONFIG_FILE.name}: {e}"])
+                    continue
+                _show_claude_desktop_notice(stdscr)
+            else:
+                config['mode'] = 'openrouter'
+                try:
+                    save_mcp_config(config)
+                except OSError as e:
+                    _curses_message(stdscr, "MCP", [f"Could not save {MCP_CONFIG_FILE.name}: {e}"])
+                    continue
+                show_openrouter_settings(stdscr, config)
+
+
+def run_mcp_server():
+    """promptpack --mcp: serve this project to the AI chosen with F6 (Claude Desktop or
+    OpenRouter) and log every call. Refuses to start until a mode is chosen and complete."""
+    check_ctags()
+    config = load_mcp_config()
+    ready, problem = mcp_ready(config)
+    if not ready:
+        print(f"❌ {problem}")
+        sys.exit(1)
+    root = build_tree('.')
+    instructions = build_mcp_instructions(root)
+    marked = len(get_marked_files(root)) if root else 0
+    header = _make_mcp_header(config)
+    if config['mode'] == 'openrouter':
+        run_openrouter_chat(config, instructions, marked, header)   # the curses chat view draws the header itself
+        return
+    port = config['port']
+    try:
+        server = _MCPServer(('127.0.0.1', port), config['token'], instructions)
+    except OSError as e:
+        print(f"❌ Cannot listen on 127.0.0.1:{port} ({e}).")
+        print(f"   Another program may use the port. Change \"port\" in {MCP_CONFIG_FILE.name}.")
+        sys.exit(1)
+    header.start()
+    print("🔌 promptpack MCP server (Claude Desktop)")
+    print(f"   project: {Path.cwd()}")
+    print(f"   url:     http://127.0.0.1:{port}/mcp")
+    print(f"   config:  {MCP_CONFIG_FILE}")
+    print(f"   marked files in spec: {marked}")
+    print("   Claude Desktop: add this under mcpServers in", claude_desktop_config_hint() + ":")
+    print(claude_desktop_snippet())
+    print("   Restart Claude Desktop after editing the file. Keep this terminal open.\n")
+    print(f"   {MCP_SECURITY_NOTE}")
+    print("   This terminal is a read-only log: typing is locked. Ctrl+C to stop. Every call is logged below.\n", flush=True)
+    restore_terminal = _lock_terminal_input()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n⏹ MCP server stopped", flush=True)
+    finally:
+        restore_terminal()
+        server.server_close()
+        header.stop()
+
+
+def run_mcp_bridge():
+    """promptpack --mcp-bridge: lets Claude Desktop reach a running promptpack --mcp.
+    Claude Desktop starts this program and speaks MCP over stdin and stdout. Each
+    message is passed unchanged as an HTTP POST to the server in the terminal, and
+    the server's answer is written back. stdout carries only the protocol, so
+    problems go to stderr. A request that cannot be answered gets a JSON-RPC error."""
+    try:
+        sys.stdin.reconfigure(encoding='utf-8')
+        sys.stdout.reconfigure(encoding='utf-8')
+    except (AttributeError, ValueError):
+        pass
+
+    def warn(text):
+        print(f"[promptpack-bridge] {text}", file=sys.stderr, flush=True)
+
+    def send(obj):
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + '\n')
+        sys.stdout.flush()
+
+    try:
+        with open(MCP_CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        port, token = int(config['port']), str(config['token'])
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        warn(f"cannot read {MCP_CONFIG_FILE.name}: {e}. Start promptpack --mcp in the project folder once first.")
+        sys.exit(1)
+
+    url = f"http://127.0.0.1:{port}/mcp"
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            msg = None
+        mid = msg.get('id') if isinstance(msg, dict) else None
+        req = urllib.request.Request(url, data=line.encode('utf-8'), method='POST', headers={
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {token}',
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=1800) as resp:
+                status, reply = resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            status, reply = e.code, e.read()
+        except OSError as e:
+            warn(f"cannot reach promptpack --mcp on port {port} ({e}). Is it running in the project folder?")
+            if mid is not None:
+                send({'jsonrpc': '2.0', 'id': mid, 'error': {
+                    'code': -32000,
+                    'message': 'promptpack --mcp is not running. Start it in the project folder.'}})
+            continue
+        if status == 202 or not reply:
+            continue   # notification accepted: nothing to send back
+        try:
+            out = json.loads(reply.decode('utf-8'))
+        except ValueError:
+            out = None
+        if not (isinstance(out, dict) and out.get('jsonrpc') == '2.0'):
+            warn(f"server answered HTTP {status}: {reply[:200]!r}")
+            if mid is None:
+                continue
+            out = {'jsonrpc': '2.0', 'id': mid, 'error': {
+                'code': -32000,
+                'message': f'promptpack --mcp answered HTTP {status}. Check the token in mcp.json.'}}
+        send(out)
+
+
 def main(stdscr):
     curses.curs_set(0)
     stdscr.keypad(True)
+    if hasattr(curses, 'set_escdelay'):
+        curses.set_escdelay(25)   # Esc is back/quit everywhere: do not wait a second for it
 
     curses.start_color()
     curses.use_default_colors()
@@ -2768,7 +4385,7 @@ def main(stdscr):
         draw_tree(stdscr, root, selected_idx, scroll_offset, cached_tokens)
         key = stdscr.getch()
 
-        if key == ord('q') or key == ord('Q'):
+        if key == 27:
             return None
         elif key == curses.KEY_F1:  # F1 för ctags.txt
             marked_files = get_marked_files(root)
@@ -2780,6 +4397,8 @@ def main(stdscr):
                 return ('ctags', 0)
         elif key == curses.KEY_F12:
             show_patch_history(stdscr)
+        elif key == curses.KEY_F6:
+            show_mcp_menu(stdscr)
         elif key == curses.KEY_UP:
             selected_idx = max(0, selected_idx - 1)
         elif key == curses.KEY_DOWN:
@@ -2887,7 +4506,19 @@ if __name__ == "__main__":
                         help='Print the complete, unfiltered worklog (every summary with its rating, every patch line) to clipboard.tmp, in the same format as the # WORKLOG section of ctags.txt. Can be long.')
     parser.add_argument('--rating', type=int, choices=[1, 2, 3], default=None, metavar='N',
                         help='Required together with --summary: impact of the task on the code and future development, 1 (minor) to 3 (architecture, data format, workflow rules or decisions future work must respect). Decides how long the task stays visible in the ctags.txt # WORKLOG.')
+    parser.add_argument('--mcp-bridge', action='store_true',
+                        help='Relay MCP messages from stdin to a running promptpack --mcp. Started by Claude Desktop, not by hand.')
+    parser.add_argument('--mcp', action='store_true',
+                        help='Start the MCP server in this terminal: HTTP on 127.0.0.1, port and token in mcp.json next to promptpack.py. Every tool call is logged here. Stop with Ctrl+C.')
     args = parser.parse_args()
+
+    if args.mcp:
+        run_mcp_server()
+        sys.exit(0)
+
+    if args.mcp_bridge:
+        run_mcp_bridge()
+        sys.exit(0)
 
 
     if args.tidy_recursive:
