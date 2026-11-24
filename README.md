@@ -62,7 +62,7 @@ Working with an AI chat usually means pasting files back and forth and applying 
 - **Interactive TUI**: Navigate your project tree with keyboard shortcuts
 - **Selective file marking**: Choose exactly which files to include
 - **Token counting**: Live token count of your selection in the status bar
-- **Persistent selection**: File selections are saved in `.promptpack`
+- **Persistent selection**: File selections are saved in `files.json`, next to `promptpack.py`
 - **`ctags.txt` output**: A lightweight structure overview (via Universal Ctags), with the full PromptPack AI-workflow instructions embedded at the top and a compact `# WORKLOG` of the project's history at the bottom
 
 ### 🔧 Advanced Patch Management
@@ -180,7 +180,7 @@ Launch the interactive file browser:
 promptpack
 ````
 
-Navigate with arrow keys, mark files with `Space`, generate `ctags.txt` with `F1`, browse patch history with `F12`, quit with `q`.
+Navigate with arrow keys, mark files with `Space`, generate `ctags.txt` with `F1`, set up MCP with `F6`, browse patch history with `F12`, quit with `Esc`.
 
 ### Export Instructions Only
 
@@ -205,8 +205,9 @@ This writes `promptpack_instructions.txt` to the current directory.
 | `Space` | Mark/unmark file or folder (marks all children) |
 | `i` | Mark file + all local Python import dependencies |
 | `F1` | Generate `ctags.txt` |
+| `F6` | MCP menu: choose Claude Desktop or OpenRouter |
 | `F12` | Browse and toggle patch history |
-| `q` | Quit |
+| `Esc` | Quit (in sub-screens: go back) |
 
 ---
 
@@ -566,7 +567,7 @@ PromptPack can run as an **MCP server**. The AI then calls `promptpack` as a too
 
 ### Choosing a mode
 
-Run `promptpack` in your project folder and press `F6`. Choose the mode with `Space`. Choosing OpenRouter opens its settings page. `promptpack --mcp` refuses to start until a mode is chosen and its settings are complete. Everything is saved in `mcp.json`, next to `promptpack.py`.
+Run `promptpack` in your project folder and press `F6`. Choose the mode with `Space` and go back with `Esc`. Choosing OpenRouter saves that mode at once and opens its settings page. `promptpack --mcp` refuses to start until a mode is chosen and its settings are complete (for OpenRouter: an API key and a model). Everything is saved in `mcp.json`, next to `promptpack.py`.
 
 ### Starting the server
 
@@ -615,9 +616,13 @@ OpenRouter mode turns the terminal into a chat with the model you choose. The mo
 
 Type a message and press Enter. `/new` starts a fresh conversation. `PgUp`, `PgDn`, the arrow keys and the mouse wheel scroll the chat, and `End` jumps back to the bottom. `Ctrl+C` stops the session.
 
-The model list shows only models that support tool calls, with prices per million tokens. `f` filters free and paid models, and `r` fetches the list again.
+The model list shows only models that support tool calls, with prices per million tokens. `f` filters free and paid models, and `r` fetches the list again. The list is cached in `mcp.json`: it is fetched again automatically when you open the page and it is older than 24 hours, the status line shows its age, and the chat warns at start if it is stale.
 
-The header shows the session's tokens in and out, the context fill of the latest request and the cost. The cost is taken from OpenRouter when it is reported. Otherwise it is estimated from the model's prices and marked with `~`.
+The header shows the session's billed tokens in, tokens out, the current context fill (the size of the latest request against the model's window), the cost and the number of requests. "Billed in" is the whole conversation sent with every request, so it grows faster than the chat itself. The cost is taken from OpenRouter when it is reported. Otherwise it is estimated from the model's prices and marked with `~`.
+
+**Context budget:** when the conversation reaches 80% of the model's context window, the oldest tool results are replaced by a one-line note with their size until it is down to about 60%. The system prompt, your messages and the AI's own text stay, and the tool results of the latest round are never trimmed. The AI can run a command again if it needs a trimmed result. If the conversation is still close to the limit, type `/new` to start a fresh one.
+
+**Long output:** the terminal shows at most about 2 kB of each command's output, with a footer giving the full size. The AI always receives the complete output; only the terminal view is cut.
 
 ### Security
 
@@ -669,7 +674,7 @@ The status script outputs plain text, so it works with any desktop or bar that c
 
 ### File Selection Storage
 
-Selections are stored in `~/.promptpack` as absolute paths, scoped per project. This allows multiple projects to maintain independent selections on the same machine.
+Selections are stored in `files.json`, next to `promptpack.py`, as absolute paths with a content hash and token count, so unchanged files are never re-tokenized. Entries are scoped per project, which lets multiple projects keep independent selections on the same machine. An old `.promptpack` file (next to the script or in your home folder) is converted once the first time `files.json` is needed.
 
 ### Patch History
 
