@@ -36,6 +36,7 @@ Working with an AI chat usually means pasting files back and forth and applying 
   - [Reviewing Changes with `#audit`](#reviewing-changes-with-audit)
   - [Optimizing with `#optimize`](#optimizing-with-optimize)
   - [Example AI Interaction](#example-ai-interaction)
+- [MCP: Claude Desktop and OpenRouter](#mcp-claude-desktop-and-openrouter)
 - [Optional: X11 Middle-Click Paste+Submit](#optional-x11-middle-click-pastesubmit-x11)
 - [Configuration](#configuration)
   - [File Selection Storage](#file-selection-storage)
@@ -117,6 +118,12 @@ Working with an AI chat usually means pasting files back and forth and applying 
 - **`#optimize`**: Language-independent performance review (goal and metric, domain, resource analysis, complexity, eight optimization levers, measurement) for anything from HTML to C#, GUI to network code
 - **Autonomous by design**: Both run without user input — one single fetch round, then the AI verifies or measures in its own environment instead of asking you to run anything
 - **Report only**: Nothing is patched until you approve it
+
+### 🔌 MCP Server Integration
+
+- **Claude Desktop or OpenRouter**: run `promptpack --mcp` and let the AI call `promptpack` as a tool, with every call logged in your terminal
+- **Built-in chat for OpenRouter**: chat with any tool-capable model from the same terminal, with token and cost usage in the header
+- **Mode chosen with `F6`**: settings and API key are stored in `mcp.json` next to `promptpack.py`
 
 ### 📄 Instruction Export
 
@@ -545,6 +552,78 @@ promptpack -c
 ````
 
 User runs the bash block — patch and summary are applied, and the result is copied to clipboard.
+
+---
+
+## MCP: Claude Desktop and OpenRouter
+
+PromptPack can run as an **MCP server**. The AI then calls `promptpack` as a tool instead of you copying bash blocks back and forth. The tool runs the same commands as in your terminal, and every call is logged where the server runs. Nothing runs until you start `promptpack --mcp` yourself.
+
+| Mode | Where you talk to the AI | Token and cost usage |
+|------|--------------------------|----------------------|
+| Claude Desktop | The Claude Desktop app | Not shown (Claude Desktop does not report it to MCP servers) |
+| OpenRouter | A chat in the same terminal, with any tool-capable model on OpenRouter | Shown: tokens, context fill and cost |
+
+### Choosing a mode
+
+Run `promptpack` in your project folder and press `F6`. Choose the mode with `Space`. Choosing OpenRouter opens its settings page. `promptpack --mcp` refuses to start until a mode is chosen and its settings are complete. Everything is saved in `mcp.json`, next to `promptpack.py`.
+
+### Starting the server
+
+````bash
+cd /path/to/your/project
+promptpack --mcp
+````
+
+The server listens on `127.0.0.1` only, on port 47829 by default, and every request must carry the token from `mcp.json`. Keep the terminal open. `Ctrl+C` stops the server. Each call the AI makes is printed in the terminal as it happens.
+
+### Claude Desktop
+
+Claude Desktop starts a small bridge, `promptpack --mcp-bridge`, which relays the protocol to the running server. This terminal becomes a read-only log: typing is locked, and you cannot chat in it.
+
+1. Start `promptpack --mcp` in the project folder.
+2. Copy the JSON snippet that the terminal prints, or the one shown under `F6` → Claude Desktop, and add it under `mcpServers` in Claude Desktop's config file:
+
+````json
+{
+  "mcpServers": {
+    "promptpack": {
+      "command": "/path/to/python3",
+      "args": ["/path/to/promptpack.py", "--mcp-bridge"]
+    }
+  }
+}
+````
+
+The paths in the snippet come from the copy of `promptpack` that is running, so they are correct on your machine. Use the snippet from the terminal rather than writing the paths by hand.
+
+Where the config file is:
+
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Linux: Claude Desktop has no official Linux build, so the location depends on how you run it
+
+Restart Claude Desktop after editing the file. The bridge needs no Node.js.
+
+### OpenRouter
+
+OpenRouter mode turns the terminal into a chat with the model you choose. The model gets the same project spec and the same `promptpack` tool as Claude Desktop, so it can read files, search, patch and summarize.
+
+1. Create an API key at openrouter.ai.
+2. Press `F6`, choose OpenRouter, press `k` and paste the key. Pick a model with `Space`.
+3. Run `promptpack --mcp` in the project folder.
+
+Type a message and press Enter. `/new` starts a fresh conversation. `PgUp`, `PgDn`, the arrow keys and the mouse wheel scroll the chat, and `End` jumps back to the bottom. `Ctrl+C` stops the session.
+
+The model list shows only models that support tool calls, with prices per million tokens. `f` filters free and paid models, and `r` fetches the list again.
+
+The header shows the session's tokens in and out, the context fill of the latest request and the cost. The cost is taken from OpenRouter when it is reported. Otherwise it is estimated from the model's prices and marked with `~`.
+
+### Security
+
+- The API key is stored in clear text in `mcp.json`. Where the system supports it, the file is set to be readable by you only. Keep `mcp.json` out of git.
+- The `-e` command lets the AI run shell commands in the project. The blacklist blocks the most destructive commands, but it is a minimal guard, not a security boundary. Only connect an AI you trust.
+- The server accepts requests only from localhost and only with the token. Still, do not start `--mcp` in a folder whose contents you would not want an AI to read.
 
 ---
 
