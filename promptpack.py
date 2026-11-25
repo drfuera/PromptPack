@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import json
 import hashlib
+import mimetypes
 import traceback
 from datetime import datetime
 
@@ -32,6 +33,8 @@ import secrets
 import tempfile
 import textwrap
 import threading
+import time
+import http.client
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -183,6 +186,9 @@ def check_ctags():
         print("  sudo apt install universal-ctags")
         sys.exit(1)
 
+# bumped on every mark change, so cached mark counts know when they are stale
+_MARK_EPOCH = [0]
+
 class TreeNode:
     def __init__(self, path, is_dir=False, parent=None):
         self.path = Path(path)
@@ -191,20 +197,38 @@ class TreeNode:
         self.parent = parent
         self.children = []
         self.expanded = False
-        self.marked = False
+        self._marked = False
+        self.is_link = False     # symlinked folder: shown red, never opened or marked
         self.size = 0
+        self._counts = (0, 0)    # (marked files, files) below this node, see _mark_counts
+        self._counts_epoch = -1
+        self.loaded = False      # folders: True once their entries are read, see load_children
+
+    @property
+    def marked(self):
+        return self._marked
+
+    @marked.setter
+    def marked(self, value):
+        self._marked = value
+        _MARK_EPOCH[0] += 1      # any mark change invalidates every cached count
 
     def calculate_size(self):
+        if self.is_link:
+            self.size = 0
+            return 0
         if not self.is_dir:
             try:
                 self.size = self.path.stat().st_size
-            except:
+            except OSError:
                 self.size = 0
         else:
-            self.size = sum(child.calculate_size() for child in self.children)
+            self.size = 0      # folders are not summed: they show '-', and summing would read the whole tree
         return self.size
 
     def format_size(self):
+        if self.is_dir:
+            return "    -"      # folder sizes are not computed; same width as a file size
         size = self.size
         for unit in ['B', 'K', 'M', 'G']:
             if size < 1024.0:
@@ -212,31 +236,43 @@ class TreeNode:
             size /= 1024.0
         return f"{size:4.0f}T"
 
+    def _mark_counts(self):
+        """(marked files, files) below this node. Cached until the next mark change."""
+        if self._counts_epoch == _MARK_EPOCH[0]:
+            return self._counts
+        if not self.is_dir:
+            counts = (1 if self.marked else 0, 1)
+        elif not self.loaded:
+            counts = (0, 1)     # not read yet: its content is unknown, so it counts as unmarked
+        else:
+            marked = total = 0
+            for child in self.children:
+                if child.is_link:
+                    continue    # symlinked folders cannot be marked, so they are not counted
+                child_marked, child_total = child._mark_counts()
+                marked += child_marked
+                total += child_total
+            counts = (marked, total)
+        self._counts, self._counts_epoch = counts, _MARK_EPOCH[0]
+        return counts
+
     def has_partial_marks(self):
         if not self.is_dir:
             return False
-
-        marked_count = 0
-        total_count = 0
-
-        def count_marks(node):
-            nonlocal marked_count, total_count
-            if not node.is_dir:
-                total_count += 1
-                if node.marked:
-                    marked_count += 1
-            else:
-                for child in node.children:
-                    count_marks(child)
-
-        count_marks(self)
-        return 0 < marked_count < total_count
+        marked, total = self._mark_counts()
+        return 0 < marked < total
 
     def toggle_expand(self):
         if self.is_dir:
             self.expanded = not self.expanded
+            if self.expanded:
+                load_children(self)
 
     def toggle_mark(self):
+        if self.is_link:
+            return      # symlinked folders cannot be marked
+        if self.is_dir and not self.marked:
+            load_all(self)     # marking a folder marks everything below it, so read it all first
         self.marked = not self.marked
         if self.is_dir and self.marked:
             self._mark_all_children(True)
@@ -245,6 +281,8 @@ class TreeNode:
 
     def _mark_all_children(self, mark_state):
         for child in self.children:
+            if child.is_link:
+                continue
             child.marked = mark_state
             if child.is_dir:
                 child._mark_all_children(mark_state)
@@ -253,15 +291,37 @@ def calculate_tokens(text):
     try:
         encoding = tiktoken.get_encoding("cl100k_base")
         return len(encoding.encode(text))
-    except:
+    except Exception:
         return len(text) // 4
+
+# The tree decides from the file name only, without opening the file. Binary types are hidden,
+# everything else is shown, including unknown extensions.
+_BINARY_MIME_PREFIXES = ('image/', 'audio/', 'video/', 'font/')
+_BINARY_MIME_TYPES = {'application/pdf', 'application/zip', 'application/gzip', 'application/x-tar',
+                      'application/x-7z-compressed', 'application/x-rar-compressed',
+                      'application/x-bzip2', 'application/x-xz', 'application/java-archive',
+                      'application/x-executable', 'application/x-sharedlib', 'application/octet-stream'}
+_BINARY_SUFFIXES = {'.pyc', '.pyo', '.o', '.so', '.a', '.class', '.dll', '.exe', '.bin', '.dat', '.db', '.sqlite'}
+_TEXT_OVERRIDES = {'.ts', '.svg'}   # the mime table calls TypeScript video/mp2t and SVG image/svg+xml
+
+def _is_code_file(name):
+    """True when the tree should show this file, judged from its name only."""
+    suffix = Path(name).suffix.lower()
+    if suffix in _TEXT_OVERRIDES:
+        return True
+    if suffix in _BINARY_SUFFIXES:
+        return False
+    mime, _ = mimetypes.guess_type(name, strict=False)
+    if mime is None:
+        return True
+    return not (mime.startswith(_BINARY_MIME_PREFIXES) or mime in _BINARY_MIME_TYPES)
 
 def is_text_file(file_path):
     try:
         with open(file_path, 'rb') as f:
             chunk = f.read(TEXT_CHECK_BYTES)
             return b'\x00' not in chunk
-    except:
+    except Exception:
         return False
 
 def compute_file_hash(filepath):
@@ -341,13 +401,16 @@ def load_promptpack():
 
 def save_promptpack(marked_files):
     """Write the marked files to files.json with content hash and token count, so unchanged
-    files never get re-tokenized. Entries for other projects are kept. Returns total tokens."""
+    files never get re-tokenized. Entries for other projects are kept. Returns total tokens.
+    A marked file is read again only when its size or modification time changed, and files.json
+    is rewritten only when something in it changed."""
     try:
         cwd = Path.cwd().resolve()
-        old_cache = load_promptpack()
+        stored = _read_files_cache()     # read once: used for the cache lookup and for the merge
 
         merged = {}
-        for path_str, info in _read_files_cache().items():
+        old_cache = {}
+        for path_str, info in stored.items():
             path = Path(path_str)
             if not path.is_absolute():
                 continue
@@ -356,25 +419,40 @@ def save_promptpack(marked_files):
                 abs_path.relative_to(cwd)
             except ValueError:
                 if abs_path.exists():
-                    merged[path_str] = info
+                    merged[path_str] = info      # another project: kept as it is
+                continue
+            if isinstance(info, dict) and abs_path.exists():
+                old_cache[abs_path] = info
 
         total_tokens = 0
         for fp in marked_files:
             resolved = fp.resolve()
+            st = None
             try:
-                file_hash = compute_file_hash(resolved)
-                cached = old_cache.get(resolved)
-                if cached and cached['hash'] == file_hash and cached['tokens'] is not None:
-                    tokens = cached['tokens']
+                st = resolved.stat()
+                cached = old_cache.get(resolved) or {}
+                if (cached.get('hash') and cached.get('tokens') is not None
+                        and cached.get('size') == st.st_size
+                        and cached.get('mtime_ns') == st.st_mtime_ns):
+                    file_hash, tokens = cached['hash'], cached['tokens']
                 else:
-                    content = resolved.read_text(encoding='utf-8', errors='ignore')
-                    tokens = calculate_tokens(content)
+                    file_hash = compute_file_hash(resolved)
+                    if cached.get('hash') == file_hash and cached.get('tokens') is not None:
+                        tokens = cached['tokens']
+                    else:
+                        content = resolved.read_text(encoding='utf-8', errors='ignore')
+                        tokens = calculate_tokens(content)
             except Exception:
                 file_hash, tokens = '', 0
+            entry = {'hash': file_hash, 'tokens': tokens}
+            if st is not None and file_hash:
+                entry['size'] = st.st_size
+                entry['mtime_ns'] = st.st_mtime_ns
             total_tokens += tokens
-            merged[str(resolved)] = {'hash': file_hash, 'tokens': tokens}
+            merged[str(resolved)] = entry
 
-        _write_json_cache(merged)
+        if merged != stored:
+            _write_json_cache(merged)
         return total_tokens
 
     except Exception as e:
@@ -814,7 +892,7 @@ def copy_to_clipboard(text):
         elif shutil.which('pbcopy'):
             subprocess.run(['pbcopy'], input=text.encode(), check=True)
             return True
-    except:
+    except Exception:
         pass
     return False
 
@@ -1869,7 +1947,7 @@ def mark_from_promptpack(root, promptpack_paths):
                 mark_node(child)
 
 
-            file_children = [child for child in node.children if not child.is_dir]
+            file_children = [child for child in node.children if not child.is_dir and not child.is_link]
             dir_children = [child for child in node.children if child.is_dir]
 
             has_any_children = file_children or dir_children
@@ -1881,6 +1959,56 @@ def mark_from_promptpack(root, promptpack_paths):
 
     mark_node(root)
 
+def load_children(node):
+    """Read the entries of one folder into the tree. Subfolders are created but not read
+    until they are expanded or marked, so startup only reads the top level."""
+    if not node.is_dir or node.loaded:
+        return
+    node.loaded = True
+    _MARK_EPOCH[0] += 1      # the tree changed: cached mark counts are stale
+    try:
+        entries = sorted(node.path.iterdir(), key=lambda x: (not (x.is_dir() and not x.is_symlink()), x.name.lower()))
+    except PermissionError:
+        return
+    for entry in entries:
+        if entry.name.startswith('.'):
+            continue
+        # symlinked folders are listed as red leaves: never descended into, so no loops
+        is_link_dir = entry.is_symlink() and entry.is_dir()
+        if entry.is_file() and not _is_code_file(entry.name):
+            continue
+        child = TreeNode(entry, is_dir=entry.is_dir() and not is_link_dir, parent=node)
+        child.is_link = is_link_dir
+        child.calculate_size()
+        node.children.append(child)
+    _MARK_EPOCH[0] += 1
+
+def load_all(node):
+    """Read every folder below node. Needed before a whole folder is marked, and before the
+    Python dependency map is built, since both need every file."""
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        load_children(current)
+        stack.extend(child for child in current.children if child.is_dir)
+
+def load_for_paths(root, paths):
+    """Read the folders on the way to each saved file, so that every file in files.json has a
+    node in the tree. Folders that are not on such a way stay unread."""
+    for path in paths:
+        try:
+            rel = Path(path).relative_to(root.path)
+        except ValueError:
+            continue
+        node = root
+        for part in rel.parts[:-1]:
+            load_children(node)
+            node = next((c for c in node.children if c.is_dir and c.name == part), None)
+            if node is None:
+                break
+        else:
+            load_children(node)
+
 def build_tree(root_path, load_marks=True):
     root_path = Path(root_path).resolve()
 
@@ -1889,33 +2017,12 @@ def build_tree(root_path, load_marks=True):
 
     root = TreeNode(root_path, is_dir=True)
     root.expanded = True
-
-    def populate(node):
-        if not node.is_dir:
-            return
-
-        try:
-            entries = sorted(node.path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-            for entry in entries:
-                if entry.name.startswith('.'):
-                    continue
-
-                if entry.is_file() and not is_text_file(entry):
-                    continue
-
-                child = TreeNode(entry, is_dir=entry.is_dir(), parent=node)
-                node.children.append(child)
-                if child.is_dir:
-                    populate(child)
-        except PermissionError:
-            pass
-
-    populate(root)
-    root.calculate_size()
+    load_children(root)      # the top level only: folders are read when expanded or marked
 
     if load_marks:
         promptpack_paths = load_promptpack()
         if promptpack_paths:
+            load_for_paths(root, promptpack_paths)
             mark_from_promptpack(root, promptpack_paths)
 
     return root
@@ -2080,7 +2187,10 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset, total_tokens):
         else:
             icon = "  "
 
-        if node.marked:
+        if node.is_link:
+            mark = "    "           # no checkbox: a symlinked folder cannot be marked
+            mark_color = curses.A_NORMAL
+        elif node.marked:
             mark = "[✓] "
             mark_color = curses.color_pair(1)
         elif node.is_dir and node.has_partial_marks():
@@ -2110,6 +2220,8 @@ def draw_tree(stdscr, root, selected_idx, scroll_offset, total_tokens):
 
             col += len(mark)
             name_attr = base_attr
+            if node.is_link:
+                name_attr |= curses.color_pair(3)   # symlinked folder: red
             if node.marked:
                 name_attr |= curses.A_BOLD
             stdscr.addstr(i + 1, col, line_suffix, name_attr)
@@ -2692,7 +2804,7 @@ Use 'promptpack -r path' whenever you need to read a file's full content.
 
 
 def get_all_py_files(root):
-    """Bygg dict: modulnamn -> TreeNode för alla .py-filer i trädet"""
+    """Build a dict: module name -> TreeNode for all .py files in the tree"""
     module_map = {}
 
     def traverse(node):
@@ -2707,7 +2819,7 @@ def get_all_py_files(root):
                         parts[-1] = parts[-1][:-3]
                         module_name = '.'.join(parts)
                     module_map[module_name] = node
-                    # Lägg även till kortnamn (sista delen)
+                    # Also add the short name (last part)
                     short = module_name.split('.')[-1]
                     if short not in module_map:
                         module_map[short] = node
@@ -2721,7 +2833,7 @@ def get_all_py_files(root):
     return module_map
 
 def get_python_imports(filepath):
-    """Plocka ut alla importerade modulnamn från en Python-fil"""
+    """Collect all imported module names from a Python file"""
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             source = f.read()
@@ -2743,7 +2855,7 @@ def get_python_imports(filepath):
 
 
 def get_dep_nodes(node, root, visited=None, module_map=None):
-    """Returnera set av TreeNode för filen och alla lokala beroenden"""
+    """Return a set of TreeNodes for the file and all its local dependencies"""
     if visited is None:
         visited = set()
     if module_map is None:
@@ -2956,21 +3068,19 @@ class _MCPServer(ThreadingHTTPServer):
     def _tool_definition():
         return {
             'name': 'promptpack',
-            'description': ('Run promptpack commands in the project folder. Several commands can go in one call; '
-                            'they run in order and every result is returned. Same arguments as the terminal CLI.'),
+            'description': 'Run promptpack commands in the project folder, in order. Same arguments as the terminal CLI.',
             'inputSchema': {
                 'type': 'object',
                 'properties': {
                     'commands': {
                         'type': 'array',
                         'minItems': 1,
+                        'description': 'A JSON array (not a string) of command objects, run in order.',
                         'items': {
                             'type': 'object',
                             'properties': {
-                                'args': {'type': 'array', 'items': {'type': 'string'},
-                                         'description': 'promptpack arguments, e.g. ["-r", "main.py"]'},
-                                'stdin': {'type': 'string',
-                                          'description': 'text for commands that read stdin (-p, -f, --summary)'},
+                                'args': {'type': 'array', 'items': {'type': 'string'}},
+                                'stdin': {'type': 'string'},
                             },
                             'required': ['args'],
                         },
@@ -2988,7 +3098,7 @@ class _MCPServer(ThreadingHTTPServer):
             raise ValueError("'commands' must be a non-empty list")
         with self.lock:
             texts = [self._run_command(item) for item in commands]
-        return {'content': [{'type': 'text', 'text': '\n\n'.join(texts)}]}
+        return {'content': [{'type': 'text', 'text': _join_results(texts, 2 * MCP_RESULT_MAX_BYTES)}]}
 
     def _run_command(self, item):
         return run_promptpack_command(item, self.say)
@@ -2999,10 +3109,11 @@ OPENROUTER_REQUEST_TIMEOUT = 600   # seconds to wait for one model answer
 OPENROUTER_MODELS_TIMEOUT = 30     # seconds to wait for the model list
 OPENROUTER_MAX_STEPS = 40          # tool-call rounds allowed for one user message
 CONTEXT_WARN_FRACTION = 0.80   # trim old tool results once the conversation reaches this share of the window
-CONTEXT_TRIM_FRACTION = 0.60   # trimming stops at this share of the window
 MODELS_MAX_AGE = 24 * 3600     # re-fetch the OpenRouter model list when older than this (seconds)
+ANTHROPIC_CACHE_TTL = '5m'     # '5m' (default, writes cost 1.25x) or '1h' (writes cost 2x); every cache read renews it
 MCP_SECURITY_NOTE = ("⚠️  The AI can run shell commands in this project (-e). The -e blacklist is a minimal "
-                     "guard, not a security boundary: only connect an AI you trust.")
+                     "guard, not a security boundary. Shell commands are only scanned for paths, so one can still "
+                     "reach files outside the project. Only connect an AI you trust.")
 
 
 def save_mcp_config(config):
@@ -3035,7 +3146,6 @@ _ANSI = {'cyan': '\x1b[36m', 'green': '\x1b[32m', 'yellow': '\x1b[33m',
          'red': '\x1b[31m', 'dim': '\x1b[2m', 'reset': '\x1b[0m'}
 _CURSES_PAIR = {'cyan': 4, 'green': 5, 'yellow': 6, 'red': 7}
 SPINNER_FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-SPINNER_INTERVAL = 0.08   # seconds per frame
 
 def _log_kind(text):
     """Which colour a log line gets, from its leading symbol. None = plain."""
@@ -3063,7 +3173,297 @@ def mcp_log(text):
         print(f"[{stamp}] {text}", flush=True)
 
 
-def run_promptpack_command(item, say):
+MCP_RESULT_MIN_BYTES = 16 * 1024      # smallest share of the context window one command may fill
+MCP_RESULT_MAX_BYTES = 100 * 1024     # largest share, also used for Claude Desktop
+MCP_RESULT_UNKNOWN_BYTES = 32 * 1024  # share used when the model's context size is unknown
+
+def _result_limit(context_tokens):
+    """Characters one promptpack command may send to the AI: 10 % of the context window
+    (about 4 characters per token), kept between 16 KB and 100 KB."""
+    if not context_tokens:
+        return MCP_RESULT_UNKNOWN_BYTES
+    share = int(context_tokens * 4 * 0.10)
+    return max(MCP_RESULT_MIN_BYTES, min(MCP_RESULT_MAX_BYTES, share))
+
+def _too_large_notice(args, size, limit):
+    """What the AI gets instead of an output over the limit. None of the output is sent: a cut
+    part costs tokens and can hide what the AI needs, so it reads the part it needs with a
+    narrower command."""
+    head = f"✖ output too large: {size:,} characters, the limit for this command is {limit:,}."
+    find = ("Find text with promptpack -s STRING OFFSET FILE or promptpack -fs STRING PATTERN, "
+            "and read a range with promptpack -n START,END FILE.")
+    cmd = args[0]
+    if cmd in ('-n', '--lines'):
+        return '\n'.join([head + " Nothing was returned.",
+                          "The range is too big. Ask for a smaller span of lines in promptpack -n START,END FILE."])
+    if cmd in ('-s', '--search', '-fs', '--file-search'):
+        return '\n'.join([head + " Nothing was returned.",
+                          "The search matches too much. Use a more specific string, or a pattern for fewer files."])
+    if cmd in ('-r', '--read'):
+        sizes = []
+        for name in args[1:]:
+            try:
+                sizes.append(f"{name} ({Path(name).stat().st_size // 1024} KB)")
+            except OSError:
+                pass
+        lines = [head + " Nothing was returned."]
+        if sizes:
+            lines.append("Files: " + ", ".join(sizes) + ".")
+        lines.append("Read the large files one at a time: " + find)
+        return '\n'.join(lines)
+    if cmd in ('-e', '--execute'):
+        return '\n'.join([head + " The command ran, but its output was not sent.",
+                          "Narrow the command so it prints less, for example with grep or tail, "
+                          "or write the output to a file and read that with promptpack -n START,END FILE."])
+    return '\n'.join([head + " Nothing was returned.", find])
+
+SMALL_RESULT_CHARS = 2000   # results this short (patch confirmations, errors) are always sent
+
+def _join_results(results, limit):
+    """Join the results of one tool call. Once the total would pass limit, the rest is not
+    sent, but those commands already ran, so the AI is told that and how to see the output."""
+    kept, used = [], 0
+    for text in results:
+        if len(text) > SMALL_RESULT_CHARS and used + len(text) > limit:
+            text = (f"✖ output withheld: the results of this tool call would pass {limit:,} characters. "
+                    "The command ran, but its output is not sent: run it alone, or read the result "
+                    "with promptpack -n, -s or -fs.")
+        else:
+            used += len(text) + 2
+        kept.append(text)
+    return '\n\n'.join(kept)
+
+ACCESS_TIMEOUT = 90         # seconds the access question waits for an answer; then it is no
+ACCESS_BUTTONS = ['Yes', 'Always', 'No']
+ACCESS_ANSWERS = ['yes', 'always', 'no']
+ACCESS_ASKER = None         # set by the mode that runs; asks one question, returns yes / always / no
+_ACCESS_GRANTED = []        # folders allowed with Always, for this run
+_EXEC_TOKEN = re.compile(r"(?<![\w.:/\-])(~[^\s'\"|&;<>()]*|\$(?:HOME|TMPDIR)[^\s'\"|&;<>()]*|\.\.?/[^\s'\"|&;<>()]*|/[^\s'\"|&;<>()]*)")
+_EXEC_SAFE = ('/dev/null', '/dev/stdout', '/dev/stderr')
+
+def set_access_asker(asker):
+    global ACCESS_ASKER
+    ACCESS_ASKER = asker
+
+def _grant_dir(target):
+    """The folder an Always answer covers: the path itself if it is a folder, else its parent."""
+    return target if target.is_dir() else target.parent
+
+def _glob_folder(pattern):
+    """The folder a glob pattern searches: the part before its first wildcard, up to the last slash."""
+    if not any(c in pattern for c in '*?['):
+        return pattern
+    prefix = re.split(r'[*?\[]', pattern, maxsplit=1)[0]
+    if '/' not in prefix:
+        return '.'
+    return prefix.rsplit('/', 1)[0] or '/'
+
+def _args_paths(args):
+    """The paths (and glob patterns, by their folder) a promptpack command reads or writes,
+    using the argument layout of the terminal CLI. -e is checked by scanning its text."""
+    cmd, rest = args[0], args[1:]
+    if cmd in ('-r', '--read'):
+        return rest
+    if cmd in ('-p', '--patch', '-f', '--file'):
+        return rest[:1]
+    if cmd in ('-n', '--lines'):
+        return rest[1:2]
+    if cmd in ('-s', '--search'):
+        return rest[2:3]
+    if cmd in ('-fs', '--file-search'):
+        return [_glob_folder(rest[1])] if len(rest) > 1 else []
+    if cmd in ('-t', '--tidy'):
+        return [_glob_folder(p) for p in rest]
+    return []
+
+def _outside_targets(paths):
+    """Resolved paths among paths that lie outside the project folder (the current directory)."""
+    root = Path.cwd().resolve()
+    outside = []
+    for raw in paths:
+        if not raw or raw in _EXEC_SAFE:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(raw))
+        if '$' in expanded:
+            continue   # a variable we do not know: cannot be judged here
+        try:
+            target = (root / expanded).resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        try:
+            target.relative_to(root)
+        except ValueError:
+            outside.append(target)
+    return outside
+
+class _AccessRequest:
+    def __init__(self, target, command):
+        self.target = target
+        self.command = command
+        self.answer = None
+        self.event = threading.Event()
+
+    def details(self):
+        return [f"Path: {self.target}", f"Command: {self.command}",
+                f"Always = allow everything under {_grant_dir(self.target)}"]
+
+def _answer_access_outside(paths, command):
+    """None when every path may be used, otherwise the denial text. Asks once per path outside
+    the project; an Always answer covers its folder for the rest of the run."""
+    for target in paths:
+        if any(target == d or d in target.parents for d in _ACCESS_GRANTED):
+            continue
+        if ACCESS_ASKER is None:
+            return f"access denied: {target} is outside the project and nobody can approve it here. Do not retry this path."
+        answer = ACCESS_ASKER(_AccessRequest(target, command))
+        if answer == 'always':
+            _ACCESS_GRANTED.append(_grant_dir(target))
+        elif answer != 'yes':
+            return f"access denied by user: {target}. Do not retry this path."
+    return None
+
+def _terminal_access_prompt(request):
+    """The access question in a plain terminal (Claude Desktop server, plain OpenRouter chat), the
+    same choice as the curses modal. Left, Right, Tab, Up and Down move the selection, Enter presses
+    it, y, a or n press a button directly. Esc and Ctrl+S mean no, and so does no key within
+    ACCESS_TIMEOUT seconds."""
+    try:
+        import termios, select, time
+    except ImportError:
+        return 'no'
+    if not sys.stdin.isatty():
+        return 'no'
+    width = 66
+    buttons = ACCESS_BUTTONS
+    letters = {b'y': 0, b'a': 1, b'n': 2}
+    details = request.details()
+    hint = f"Esc or Ctrl+S: no.  No key within {ACCESS_TIMEOUT} s: no."
+
+    def frame(selected):
+        plain = "   ".join(f" {name} " for name in buttons)
+        styled = "   ".join(f"\x1b[7m {name} \x1b[0m" if i == selected else f" {name} "
+                            for i, name in enumerate(buttons))
+        rows = ["┌" + "─" * width + "┐"]
+        for text in details:
+            shown = text[:width - 1]
+            rows.append("│ " + shown + " " * (width - 1 - len(shown)) + "│")
+        rows.append("│" + " " * width + "│")
+        rows.append("│ " + styled + " " * (width - 1 - len(plain)) + "│")
+        rows.append("│ " + hint + " " * (width - 1 - len(hint)) + "│")
+        rows.append("└" + "─" * width + "┘")
+        return rows
+
+    def draw(selected, redraw):
+        rows = frame(selected)
+        out = [f"\x1b[{len(rows)}A"] if redraw else []   # back up to the top border
+        out += [f"\r\x1b[2K{row}\n" for row in rows]
+        sys.stdout.write(''.join(out))
+        sys.stdout.flush()
+
+    print("", flush=True)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    raw = termios.tcgetattr(fd)
+    raw[0] &= ~termios.IXON                      # Ctrl+S must arrive as a key, not pause the output
+    raw[3] &= ~(termios.ICANON | termios.ECHO)
+    raw[6][termios.VMIN] = 1
+    raw[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSADRAIN, raw)
+    selected, answer = 2, 'no'
+    deadline = time.monotonic() + ACCESS_TIMEOUT
+    try:
+        draw(selected, redraw=False)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                break
+            data = os.read(fd, 16)
+            if not data:
+                break
+            if data[:1] == b'\x1b' and data[1:2] in (b'[', b'O'):
+                code = data[2:3]
+                if code in (b'C', b'B'):
+                    selected = min(selected + 1, len(buttons) - 1)
+                elif code in (b'D', b'A'):
+                    selected = max(selected - 1, 0)
+                else:
+                    continue
+                draw(selected, redraw=True)
+            elif data[:1] == b'\x1b' or data[:1] == b'\x13':   # Esc or Ctrl+S
+                break
+            elif data[:1] == b'\t':
+                selected = (selected + 1) % len(buttons)
+                draw(selected, redraw=True)
+            elif data[:1] in (b'\r', b'\n'):
+                answer = ACCESS_ANSWERS[selected]
+                break
+            elif data[:1].lower() in letters:
+                answer = ACCESS_ANSWERS[letters[data[:1].lower()]]
+                break
+    finally:
+        termios.tcflush(fd, termios.TCIFLUSH)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)   # back to the read-only state the server set
+    sys.stdout.write(f"   → {answer}\n")
+    sys.stdout.flush()
+    return answer
+
+def _curses_choice(stdscr, question, details, buttons, hint, default, stop=None):
+    """A modal box with buttons over the screen. Tab, Left and Right move the selection, Enter
+    presses it, the first letter of a button presses it. Esc and Ctrl+S press the last button.
+    Returns the index of the pressed button, or None when stop() becomes true."""
+    selected, last = default, len(buttons) - 1
+    letters = [name[0].lower() for name in buttons]
+    button_row = 2 + len(details) + 1
+    box_h = button_row + 4
+    curses.curs_set(0)
+    try:
+        while True:
+            if stop is not None and stop():
+                return None
+            height, width = stdscr.getmaxyx()
+            box_w = max(54, min(width - 2, 70))
+            top = max(0, (height - box_h) // 2)
+            left = max(0, (width - box_w) // 2)
+            inner = box_w - 4
+            _put(stdscr, top, left, '┌' + '─' * (box_w - 2) + '┐')
+            for r in range(1, box_h - 1):
+                _put(stdscr, top + r, left, '│' + ' ' * (box_w - 2) + '│')
+            _put(stdscr, top + box_h - 1, left, '└' + '─' * (box_w - 2) + '┘')
+            _put(stdscr, top + 1, left + 2, question[:inner], curses.A_BOLD)
+            for i, text in enumerate(details):
+                _put(stdscr, top + 2 + i, left + 2, text[:inner])
+            labels = [f"  {name}  " for name in buttons]
+            gap = 4
+            x = left + max(2, (box_w - (sum(len(label) for label in labels) + gap * last)) // 2)
+            for i, label in enumerate(labels):
+                attr = curses.A_REVERSE if i == selected else curses.A_NORMAL
+                _put(stdscr, top + button_row, x, label, attr | curses.A_BOLD)
+                x += len(label) + gap
+            _put(stdscr, top + button_row + 2, left + 2, hint[:inner])
+            stdscr.refresh()
+            try:
+                ch = stdscr.get_wch()
+            except curses.error:
+                continue
+            if ch == '\t':
+                selected = (selected + 1) % len(buttons)
+            elif ch == curses.KEY_RIGHT:
+                selected = min(selected + 1, last)
+            elif ch == curses.KEY_LEFT:
+                selected = max(selected - 1, 0)
+            elif ch in ('\n', '\r') or ch == curses.KEY_ENTER:
+                return selected
+            elif ch in ('\x1b', '\x13'):
+                return last
+            elif isinstance(ch, str) and ch.lower() in letters:
+                return letters.index(ch.lower())
+    finally:
+        curses.curs_set(1)
+
+def run_promptpack_command(item, say, limit=MCP_RESULT_MAX_BYTES):
     """Run one {"args": [...], "stdin": "..."} item as a promptpack child process, exactly as
     the terminal CLI would, and return the result as text. say(text) logs one line."""
     args = item.get('args') if isinstance(item, dict) else None
@@ -3078,6 +3478,13 @@ def run_promptpack_command(item, say):
         say(f"✖ refused: {shown}")
         return f"$ {shown}\n✖ refused: the MCP server cannot be started through the tool"
     say(f"→ {shown}")
+    outside = (_outside_targets(_EXEC_TOKEN.findall(' '.join(args[1:])))
+               if args[0] in ('-e', '--execute')
+               else _outside_targets(_args_paths(args)))
+    denial = _answer_access_outside(outside, shown) if outside else None
+    if denial:
+        say(f"✖ {denial}")
+        return f"$ {shown}\n{denial}\n[not run]"
     fd, buffer_path = tempfile.mkstemp(prefix='promptpack_mcp_', suffix='.txt')
     os.close(fd)
     env = dict(os.environ, PROMPTPACK_MCP_BUFFER=buffer_path, PYTHONIOENCODING='utf-8')
@@ -3103,6 +3510,8 @@ def run_promptpack_command(item, say):
     extra = [line for line in console.splitlines()
              if line.strip() and re.sub(r'^[^A-Za-z0-9]+', '', line.strip()) not in buffered]
     body = '\n'.join(part for part in (buffered.strip('\n'), '\n'.join(extra).strip('\n')) if part)
+    if len(body) > limit:
+        body = _too_large_notice(args, len(body), limit)
     say(f"← exit {code}")
     if body:
         print(_clip(body, MCP_LOG_MAX_BYTES, 'terminal'), flush=True)
@@ -3131,6 +3540,9 @@ def _openrouter_request(path, key=None, payload=None, timeout=OPENROUTER_REQUEST
         raise RuntimeError(f"OpenRouter answered HTTP {e.code}: {detail}")
     except OSError as e:
         raise RuntimeError(f"cannot reach OpenRouter: {e}")
+    except http.client.HTTPException as e:
+        # IncompleteRead is not an OSError, so it used to escape the turn unhandled
+        raise RuntimeError(f"connection to OpenRouter broke while reading: {e}")
     try:
         return json.loads(raw.decode('utf-8'))
     except ValueError:
@@ -3161,6 +3573,30 @@ def _fmt_context(tokens):
     return f"{tokens // 1000}K" if tokens < 1000000 else f"{tokens / 1000000:.1f}M"
 
 
+def _cache_ttl_label(model_id):
+    """Cache lifetime shown in F6. Only Anthropic models get an explicit TTL from promptpack
+    (ANTHROPIC_CACHE_TTL); other providers cache on their own terms and have no setting here."""
+    return ANTHROPIC_CACHE_TTL if 'anthropic/' in str(model_id) else 'auto'
+
+
+def _cache_write_price(model):
+    """USD per million tokens to write the cache with the TTL promptpack uses, or None when
+    OpenRouter lists no such price."""
+    if 'anthropic/' in str(model.get('id')) and ANTHROPIC_CACHE_TTL == '1h':
+        return model.get('cache_write_1h')
+    return model.get('cache_write')
+
+
+def _fmt_cache_price(price):
+    """Like _fmt_price, but an unlisted cache price is '-' instead of 'var'."""
+    return '-' if price is None else _fmt_price(price)
+
+
+def _new_session_id():
+    """A fresh OpenRouter session id for one conversation (OpenRouter allows 256 characters)."""
+    return 'promptpack-' + secrets.token_hex(8)
+
+
 def fetch_openrouter_models():
     """Download the model list and keep the models that can call tools (free and paid).
     Sorted free first, then by name. Raises RuntimeError if the list cannot be fetched."""
@@ -3183,6 +3619,9 @@ def fetch_openrouter_models():
             'context': m.get('context_length') or 0,
             'prompt': price_in,
             'completion': price_out,
+            'cache_read': _price_per_million(pricing.get('input_cache_read')),
+            'cache_write': _price_per_million(pricing.get('input_cache_write')),
+            'cache_write_1h': _price_per_million(pricing.get('input_cache_write_1h')),
             'free': str(m['id']).endswith(':free') or (price_in == 0 and price_out == 0),
         })
     models.sort(key=lambda m: (not m['free'], m['name'].lower()))
@@ -3204,6 +3643,18 @@ def _join_row(left, right, width):
     return left[:max(0, width - len(right) - 1)] + ' ' + right
 
 
+def _cache_counts(usage):
+    """(cached_read, cache_written) from an OpenRouter usage object. OpenRouter gives these
+    fields for every provider in the same place, prompt_tokens_details. A missing field counts 0."""
+    details = usage.get('prompt_tokens_details') if isinstance(usage, dict) else None
+    if not isinstance(details, dict):
+        details = {}
+
+    def number(name):
+        value = details.get(name)
+        return int(value) if isinstance(value, (int, float)) else 0
+    return number('cached_tokens'), number('cache_write_tokens')
+
 class _MCPHeader:
     """Pinned two-row header for promptpack --mcp, drawn with ANSI escape codes. The rows
     below it form a scroll region, so the log and the chat scroll under the header without
@@ -3222,12 +3673,15 @@ class _MCPHeader:
         self.tokens_in = 0
         self.tokens_out = 0
         self.last_in = 0        # prompt size of the latest request = how full the context is
+        self.last_cached = 0    # cached prompt tokens of the latest request
+        self.cached_read = 0    # session total of prompt tokens read from the cache
         self.cost = 0.0
         self.estimated = False  # part of the cost is calculated from prices, not reported
         self.cost_unknown = False
         self.active = False
         self._size = None
         self._lock = threading.Lock()
+        self._stop_watch = threading.Event()   # set by stop(): ends the size watcher thread
 
     def set_model(self, info):
         """info: a model entry from the cached OpenRouter list (or None)."""
@@ -3239,19 +3693,33 @@ class _MCPHeader:
         self.context = info.get('context') or 0
         self.free = bool(info.get('free'))
 
+    def change_model(self, config):
+        """The model was changed while the chat runs: take its name, prices and context window.
+        The session totals stay; the figures of the previous model's latest request are cleared."""
+        model = config.get('openrouter_model')
+        info = next((m for m in config.get('openrouter_models') or [] if m.get('id') == model), None)
+        with self._lock:
+            self.title = f"OpenRouter | {model}"
+            self.prices, self.context, self.free = None, 0, False
+            self.last_in = self.last_cached = 0
+        self.set_model(info)
+        self.draw()
+
     def _lines(self, width):
         line1 = _join_row(f" PromptPack MCP | {self.title}", f"{Path.cwd()} ", width)
         if self.note:
-            return line1, _join_row(" " + self.note, "Ctrl+C: Stop ", width)
+            return line1, _join_row(" " + self.note, "Esc: quit | Ctrl+S: stop AI ", width)
         if self.free:
             cost = 'free ($0)'
         else:
             cost = f"{'~' if self.estimated else ''}${self.cost:.4f}{'+' if self.cost_unknown else ''}"
         ctx = _fmt_count(self.last_in) + (f"/{_fmt_context(self.context)}" if self.context else '')
-        # "billed in" is the whole context sent with each request, so it grows faster than the chat
-        line2 = (f" Billed in: {_fmt_count(self.tokens_in)} | Out: {_fmt_count(self.tokens_out)} | "
-                 f"Context now: {ctx} | Cost: {cost} | Requests: {self.requests}")
-        return line1, _join_row(line2, "Ctrl+C: Stop ", width)
+        hit = f"{100 * self.last_cached // self.last_in}%" if self.last_in else "-"
+        cache = f"Cache: {hit} hit, {_fmt_count(self.cached_read)} read"
+        # "sent in" is the whole context sent with each request (cached and new), so it grows faster than the chat
+        line2 = (f" Sent in: {_fmt_count(self.tokens_in)} | Out: {_fmt_count(self.tokens_out)} | "
+                 f"Context now: {ctx} | {cache} | Cost: {cost} | Requests: {self.requests}")
+        return line1, _join_row(line2, "Esc: quit | Ctrl+S: stop AI ", width)
 
     def start(self):
         if not sys.stdout.isatty() or os.environ.get('TERM') == 'dumb':
@@ -3266,6 +3734,7 @@ class _MCPHeader:
         self.draw()
         sys.stdout.write("\x1b[3;1H")   # first line of the scrolling area
         sys.stdout.flush()
+        threading.Thread(target=self._watch_size, daemon=True).start()
 
     def draw(self):
         if not self.active:
@@ -3296,12 +3765,15 @@ class _MCPHeader:
             return int(value) if isinstance(value, (int, float)) else 0
 
         tokens_in, tokens_out = count('prompt_tokens'), count('completion_tokens')
+        cached, _written = _cache_counts(usage)
         reported = usage.get('cost')
         with self._lock:
             self.requests += 1
             self.tokens_in += tokens_in
             self.tokens_out += tokens_out
             self.last_in = tokens_in
+            self.last_cached = cached
+            self.cached_read += cached
             if isinstance(reported, (int, float)):
                 self.cost += float(reported)
             elif self.prices:
@@ -3311,10 +3783,19 @@ class _MCPHeader:
                 self.cost_unknown = True
         self.draw()
 
+    def _watch_size(self):
+        """Redraw the header when the window size changes. In Claude Desktop mode nothing else
+        calls draw (no usage arrives there), so without this the scroll region keeps the old size."""
+        while not self._stop_watch.wait(0.3):
+            size = shutil.get_terminal_size((80, 24))
+            if (size.columns, size.lines) != self._size:
+                self.draw()
+
     def stop(self):
         if not self.active:
             return
         self.active = False
+        self._stop_watch.set()
         height = shutil.get_terminal_size((80, 24)).lines
         sys.stdout.write(f"\x1b[r\x1b[{height};1H\n")   # remove the scroll region, cursor to the bottom
         sys.stdout.flush()
@@ -3499,15 +3980,17 @@ class _ChatView:
     possible while the AI is busy."""
 
     MAX_LINES = 20000
-    encoding = 'utf-8'
 
-    def __init__(self, header):
+    def __init__(self, header, cancel, config=None):
         self.header = header
+        self.config = config    # mcp.json settings: F6 opens the OpenRouter page on them
+        self.cancel = cancel    # set by Ctrl+S: the running AI call is abandoned
         self.spin = 0           # index into SPINNER_FRAMES while the AI works
         self.lines = []          # logical lines: (text, attr)
         self.partial = ''        # written text that has no newline yet
         self.lock = threading.Lock()
         self.busy = False
+        self.access_request = None   # set while the AI waits for an answer to an access question
         self.offset = 0          # wrapped rows scrolled up from the bottom (0 = follow)
         self.text = ''           # the input line
         self.pos = 0             # cursor position in the input line
@@ -3515,6 +3998,7 @@ class _ChatView:
         self._wrapped = 0
         self._width = 0
         self._trimmed = False
+        self._dirty = True       # the view is only redrawn when this is set
 
     # --- file-like side: used as sys.stdout and sys.stderr while the view runs ---
     def isatty(self):
@@ -3544,6 +4028,7 @@ class _ChatView:
         elif kind == 'dim' or text.startswith('['):
             attr = curses.A_DIM
         self.lines.append((text.expandtabs(4), attr))
+        self._dirty = True
         if len(self.lines) > self.MAX_LINES:
             del self.lines[:self.MAX_LINES // 10]
             self._trimmed = True
@@ -3561,7 +4046,33 @@ class _ChatView:
             if self.offset and not fresh:
                 self.offset += len(self._rows) - before   # keep the view still while scrolled up
 
+    def _terminal_size(self):
+        """(lines, columns) of the real terminal, or None when it cannot be read."""
+        try:
+            size = os.get_terminal_size(sys.__stdout__.fileno())
+            return (size.lines, size.columns)
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def _follow_terminal_size(self, stdscr):
+        """Keep the window the size of the terminal. ncurses does not always notice a resize
+        (for example when LINES or COLUMNS are set in the environment), so the real size is
+        read from the terminal and the window is resized to it when they differ."""
+        try:
+            size = os.get_terminal_size(sys.__stdout__.fileno())
+        except (OSError, ValueError, AttributeError):
+            return
+        height, width = stdscr.getmaxyx()
+        if (size.lines, size.columns) != (height, width) and size.lines > 0 and size.columns > 0:
+            try:
+                curses.resizeterm(size.lines, size.columns)
+            except curses.error:
+                return
+            stdscr.clear()
+            self._width = 0      # forces the chat to be wrapped again at the new width
+
     def _draw(self, stdscr):
+        self._follow_terminal_size(stdscr)
         height, width = stdscr.getmaxyx()
         stdscr.erase()
         if height < 6 or width < 24:
@@ -3581,7 +4092,7 @@ class _ChatView:
         if self.offset:
             status = f" ↑ scrolled up, {self.offset} rows below | End: back to the bottom"
         else:
-            status = " PgUp/PgDn, Up/Down or the mouse wheel scroll | Home: top | End: bottom"
+            status = " Esc: quit | Ctrl+S: stop AI | F6: model | PgUp/PgDn, Up/Down scroll | Home/End"
         if self.busy:
             frame = SPINNER_FRAMES[self.spin % len(SPINNER_FRAMES)]
             status = f" {frame} the AI is working |" + status
@@ -3616,18 +4127,35 @@ class _ChatView:
                 bg = -1
             except curses.error:
                 bg = curses.COLOR_BLACK
-            for pair, colour in ((4, curses.COLOR_CYAN), (5, curses.COLOR_GREEN),
+            for pair, colour in ((1, curses.COLOR_GREEN), (2, curses.COLOR_YELLOW), (3, curses.COLOR_RED),
+                                 (4, curses.COLOR_CYAN), (5, curses.COLOR_GREEN),
                                  (6, curses.COLOR_YELLOW), (7, curses.COLOR_RED)):
                 curses.init_pair(pair, colour, bg)
+        if hasattr(curses, 'set_escdelay'):
+            curses.set_escdelay(25)   # Esc quits: do not wait a second for it
+        curses.raw()                  # Ctrl+C and Ctrl+S arrive as keys, not as signals
         stdscr.timeout(100)      # wake up often: the worker thread adds lines meanwhile
+        last_size = None
         while True:
-            self._draw(stdscr)
+            size = self._terminal_size()
+            if size != last_size:
+                last_size = size
+                self._dirty = True       # the terminal was resized: ncurses may not report it
             if self.busy:
                 self.spin += 1
+                self._dirty = True       # the spinner moves while the AI works
+            if self._dirty:
+                self._dirty = False
+                self._draw(stdscr)
+            if self.access_request is not None:
+                self._answer_access(stdscr)
+                self._dirty = True
+                continue
             try:
                 ch = stdscr.get_wch()
             except curses.error:
                 continue
+            self._dirty = True           # a key changes what is shown
             page = max(1, stdscr.getmaxyx()[0] - 5)
             if ch == curses.KEY_PPAGE:
                 self.offset += page
@@ -3645,14 +4173,22 @@ class _ChatView:
                 self.pos = max(0, self.pos - 1)
             elif ch == curses.KEY_RIGHT:
                 self.pos = min(len(self.text), self.pos + 1)
+            elif ch == curses.KEY_RESIZE:
+                stdscr.clear()
+                self._width = 0      # the chat is wrapped again at the new width
             elif ch == '\x01':
                 self.pos = 0
             elif ch == '\x05':
                 self.pos = len(self.text)
             elif ch == '\x15':
                 self.text, self.pos = '', 0
-            elif ch == '\x04' and not self.text:
-                return
+            elif ch in ('\x1b', '\x03', '\x04'):
+                if self._confirm_quit(stdscr):
+                    return
+            elif ch == curses.KEY_F6:
+                self._open_settings(stdscr)
+            elif ch == '\x13':          # Ctrl+S
+                self._stop_ai()
             elif ch in ('\x7f', '\b') or ch == curses.KEY_BACKSPACE:
                 if self.pos:
                     self.text = self.text[:self.pos - 1] + self.text[self.pos:]
@@ -3686,6 +4222,108 @@ class _ChatView:
                 self.text = self.text[:self.pos] + ch + self.text[self.pos:]
                 self.pos += 1
 
+    def _open_settings(self, stdscr):
+        """F6: the OpenRouter page (API key and model) on top of the chat. A model or key chosen
+        there is used from the next message; the conversation stays as it is."""
+        if self.config is None:
+            return
+        if self.busy:
+            print("⏳ The AI is still working: press F6 when it has answered.", flush=True)
+            return
+        before = self.config.get('openrouter_model')
+        stdscr.timeout(-1)            # the page reads keys with a blocking getch()
+        try:
+            show_openrouter_settings(stdscr, self.config)
+        finally:
+            stdscr.timeout(100)
+            stdscr.clear()
+            curses.curs_set(1)
+        model = self.config.get('openrouter_model')
+        if model != before:
+            if self.header:
+                self.header.change_model(self.config)
+            print(f"↻ Model changed to {model}. The conversation continues; the cache starts over on the next request.", flush=True)
+
+    def ask_access(self, request):
+        """Called from the AI's worker thread. The main loop shows the question (see
+        _answer_access) and sets request.answer. Nobody answers in time: no."""
+        self.access_request = request
+        if not request.event.wait(ACCESS_TIMEOUT):
+            request.answer = 'no'
+            request.event.set()
+        return request.answer
+
+    def _answer_access(self, stdscr):
+        request = self.access_request
+        stdscr.timeout(200)   # wake up to notice a timeout set by the worker thread
+        try:
+            pick = _curses_choice(stdscr, "AI wants access outside the project", request.details(),
+                                  ACCESS_BUTTONS, "Y yes  A always  N no  (Esc, Ctrl+S: no)",
+                                  default=2, stop=request.event.is_set)
+        finally:
+            stdscr.timeout(100)
+            self.access_request = None
+        if pick is not None and not request.event.is_set():
+            request.answer = ACCESS_ANSWERS[pick]
+            request.event.set()
+
+    def _stop_ai(self):
+        """Ctrl+S: abandon the AI call that is running. The chat stays open."""
+        if not self.busy:
+            print("⏹ No AI call is running.", flush=True)
+            return
+        self.cancel.set()
+        print("⏹ Stopping the AI call ...", flush=True)
+
+    def _confirm_quit(self, stdscr):
+        """Ask before the chat ends: two buttons, Yes and No. Tab or Left/Right switch the
+        selection, Enter presses the selected button, Esc means No. Returns True to quit."""
+        question = "Quit the MCP chat?"
+        note = "An AI call is running and will be stopped." if self.busy else ""
+        buttons = ["Yes", "No"]
+        selected = 1            # No is selected by default, so a stray Enter keeps the chat
+        result = None
+        curses.curs_set(0)
+        while result is None:
+            height, width = stdscr.getmaxyx()
+            box_w = max(54, min(width - 2, 64))
+            box_h = 9
+            top = max(0, (height - box_h) // 2)
+            left = max(0, (width - box_w) // 2)
+            inner = box_w - 4
+            _put(stdscr, top, left, '┌' + '─' * (box_w - 2) + '┐')
+            for r in range(1, box_h - 1):
+                _put(stdscr, top + r, left, '│' + ' ' * (box_w - 2) + '│')
+            _put(stdscr, top + box_h - 1, left, '└' + '─' * (box_w - 2) + '┘')
+            _put(stdscr, top + 1, left + 2, question[:inner], curses.A_BOLD)
+            _put(stdscr, top + 2, left + 2, note[:inner])
+            labels = [f"  {name}  " for name in buttons]
+            gap = 4
+            x = left + max(2, (box_w - (sum(len(label) for label in labels) + gap)) // 2)
+            for i, label in enumerate(labels):
+                attr = curses.A_REVERSE if i == selected else curses.A_NORMAL
+                _put(stdscr, top + 5, x, label, attr | curses.A_BOLD)
+                x += len(label) + gap
+            _put(stdscr, top + 7, left + 2, "Tab or Left/Right: choose | Enter: press | Esc: No"[:inner])
+            stdscr.refresh()
+            try:
+                ch = stdscr.get_wch()
+            except curses.error:
+                continue
+            if ch == '\t' or ch == curses.KEY_LEFT or ch == curses.KEY_RIGHT:
+                if ch == curses.KEY_LEFT:
+                    selected = 0
+                elif ch == curses.KEY_RIGHT:
+                    selected = 1
+                else:
+                    selected = 1 - selected
+            elif ch in ('\n', '\r') or ch == curses.KEY_ENTER:
+                result = selected == 0
+            elif ch == '\x1b':
+                result = False
+        curses.curs_set(1)
+        return result
+
     def start(self, on_submit, intro):
         """Run the view until Ctrl+C or Ctrl+D. intro() prints the opening lines into it."""
         saved = sys.stdout, sys.stderr
@@ -3710,27 +4348,213 @@ def _history_tokens(messages):
     """Tokens the whole conversation takes, estimated the same way as the other counts."""
     return calculate_tokens(json.dumps(messages, ensure_ascii=False))
 
-def _trim_history(messages, limit):
-    """Shorten the conversation in place until it is under CONTEXT_TRIM_FRACTION of the window.
-    The oldest tool results are replaced by a one-line note with their size. The system prompt
-    and the user and assistant text stay. Returns how many results were replaced."""
-    target = int(limit * CONTEXT_TRIM_FRACTION)
-    total = _history_tokens(messages)
-    trimmed = 0
-    # the tool results of the latest round are what the model is working on now: never trimmed
-    latest = max((i for i, m in enumerate(messages) if m.get('role') == 'assistant'), default=len(messages))
-    for msg in messages[:latest]:
-        if total <= target:
-            break
-        if msg.get('role') != 'tool' or str(msg.get('content', '')).startswith('[trimmed'):
+OPENROUTER_STUB_NOTICE = """\
+# CONTEXT STUBS (this OpenRouter session only)
+Older rounds of this conversation are replaced by stubs, once. A stub never changes afterwards.
+The latest rounds are always complete. A stub says what was removed and how to get it back.
+Read-only commands (-r, -n, -s, -fs, -ph, -log, -completelog, -w) can be run again. Never run
+-p, -f, -u, -us, -e or --summary again to get an old output back: they change files or history.
+This overrides the rules above that a file already shown is complete and current. Code that is
+stubbed is NOT in this conversation: read it again before you patch it.
+Line numbers in a stub are only where the code was when the stub was written. The file may have
+changed since, so they can be wrong. Find the code with the search text in the stub
+(promptpack -s "text" 0,40 file, or -fs), then check the lines with -n before you patch. Never
+patch by line number alone. The exact old and new text of a patch is in promptpack -ph <number>;
+that is the patch as it was made, not the file as it is now.
+"""
+
+STUB_MIN_BYTES = 2 * 1024      # shorter outputs and code are cheaper to keep than to read again
+CTAGS_MIN_BYTES = 8 * 1024     # files above this get a symbol index in their stub
+CTAGS_STUB_MAX = 60            # most symbols listed in one stub
+SYMBOL_KINDS = {'class', 'function', 'method'}
+RERUN_SAFE = ('-r', '-n', '-s', '-fs', '-ph', '-log', '-completelog', '-w')
+_CMD_HEAD = re.compile(r'(?m)^\$ promptpack ')
+_SYMBOL_CACHE = {}
+
+def _file_symbols(path):
+    """(line, kind, name) of the classes and functions in a file, from ctags. Cached by content hash."""
+    path = Path(path)
+    try:
+        key = (str(path.resolve()), compute_file_hash(path))
+    except OSError:
+        return []
+    if key in _SYMBOL_CACHE:
+        return _SYMBOL_CACHE[key]
+    try:
+        out = subprocess.run(['ctags', '-x', str(_rel_path(path))], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = ''
+    syms = []
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) >= 4 and parts[2].isdigit() and parts[1] in SYMBOL_KINDS:
+            syms.append((int(parts[2]), parts[1], parts[0]))
+    syms.sort()
+    _SYMBOL_CACHE[key] = syms
+    return syms
+
+def _format_symbols(syms):
+    """'class A L10, function b L40' for at most CTAGS_STUB_MAX symbols."""
+    if not syms:
+        return 'none found'
+    shown = [f"{kind} {name} L{line}" for line, kind, name in syms[:CTAGS_STUB_MAX]]
+    more = len(syms) - len(shown)
+    return ', '.join(shown) + (f" (+{more} more)" if more > 0 else '')
+
+def _file_index(name):
+    """Stub lines with the symbol index of a file, or [] when the file is small or missing."""
+    path = Path(name)
+    try:
+        if path.stat().st_size < CTAGS_MIN_BYTES:
+            return []
+    except OSError:
+        return []
+    return [f"    symbols in {name} (line numbers as of this stub): {_format_symbols(_file_symbols(path))}"]
+
+def _current_lines(content, patch):
+    """Current 1-based (first, last) line of a patch's new_text, or None when it cannot be placed."""
+    if not patch.get('new_text'):
+        return None
+    hits = _locate_patch(content, patch)
+    if len(hits) != 1:
+        return None
+    first = content.count('\n', 0, hits[0])
+    return first + 1, first + len(patch['new_text'].splitlines())
+
+def _patch_stub(pid, cmd, history, texts):
+    """Stub for a -p command whose code has left the context. It is written once and never rebuilt.
+    The search text finds the code again; the line numbers are only where it was when written."""
+    file_name = cmd[1] if len(cmd) > 1 else '?'
+    desc = cmd[2] if len(cmd) > 2 else ''
+    head = f"[PATCH {pid} · {file_name} · {desc}"
+    if history is None:
+        return f"{head} · patch history could not be read. Read the file with -r.]"
+    patch = history.get(pid)
+    if patch is None or not patch.get('applied'):
+        return f"{head} · the patch is undone or missing. Read the file again with -s or -r before relying on it.]"
+    if not patch.get('new_text'):
+        return f"{head} · deletion · the old and new text: promptpack -ph {pid}]"
+    fp = patch['filepath']
+    if fp not in texts:
+        try:
+            texts[fp] = Path(fp).read_text(encoding='utf-8')
+        except (OSError, ValueError):
+            texts[fp] = None
+    rng = _current_lines(texts[fp], patch) if texts[fp] is not None else None
+    where = f" · lines {rng[0]}-{rng[1]} when written, may have moved" if rng else ""
+    anchor = _anchor(patch['new_text'])
+    return (f'{head}{where} · find it: promptpack -s "{anchor}" 0,40 {file_name} · '
+            f'the old and new text: promptpack -ph {pid}]')
+
+def _new_file_stub(name):
+    """Stub for a -f command whose code has left the context."""
+    lines = [f"[NEW FILE {name} · code removed from context. Read it again: promptpack -r {name}]"]
+    lines += _file_index(name)
+    return '\n'.join(lines)
+
+def _output_stub(content):
+    """Stub for an older tool result. Only read-only commands are offered to run again."""
+    size = len(content.encode('utf-8'))
+    commands = [c.split() for c in re.findall(r'(?m)^\$ promptpack (.*)$', content)]
+    commands = [c for c in commands if c]
+    rerun = [c for c in commands if c[0] in RERUN_SAFE]
+    if not rerun:
+        names = ', '.join(c[0] for c in commands) or 'unknown'
+        return (f"[earlier output removed from context, {size / 1024:.1f} kB, from promptpack {names}. "
+                f"Do not run these again to get the output back: they change files or history.]")
+    lines = [f"[earlier output removed from context, {size / 1024:.1f} kB. Run the commands again to see it:]"]
+    for args in rerun:
+        lines.append("  promptpack " + ' '.join(args))
+        if args[0] == '-r':
+            for name in args[1:]:
+                lines += _file_index(name)
+        elif args[0] in ('-n', '-s') and len(args) >= 2:
+            lines += _file_index(args[-1])
+    return '\n'.join(lines)
+
+def _split_outputs(content, count):
+    """One output block per command of a tool result, or None when the blocks do not match."""
+    blocks = _CMD_HEAD.split(content)[1:]
+    return blocks if len(blocks) == count else None
+
+def _stub_assistant(msg, results, history, texts):
+    """Copy of an assistant message where succeeded -p and -f commands with code are replaced by stubs.
+    Failed commands keep their code so it can be repaired."""
+    calls, changed = [], False
+    for call in msg.get('tool_calls') or []:
+        fn = call.get('function') or {}
+        try:
+            args = json.loads(fn.get('arguments') or '{}')
+        except ValueError:
+            calls.append(call)
             continue
-        before = calculate_tokens(json.dumps(msg, ensure_ascii=False))
-        size = len(str(msg.get('content', '')).encode('utf-8'))
-        msg['content'] = (f"[trimmed to save context: this tool result was {size / 1024:.1f} kB. "
-                          f"Run the command again if you need it.]")
-        total -= before - calculate_tokens(json.dumps(msg, ensure_ascii=False))
-        trimmed += 1
-    return trimmed
+        items = args.get('commands') if isinstance(args, dict) else None
+        blocks = None
+        if isinstance(items, list) and items:
+            blocks = _split_outputs(results.get(call.get('id'), ''), len(items))
+        if blocks is None:
+            calls.append(call)
+            continue
+        call_changed = False
+        for item, block in zip(items, blocks):
+            cmd = item.get('args') if isinstance(item, dict) else None
+            code = item.get('stdin') or ''
+            if not cmd or len(code) < STUB_MIN_BYTES:
+                continue
+            m = re.search(r'\[PATCHID (\d+)\]', block)
+            if cmd[0] == '-p' and m:
+                item['stdin'] = _patch_stub(int(m.group(1)), cmd, history, texts)
+                call_changed = True
+            elif cmd[0] == '-f' and len(cmd) > 1 and 'created successfully' in block:
+                item['stdin'] = _new_file_stub(cmd[1])
+                call_changed = True
+        if call_changed:
+            changed = True
+            calls.append(dict(call, function=dict(fn, arguments=json.dumps(args, ensure_ascii=False))))
+        else:
+            calls.append(call)
+    return dict(msg, tool_calls=calls) if changed else msg
+
+STUB_KEEP_ROUNDS = 1         # only the latest round stays complete
+
+def _anchor(new_text):
+    """The first non-blank line of a patch's new text, shortened and without double quotes,
+    so that it can be given to -s as a search string."""
+    for line in new_text.splitlines():
+        if line.strip():
+            return line.strip().replace('"', "'")[:60]
+    return ''
+
+def _freeze_old_rounds(messages):
+    """Stub the old rounds, in place, once each. A round is stubbed when it is older than the latest
+    STUB_KEEP_ROUNDS rounds, and the stub is never rebuilt. Because a stub is written once, the start
+    of every request stays identical from one request to the next, which prompt caching needs."""
+    rounds = [i for i, m in enumerate(messages) if m.get('role') == 'assistant' and m.get('tool_calls')]
+    if len(rounds) <= STUB_KEEP_ROUNDS:
+        return
+    cutoff = rounds[-STUB_KEEP_ROUNDS]
+    results = {m.get('tool_call_id'): str(m.get('content', '')) for m in messages if m.get('role') == 'tool'}
+    try:
+        history = {p['id']: p for p in load_patch_history()}
+    except HistoryCorruptError:
+        history = None
+    texts = {}
+    for i in range(cutoff):
+        msg = messages[i]
+        if msg.get('role') == 'assistant' and msg.get('tool_calls'):
+            messages[i] = _stub_assistant(msg, results, history, texts)
+        elif msg.get('role') == 'tool':
+            content = str(msg.get('content', ''))
+            if (len(content.encode('utf-8')) >= STUB_MIN_BYTES
+                    and not content.startswith('[earlier output removed')):
+                messages[i] = dict(msg, content=_output_stub(content))
+
+def _context_view(messages):
+    """The request for the model. Old rounds are stubbed in place, once each (see _freeze_old_rounds),
+    and the stored list is what gets sent, so the start of each request stays identical."""
+    _freeze_old_rounds(messages)
+    return messages
 
 def _models_age(config):
     """Seconds since the OpenRouter model list was fetched, or None when that is unknown."""
@@ -3742,7 +4566,10 @@ def _models_age(config):
 
 def _models_stale(config):
     age = _models_age(config)
-    return age is None or age > MODELS_MAX_AGE
+    if age is None or age > MODELS_MAX_AGE:
+        return True
+    models = config.get('openrouter_models') or []
+    return bool(models) and 'cache_read' not in models[0]   # list saved before cache prices were stored
 
 def _fmt_age(seconds):
     if seconds is None:
@@ -3753,32 +4580,90 @@ def _fmt_age(seconds):
         return f"{int(seconds // 3600)} h old"
     return f"{int(seconds // 86400)} days old"
 
-def _openrouter_turn(key, model, tools, messages, header=None):
+class _Cancelled(Exception):
+    """Ctrl+S was pressed while an AI call was running."""
+
+def _call_cancellable(fn, cancel, *args, **kwargs):
+    """Run a blocking call in a thread and wait for it, unless cancel is set first. A cancelled
+    call is abandoned: its thread finishes in the background and its answer is thrown away."""
+    box = {}
+    def run():
+        try:
+            box['value'] = fn(*args, **kwargs)
+        except BaseException as e:
+            box['error'] = e
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()
+        worker.join(0.1)
+    if 'error' in box:
+        raise box['error']
+    return box['value']
+
+CONTEXT_LOG_FILE = Path('contextwindow.log')   # what the model receives in the latest request, nothing else
+CONTEXT_LOG_ENABLED = False                    # set by --log-context, which only works with --mcp
+
+def _log_context(messages, tools):
+    """Overwrite contextwindow.log with exactly what is sent to the model in this request: each
+    message as it is sent, then the tool definitions. Nothing else is written to the file."""
+    lines = []
+    for msg in messages:
+        lines.append(f"[{msg.get('role')}]")
+        if msg.get('tool_call_id'):
+            lines.append(f"tool_call_id: {msg['tool_call_id']}")
+        content = msg.get('content')
+        if isinstance(content, list):
+            lines.append(json.dumps(content, ensure_ascii=False, indent=2))
+        elif content:
+            lines.append(str(content))
+        if msg.get('tool_calls'):
+            lines.append("tool_calls: " + json.dumps(msg['tool_calls'], ensure_ascii=False))
+        lines.append("")
+    lines.append("[tools]")
+    lines.append(json.dumps(tools, ensure_ascii=False))
+    try:
+        _atomic_write_text(CONTEXT_LOG_FILE, '\n'.join(lines) + '\n')
+    except OSError:
+        pass
+
+def _openrouter_turn(key, model, tools, messages, header=None, cancel=None, session_id=None):
     """Send the conversation, run the tool calls the model asks for and repeat until it
     answers in text. messages is extended in place. Raises RuntimeError on failure."""
     for _ in range(OPENROUTER_MAX_STEPS):
+        view = _context_view(messages)
+        used = _history_tokens(view)
         limit = header.context if header else 0
-        if limit:
-            used = _history_tokens(messages)
-            if used > limit * CONTEXT_WARN_FRACTION:
-                trimmed = _trim_history(messages, limit)
-                after = _history_tokens(messages)
-                print(f"⚠ context {used / limit:.0%} full: {trimmed} old tool result(s) trimmed, "
-                      f"now about {after:,} of {limit:,} tokens", flush=True)
-                if after > limit * CONTEXT_WARN_FRACTION:
-                    print("⚠ still close to the limit: type /new to start a fresh conversation", flush=True)
-        mcp_log(f"→ OpenRouter ({model})")
-        data = _openrouter_request('/chat/completions', key, {
-            'model': model, 'messages': messages, 'tools': tools, 'usage': {'include': True}})
+        if limit and used > limit * CONTEXT_WARN_FRACTION:
+            print(f"⚠ context {used / limit:.0%} full even with old outputs stubbed: type /new to start a fresh conversation", flush=True)
+        if CONTEXT_LOG_ENABLED:
+            _log_context(view, tools)
+        mcp_log(f"→ OpenRouter ({model})" + (f" · session {session_id}" if session_id else ""))
+        payload = {'model': model, 'messages': view, 'tools': tools, 'usage': {'include': True}}
+        if 'anthropic/' in model:
+            # OpenRouter's automatic Anthropic caching: the breakpoint sits on the last cacheable
+            # block and moves forward as the conversation grows. The start of the request is
+            # frozen by _freeze_old_rounds, so the cache can hit on everything before the newest round.
+            payload['cache_control'] = ({'type': 'ephemeral', 'ttl': '1h'} if ANTHROPIC_CACHE_TTL == '1h'
+                                        else {'type': 'ephemeral'})
+        if session_id:
+            payload['session_id'] = session_id   # keeps the conversation on the provider that holds its cache
+        data = _call_cancellable(_openrouter_request, cancel, '/chat/completions', key, payload)
         choices = data.get('choices') if isinstance(data, dict) else None
         if not choices or not isinstance(choices[0], dict):
             err = data.get('error') if isinstance(data, dict) else None
             raise RuntimeError(f"unexpected answer from OpenRouter: {err or str(data)[:200]}")
         message = choices[0].get('message') or {}
+        if choices[0].get('finish_reason') == 'length':
+            mcp_log("⚠ the answer was cut off at the model's output limit")
         text = message.get('content') or ''
         calls = message.get('tool_calls') or []
         usage = data.get('usage') or {}
-        mcp_log(f"← {usage.get('prompt_tokens', '?')} tokens in, {usage.get('completion_tokens', '?')} out")
+        cached, written = _cache_counts(usage)
+        provider = data.get('provider')   # OpenRouter names the provider that answered
+        mcp_log(f"← {usage.get('prompt_tokens', '?')} tokens in ({cached} cached, {written} written), "
+                f"{usage.get('completion_tokens', '?')} out" + (f" · provider {provider}" if provider else ""))
         if header:
             header.add_usage(usage)
         entry = {'role': 'assistant', 'content': text}
@@ -3793,18 +4678,41 @@ def _openrouter_turn(key, model, tools, messages, header=None):
             if not text.strip():
                 print("\nai> (empty answer)", flush=True)
             return
-        for call in calls:
+        for position, call in enumerate(calls):
+            if cancel is not None and cancel.is_set():
+                for left in calls[position:]:
+                    messages.append({'role': 'tool', 'tool_call_id': left.get('id'),
+                                     'content': '[cancelled by the user: not run]'})
+                raise _Cancelled()
             fn = call.get('function') or {}
             try:
                 arguments = json.loads(fn.get('arguments') or '{}')
-            except ValueError:
+                json_error = ''
+            except ValueError as e:
                 arguments = None
+                json_error = str(e)
+            if isinstance(arguments, dict) and isinstance(arguments.get('commands'), str):
+                # some models send the array as a JSON string: decode it once more
+                try:
+                    arguments['commands'] = json.loads(arguments['commands'])
+                except ValueError as e:
+                    json_error = f"commands is a string that is not valid JSON: {e}"
             if (fn.get('name') != 'promptpack' or not isinstance(arguments, dict)
                     or not isinstance(arguments.get('commands'), list) or not arguments['commands']):
-                mcp_log(f"✖ invalid tool call from model: name={fn.get('name')!r}, arguments={str(fn.get('arguments'))[:160]}")
-                result = "✖ invalid tool call: use the tool promptpack with a non-empty commands list"
+                if fn.get('name') != 'promptpack':
+                    why = f"unknown tool {fn.get('name')!r}, the tool is promptpack"
+                elif arguments is None:
+                    why = f"the arguments are not valid JSON ({json_error}), probably cut off at the output limit"
+                elif json_error:
+                    why = json_error
+                else:
+                    why = "commands must be a non-empty JSON array of objects with args and stdin"
+                mcp_log(f"✖ invalid tool call from model ({why}): arguments are {len(fn.get('arguments') or '')} chars")
+                result = f"✖ invalid tool call: {why}. Call promptpack again with commands as a JSON array."
             else:
-                result = '\n\n'.join(run_promptpack_command(item, mcp_log) for item in arguments['commands'])
+                result_limit = _result_limit(limit)
+                results = [run_promptpack_command(item, mcp_log, result_limit) for item in arguments['commands']]
+                result = _join_results(results, 2 * result_limit)
             messages.append({'role': 'tool', 'tool_call_id': call.get('id'), 'content': result})
     raise RuntimeError(f"stopped after {OPENROUTER_MAX_STEPS} tool rounds without a final answer")
 
@@ -3820,11 +4728,13 @@ def run_openrouter_chat(config, instructions, marked, header=None):
     except ImportError:
         pass
     key, model = config['openrouter_key'], config['openrouter_model']
+    cancel = threading.Event()   # set by Ctrl+S, cleared before each user message
     spec = _MCPServer._tool_definition()
     tools = [{'type': 'function', 'function': {
         'name': spec['name'], 'description': spec['description'], 'parameters': spec['inputSchema']}}]
     start = [{'role': 'system', 'content': instructions}]
     messages = list(start)
+    session = {'id': _new_session_id()}   # one OpenRouter session per conversation, renewed by /new
 
     def intro():
         print("🔌 promptpack MCP chat (OpenRouter)")
@@ -3832,7 +4742,8 @@ def run_openrouter_chat(config, instructions, marked, header=None):
         print(f"   model:   {model}")
         print(f"   config:  {MCP_CONFIG_FILE}")
         print(f"   marked files in spec: {marked}")
-        print("   Type a message and press Enter. /new starts a new conversation. Ctrl+C stops.")
+        print("   Type a message and press Enter. /new starts a new conversation.")
+        print("   Esc or Ctrl+C asks before quitting. Ctrl+S stops an AI call that is running.")
         print("   PgUp/PgDn, Up/Down or the mouse wheel scroll, Home/End jump to the top or bottom.")
         if _models_stale(config):
             print(f"⚠ The model list is {_fmt_age(_models_age(config))}: press F6, OpenRouter, then r to refresh it.", flush=True)
@@ -3843,22 +4754,37 @@ def run_openrouter_chat(config, instructions, marked, header=None):
         nonlocal messages
         if user_text == '/new':
             messages = list(start)
+            session['id'] = _new_session_id()
             print("↺ New conversation started.", flush=True)
+            return
+        key, model = config.get('openrouter_key'), config.get('openrouter_model')   # F6 may have changed them
+        if not key or not model:
+            print("⚠ OpenRouter needs an API key and a model: press F6 to set them.", flush=True)
             return
         messages.append({'role': 'user', 'content': user_text})
         try:
-            _openrouter_turn(key, model, tools, messages, header)
-        except RuntimeError as e:
+            cancel.clear()
+            _openrouter_turn(key, model, tools, messages, header, cancel, session['id'])
+        except _Cancelled:
+            if messages[-1]['role'] == 'user':
+                messages.pop()
+                print("⏹ AI call stopped. The message was not added: send it again when you are ready.", flush=True)
+            else:
+                print("⏹ AI call stopped. Tool commands that already ran are kept in the conversation.", flush=True)
+            return
+        except Exception as e:
             if messages[-1]['role'] == 'user':
                 messages.pop()
                 hint = "Your message was not added to the conversation: send it again."
             else:
                 hint = "The work done so far is kept: type continue to go on."
-            print(f"❌ {e}\n   {hint}", flush=True)
+            print(f"❌ {e or type(e).__name__}\n   {hint}", flush=True)
 
     if sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get('TERM') != 'dumb':
         try:
-            _ChatView(header).start(handle, intro)
+            view = _ChatView(header, cancel, config)
+            set_access_asker(view.ask_access)
+            view.start(handle, intro)
             print("\n⏹ Chat stopped", flush=True)
             return
         except (EOFError, KeyboardInterrupt):
@@ -3866,6 +4792,7 @@ def run_openrouter_chat(config, instructions, marked, header=None):
             return
         except curses.error as e:
             print(f"⚠ The curses chat view is not available here ({e}): using the plain terminal.", flush=True)
+    set_access_asker(_terminal_access_prompt)
     intro()
     while True:
         try:
@@ -3906,42 +4833,6 @@ def _put(stdscr, y, x, text, attr=curses.A_NORMAL):
         stdscr.addstr(y, x, text[:width - x - 1], attr)
     except curses.error:
         pass
-
-
-def _curses_input(stdscr, row, label, initial=''):
-    """One-line text field on the given row. Enter saves, Esc cancels.
-    Returns the new text, or None when cancelled."""
-    text = initial
-    curses.curs_set(1)
-    try:
-        while True:
-            height, width = stdscr.getmaxyx()
-            visible = text[-max(1, width - len(label) - 2):]
-            try:
-                stdscr.move(row, 0)
-                stdscr.clrtoeol()
-            except curses.error:
-                pass
-            _put(stdscr, row, 0, label + visible)
-            try:
-                stdscr.move(row, min(width - 2, len(label) + len(visible)))
-            except curses.error:
-                pass
-            stdscr.refresh()
-            try:
-                ch = stdscr.get_wch()
-            except curses.error:
-                continue
-            if ch in ('\n', '\r') or ch == curses.KEY_ENTER:
-                return text.strip()
-            if ch == '\x1b':
-                return None
-            if ch in ('\x7f', '\b') or ch == curses.KEY_BACKSPACE:
-                text = text[:-1]
-            elif isinstance(ch, str) and ch.isprintable():
-                text += ch
-    finally:
-        curses.curs_set(0)
 
 
 def _curses_key_modal(stdscr, current=''):
@@ -4108,7 +4999,8 @@ def show_openrouter_settings(stdscr, config):
         _put(stdscr, 0, 0, title.ljust(width - 1), curses.A_REVERSE)
         key_row = f"API key: {config.get('openrouter_key') or '(not set - press k to paste it)'}"
         _put(stdscr, 1, 0, key_row.ljust(width - 1), curses.A_REVERSE if selected == 0 else curses.A_BOLD)
-        header = f"  {'Kind':<5} {'In $/M':>8} {'Out $/M':>8} {'Context':>8}  Model (id)   [filter: {state['filter']}]"
+        header = (f"  {'Kind':<5} {'In $/M':>8} {'Out $/M':>8} {'Context':>8} {'TTL':>5} "
+                  f"{'C.rd $/M':>8} {'C.wr $/M':>8}  Model (id)   [filter: {state['filter']}]")
         _put(stdscr, 2, 0, header, curses.A_BOLD)
 
         if not models:
@@ -4121,7 +5013,9 @@ def show_openrouter_settings(stdscr, config):
             chosen = m['id'] == config.get('openrouter_model')
             line = (f"{'✓' if chosen else ' '} {'Free' if m.get('free') else 'Paid':<5} "
                     f"{_fmt_price(m.get('prompt')):>8} {_fmt_price(m.get('completion')):>8} "
-                    f"{_fmt_context(m.get('context')):>8}  {m.get('name')} ({m['id']})")
+                    f"{_fmt_context(m.get('context')):>8} {_cache_ttl_label(m['id']):>5} "
+                    f"{_fmt_cache_price(m.get('cache_read')):>8} {_fmt_cache_price(_cache_write_price(m)):>8}  "
+                    f"{m.get('name')} ({m['id']})")
             attr = curses.A_REVERSE if mi == idx else curses.A_NORMAL
             if chosen:
                 attr |= curses.color_pair(1)
@@ -4237,6 +5131,15 @@ def show_mcp_menu(stdscr):
                 show_openrouter_settings(stdscr, config)
 
 
+OPENROUTER_TOOL_NOTICE = """\
+# HOW TO RUN COMMANDS (this OpenRouter session)
+Ignore every instruction above that says to ask the user to run commands, to paste output back,
+or to write commands in chat. In this session you run promptpack yourself, with the tool
+promptpack. Every promptpack command, including -r, -p, -f, -s, -n, --summary and -c, is a tool
+call with args and, where needed, stdin. Never write NEWFILE, PATCH or SUMMARY blocks as text in
+your reply: they are not run, and nothing is created. Do not write -c, it is not needed.
+"""
+
 def run_mcp_server():
     """promptpack --mcp: serve this project to the AI chosen with F6 (Claude Desktop or
     OpenRouter) and log every call. Refuses to start until a mode is chosen and complete."""
@@ -4248,6 +5151,9 @@ def run_mcp_server():
         sys.exit(1)
     root = build_tree('.')
     instructions = build_mcp_instructions(root)
+    if config['mode'] == 'openrouter':
+        instructions += '\n\n' + OPENROUTER_STUB_NOTICE
+        instructions += '\n\n' + OPENROUTER_TOOL_NOTICE
     marked = len(get_marked_files(root)) if root else 0
     header = _make_mcp_header(config)
     if config['mode'] == 'openrouter':
@@ -4271,6 +5177,7 @@ def run_mcp_server():
     print("   Restart Claude Desktop after editing the file. Keep this terminal open.\n")
     print(f"   {MCP_SECURITY_NOTE}")
     print("   This terminal is a read-only log: typing is locked. Ctrl+C to stop. Every call is logged below.\n", flush=True)
+    set_access_asker(_terminal_access_prompt)
     restore_terminal = _lock_terminal_input()
     try:
         server.serve_forever()
@@ -4387,7 +5294,7 @@ def main(stdscr):
 
         if key == 27:
             return None
-        elif key == curses.KEY_F1:  # F1 för ctags.txt
+        elif key == curses.KEY_F1:  # F1 for ctags.txt
             marked_files = get_marked_files(root)
             if marked_files:
                 save_promptpack(marked_files)
@@ -4429,6 +5336,7 @@ def main(stdscr):
             if selected_idx < len(visible_nodes):
                 node, _ = visible_nodes[selected_idx]
                 if not node.is_dir and node.path.suffix == '.py':
+                    load_all(root)     # the dependency map needs every Python file, so read the whole tree once
                     module_map = get_all_py_files(root)
                     dep_nodes = get_dep_nodes(node, root, module_map=module_map)
                     all_marked = all(n.marked for n in dep_nodes)
@@ -4510,7 +5418,12 @@ if __name__ == "__main__":
                         help='Relay MCP messages from stdin to a running promptpack --mcp. Started by Claude Desktop, not by hand.')
     parser.add_argument('--mcp', action='store_true',
                         help='Start the MCP server in this terminal: HTTP on 127.0.0.1, port and token in mcp.json next to promptpack.py. Every tool call is logged here. Stop with Ctrl+C.')
+    parser.add_argument('--log-context', action='store_true',
+                        help='Debug only, with --mcp: write contextwindow.log with the exact request sent to the model in each OpenRouter call. Without this flag nothing is written.')
     args = parser.parse_args()
+    if args.log_context and not args.mcp:
+        parser.error('--log-context only works together with --mcp')
+    CONTEXT_LOG_ENABLED = args.log_context
 
     if args.mcp:
         run_mcp_server()
@@ -4522,7 +5435,6 @@ if __name__ == "__main__":
 
 
     if args.tidy_recursive:
-        import glob as _glob
         patterns = []
         for dirpath, dirnames, filenames in os.walk('.'):
             dirnames[:] = [d for d in dirnames if not d.startswith('.')]
@@ -4665,17 +5577,11 @@ if __name__ == "__main__":
         header = f"------ OUTPUT FROM COMMAND: {command} ------"
         append_to_clipboard_tmp(header)
 
-        import threading
-        import time
-
-        output_buffer = []
         process = None
-        timed_out = False
         write_lock = threading.Lock()
 
-        def read_output(pipe, is_stderr=False):
+        def read_output(pipe):
             for line in iter(pipe.readline, ''):
-                output_buffer.append(line)
                 with write_lock:
                     append_to_clipboard_tmp(line.rstrip('\n'))
             pipe.close()
@@ -4690,8 +5596,8 @@ if __name__ == "__main__":
                 bufsize=1
             )
 
-            stdout_thread = threading.Thread(target=read_output, args=(process.stdout, False))
-            stderr_thread = threading.Thread(target=read_output, args=(process.stderr, True))
+            stdout_thread = threading.Thread(target=read_output, args=(process.stdout,))
+            stderr_thread = threading.Thread(target=read_output, args=(process.stderr,))
             stdout_thread.daemon = True
             stderr_thread.daemon = True
             stdout_thread.start()
@@ -4710,7 +5616,6 @@ if __name__ == "__main__":
             print(f"⚙️ Command executed, output in clipboard.tmp")
 
         except subprocess.TimeoutExpired:
-            timed_out = True
             process.terminate()
             time.sleep(0.1)
             if process.poll() is None:
