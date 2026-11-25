@@ -8,6 +8,11 @@ Working with an AI chat usually means pasting files back and forth and applying 
 2. **Ask:** send it to any AI chat (Claude, GPT, DeepSeek, Grok or anything else you can paste into) and describe what you want
 3. **Apply:** run the commands the AI gives you, review the result and undo any single patch if needed
 
+<p align="center">
+  <img src="terminal1.png" alt="PromptPack TUI: a project tree with marked files" width="800">
+  <br><em>The TUI: mark the files the AI should see. The status bar shows the token count.</em>
+</p>
+
 - **Exact, undoable patches:** every change is recorded and can be reverted one patch at a time
 - **Project memory:** a built-in worklog gives the AI a compact history of earlier work
 - **Built-in review:** `#audit` for bugs and risks, `#optimize` for performance
@@ -565,6 +570,11 @@ PromptPack can run as an **MCP server**. The AI then calls `promptpack` as a too
 |------|--------------------------|----------------------|
 | Claude Desktop | The Claude Desktop app | Not shown (Claude Desktop does not report it to MCP servers) |
 | OpenRouter | A chat in the same terminal, with any tool-capable model on OpenRouter | Shown: tokens, context fill and cost |
+
+<p align="center">
+  <img src="terminal2.png" alt="PromptPack MCP: the terminal with the pinned header and the chat" width="800">
+  <br><em>promptpack --mcp in a terminal: the pinned header shows the session's usage, and the chat scrolls under it.</em>
+</p>
 
 ### Choosing a mode
 
