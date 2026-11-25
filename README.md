@@ -9,7 +9,7 @@ Working with an AI chat usually means pasting files back and forth and applying 
 3. **Apply:** run the commands the AI gives you, review the result and undo any single patch if needed
 
 <p align="center">
-  <img src="terminal1.png" alt="PromptPack TUI: a project tree with marked files" width="800">
+  <img src="img/terminal1.png" alt="PromptPack TUI: a project tree with marked files" width="800">
   <br><em>The TUI: mark the files the AI should see. The status bar shows the token count.</em>
 </p>
 
@@ -572,7 +572,7 @@ PromptPack can run as an **MCP server**. The AI then calls `promptpack` as a too
 | OpenRouter | A chat in the same terminal, with any tool-capable model on OpenRouter | Shown: tokens, context fill and cost |
 
 <p align="center">
-  <img src="terminal2.png" alt="PromptPack MCP: the terminal with the pinned header and the chat" width="800">
+  <img src="img/terminal2.png" alt="PromptPack MCP: the terminal with the pinned header and the chat" width="800">
   <br><em>promptpack --mcp in a terminal: the pinned header shows the session's usage, and the chat scrolls under it.</em>
 </p>
 
