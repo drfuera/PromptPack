@@ -2,7 +2,7 @@
 
 **A CLI tool that lets any AI assistant read, search and patch your codebase, with you in control of every change.**
 
-Working with an AI chat usually means pasting files back and forth and applying its suggestions by hand. PromptPack replaces that with a safe loop: the AI asks for the files it needs and replies with exact patches, and you run them from your terminal. The AI never touches your filesystem. It only tells you which `promptpack` commands to run, and nothing changes unless you run them.
+Working with an AI chat usually means pasting files back and forth and applying its suggestions by hand. PromptPack replaces that with a safe loop: the AI asks for the files it needs and replies with exact patches, and you run them from your terminal. In the default workflow the AI never touches your filesystem: it only tells you which `promptpack` commands to run, and nothing changes unless you run them. With MCP (see below) the AI can call `promptpack` itself, and then the access rules and the logged calls apply.
 
 1. **Pack:** mark your files and generate `ctags.txt` (a project overview plus the embedded AI instructions)
 2. **Ask:** send it to any AI chat (Claude, GPT, DeepSeek, Grok or anything else you can paste into) and describe what you want
@@ -39,6 +39,7 @@ Working with an AI chat usually means pasting files back and forth and applying 
 - [MCP: Claude Desktop and OpenRouter](#mcp-claude-desktop-and-openrouter)
 - [Optional: X11 Middle-Click Paste+Submit](#optional-x11-middle-click-pastesubmit-x11)
 - [Configuration](#configuration)
+  - [Files promptpack writes](#files-promptpack-writes)
   - [File Selection Storage](#file-selection-storage)
   - [Patch History](#patch-history)
   - [Summary History](#summary-history)
@@ -135,7 +136,7 @@ Working with an AI chat usually means pasting files back and forth and applying 
 
 ### Requirements
 
-- Python 3.6+
+- Python 3.7+
 - Universal Ctags
 - Clipboard utility: `xclip`, `xsel`, or `pbcopy`
 - `tiktoken` Python package
@@ -614,21 +615,22 @@ OpenRouter mode turns the terminal into a chat with the model you choose. The mo
 2. Press `F6`, choose OpenRouter, press `k` and paste the key. Pick a model with `Space`.
 3. Run `promptpack --mcp` in the project folder.
 
-Type a message and press Enter. `/new` starts a fresh conversation. `PgUp`, `PgDn`, the arrow keys and the mouse wheel scroll the chat, and `End` jumps back to the bottom. `Ctrl+C` stops the session.
+Type a message and press Enter. `/new` starts a fresh conversation. `PgUp`, `PgDn` and the arrow keys scroll the chat, and `Home` and `End` jump to the top and the bottom. `Esc` or `Ctrl+C` asks whether to quit, and `Ctrl+S` stops an AI call that is still running without closing the chat. `F6` opens the OpenRouter page, and a model or key changed there is used from the next message.
 
-The model list shows only models that support tool calls, with prices per million tokens. `f` filters free and paid models, and `r` fetches the list again. The list is cached in `mcp.json`: it is fetched again automatically when you open the page and it is older than 24 hours, the status line shows its age, and the chat warns at start if it is stale.
+The model list shows only models that support tool calls, with prices per million tokens and cache prices (`C.rd` and `C.wr`). For Anthropic models the table also shows the cache lifetime (`TTL`), which is set by `ANTHROPIC_CACHE_TTL` at the top of `promptpack.py` (`5m` by default, or `1h`). `f` cycles through all, free and paid models, and `r` fetches the list again. The list is cached in `mcp.json`: it is fetched again automatically when you open the page and it is older than 24 hours, the status line shows its age, and the chat warns at start if it is stale.
 
-The header shows the session's billed tokens in, tokens out, the current context fill (the size of the latest request against the model's window), the cost and the number of requests. "Billed in" is the whole conversation sent with every request, so it grows faster than the chat itself. The cost is taken from OpenRouter when it is reported. Otherwise it is estimated from the model's prices and marked with `~`.
+The header shows the tokens sent in ("Sent in"), tokens out, the current context fill (the size of the latest request against the model's window), the cache hit rate with the number of prompt tokens read from the cache, the cost and the number of requests. "Sent in" is the whole conversation sent with every request, cached or not, so it grows faster than the chat itself. The cost is taken from OpenRouter when it is reported. Otherwise it is estimated from the model's prices and marked with `~`.
 
-**Context budget:** when the conversation reaches 80% of the model's context window, the oldest tool results are replaced by a one-line note with their size until it is down to about 60%. The system prompt, your messages and the AI's own text stay, and the tool results of the latest round are never trimmed. The AI can run a command again if it needs a trimmed result. If the conversation is still close to the limit, type `/new` to start a fresh one.
+**Context stubs:** the conversation is not trimmed. From the first request on, every round except the latest is sent with its large tool results, and its patch and new-file code, replaced by short stubs. A stub says what was removed and which read-only commands (`-r`, `-n`, `-s`, `-fs`, `-ph`, `-log`, `-completelog`, `-w`) bring it back. For large code files a stub gives a symbol index with line numbers. Patch stubs give a search text instead, because line numbers can move. A stub is written once and never rebuilt, so the start of each request stays identical and prompt caching keeps working. The stored conversation is not changed. If the context is 80% full even with stubs, the chat warns you: type `/new` to start a fresh conversation.
 
-**Long output:** the terminal shows at most about 2 kB of each command's output, with a footer giving the full size. The AI always receives the complete output; only the terminal view is cut.
+**Long output:** the terminal shows at most about 2 kB of each command's output, with a footer giving the full size. The model receives each command's full output up to a limit of 10 % of its context window, counted as about 4 characters per token, kept between 16 KB and 100 KB (32 KB when the window size is unknown). Output above the limit is not sent: the model gets a note telling it to narrow the command, for example with `-s`, `-fs` or `-n`. When one tool call returns several results that together pass the limit, the later large results are withheld in the same way.
 
 ### Security
 
 - The API key is stored in clear text in `mcp.json`. Where the system supports it, the file is set to be readable by you only. Keep `mcp.json` out of git.
 - The `-e` command lets the AI run shell commands in the project. The blacklist blocks the most destructive commands, but it is a minimal guard, not a security boundary. Only connect an AI you trust.
 - The server accepts requests only from localhost and only with the token. Still, do not start `--mcp` in a folder whose contents you would not want an AI to read.
+- Paths outside the project folder need approval. When the AI asks for one, promptpack asks Yes, Always or No. Always allows everything under that folder until promptpack is restarted. No is the default: Esc, Ctrl+S and no answer within 90 seconds all mean No. In the OpenRouter chat the question is a box; in Claude Desktop mode it is asked in the server terminal, where typing is enabled for the answer. Shell commands are only checked for the paths they name, so this is not a complete guard.
 
 ---
 
@@ -671,6 +673,23 @@ The status script outputs plain text, so it works with any desktop or bar that c
 ---
 
 ## Configuration
+
+### Files promptpack writes
+
+| File | Written by | Contents |
+|------|------------|----------|
+| `files.json` | Every mark or unmark with Space or `i`, and F1 | Marked files per project, with content hash, token count, size and modification time |
+| `ctags.txt` | F1, and `--mcp` at startup | Project overview, AI instructions and the `# WORKLOG` |
+| `patch.json` | `-p`, `-u` and F12 | Patch history with the old and new text |
+| `summary.json` | `--summary` and `-us` | Task summaries with rating and linked patch IDs |
+| `work.txt` | `-w` | Patch TOC and the full chronological log |
+| `clipboard.tmp` | Most commands | Output waiting for `-c` |
+| `promptpack_error.log` | A failed undo or reapply | Timestamped error details for debugging |
+| `promptpack_instructions.txt` | `-i` | The AI instructions on their own |
+| `mcp.json` | F6 and `--mcp` | Port, token, MCP mode and OpenRouter settings, including the API key |
+| `contextwindow.log` | `--mcp --log-context` (debug only) | The exact request of the latest model call, rewritten for each call |
+
+`mcp.json` should stay out of git: it holds the API key. `contextwindow.log` is written only when you start `promptpack --mcp --log-context`, as a debugging aid. It holds project content the AI has read, so delete it when you are done. If `patch.json` or `summary.json` is corrupt, promptpack refuses to change it and copies the unreadable file to a `.corrupt-` backup. Repair the file, or delete it to start a new history.
 
 ### File Selection Storage
 
