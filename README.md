@@ -132,6 +132,7 @@ Working with an AI chat usually means pasting files back and forth and applying 
 - **Mode chosen with `F6`**: settings and API key are stored in `mcp.json` next to `promptpack.py`
 - **Attach files (`F2`)**: send text, images, PDFs and audio along with a message in the OpenRouter chat
 - **Save and load sessions (`F3`, `F4`)**: continue a conversation later from a `NAME.session` file, with automatic saving after every message
+- **Compact (`F5` or `/compact`)**: the AI summarises a long conversation, and the chat continues from the summary in a new session file
 
 ### 📄 Instruction Export
 
@@ -629,7 +630,7 @@ OpenRouter mode turns the terminal into a chat with the model you choose. The mo
 2. Press `F6`, choose OpenRouter, press `k` and paste the key. Pick a model with `Space`.
 3. Run `promptpack --mcp` in the project folder.
 
-Type a message and press Enter. `/new` starts a fresh conversation. `PgUp`, `PgDn` and the arrow keys scroll the chat, and `Home` and `End` jump to the top and the bottom. `Esc` or `Ctrl+C` asks whether to quit, and `Ctrl+S` stops an AI call that is still running without closing the chat. `F6` opens the OpenRouter page, and a model or key changed there is used from the next message. `F2` attaches files, `F3` saves the conversation and `F4` loads one (both are described below). `F2`, `F3`, `F4` and `F6` are refused while the AI is working.
+Type a message and press Enter. `/new` starts a fresh conversation. `PgUp`, `PgDn` and the arrow keys scroll the chat, and `Home` and `End` jump to the top and the bottom. `Esc` or `Ctrl+C` asks whether to quit, and `Ctrl+S` stops an AI call that is still running without closing the chat. `F6` opens the OpenRouter page, and a model or key changed there is used from the next message. `F2` attaches files, `F3` saves the conversation, `F4` loads one and `F5` compacts it (all described below). `/compact` does the same as `F5`, without the question. `F2`, `F3`, `F4`, `F5` and `F6` are refused while the AI is working.
 
 The model list shows only models that support tool calls, with prices per million tokens and cache prices (`C.rd` and `C.wr`). For Anthropic models the table also shows the cache lifetime (`TTL`), which is set by `ANTHROPIC_CACHE_TTL` at the top of `promptpack.py` (`5m` by default, or `1h`). `f` cycles through all, free and paid models, and `r` fetches the list again. The list is cached in `mcp.json`: it is fetched again automatically when you open the page and it is older than 24 hours, the status line shows its age, and the chat warns at start if it is stale.
 
@@ -655,12 +656,20 @@ Once a session has been saved or loaded, it is saved again automatically after e
 
 The file holds the conversation as it is stored, including the stubs already written, so the start of the request stays identical and prompt caching keeps working after a load. Attached files are already stubs in it. The cache itself starts over on the first request after a load, and again whenever its lifetime has run out.
 
-Not saved: the project spec and the tool notices, the API key and the OpenRouter session id. The spec is rebuilt from the current `ctags.txt` on every load, so a loaded session follows the promptpack you run now and not the one that saved it. A new OpenRouter session id is created on load. The model name is recorded: if it differs from the current model when you load, you get a notice, and the current model is used. Do not edit a session file by hand. If tool calls and tool results no longer match, it may load and then be refused by the API on the next message.
+Not saved: the project spec and the tool notices, the API key and the OpenRouter session id. The spec is rebuilt from the current `ctags.txt` on every load, so a loaded session follows the promptpack you run now and not the one that saved it. A new OpenRouter session id is created on load. The model name is recorded: if it differs from the current model when you load, you get a notice, and the current model is used. When a file is loaded, promptpack checks that every tool call has a result and every result has a call, and refuses a damaged file with a message, without changing the conversation. A turn that fails in the middle of its tool calls gets the unanswered calls marked as not run before the session is saved, so `continue` still works. Only this pairing is checked, so do not edit a session file by hand.
+
+### Compacting a conversation (OpenRouter)
+
+Type `/compact`, or press `F5` and answer Yes in the box (No is the default, and `Esc` means No), to have the model summarise the conversation and continue from the summary. It needs a saved session, so save with `F3` first: the full history then stays in a file. The model writes a "PROMPTPACK Summary" in the language you write in: the project and its goals, a log of the conversation, the files worked on, the files to read again, and notes for what comes next. If the conversation already starts with an earlier compact summary, it is included unchanged and the log continues from it.
+
+The summary is saved as `NAME.compactN.session`, where N is the highest existing number for that name plus one: `NAME.compact1.session`, then `NAME.compact2.session`, also when you compact from `NAME.compact1`. An existing compact file is never overwritten. The session file you compacted from is written one last time just before the summary is requested, so it is complete, and is never written again. The new file becomes the one that is saved automatically. The chat is cleared and starts with the summary, the context meter starts over, and the OpenRouter session id is kept. To read the old history, load the earlier session with `F4`.
+
+`/compact` is refused when there is no saved session, when the conversation is empty, when the conversation does not end with a finished answer (type `continue` first), and when you add arguments to it. `Ctrl+S`, an API error, an answer without text or a summary that was cut off at the output limit leave the conversation and the files as they were. The request is the whole conversation plus the instruction, so the context window needs room for it: run `/compact` when the 80% warning appears, not when the window is full.
 
 ### Security
 
 - The API key is stored in clear text in `mcp.json`. Where the system supports it, the file is set to be readable by you only. Keep `mcp.json` out of git.
-- Session files hold the whole conversation, including code and file contents the AI has read. They get ordinary file permissions. Keep `*.session` out of git, and delete the ones you no longer need.
+- Session files hold the whole conversation, including code and file contents the AI has read. Where the system supports it, promptpack sets them readable by you only each time it writes them, like `mcp.json`. A file saved before this was added keeps its old permissions until the next time it is written. Keep `*.session` out of git, and delete the ones you no longer need.
 - The `-e` command lets the AI run shell commands in the project. The blacklist blocks the most destructive commands, but it is a minimal guard, not a security boundary. Only connect an AI you trust.
 - The server accepts requests only from localhost and only with the token. Still, do not start `--mcp` in a folder whose contents you would not want an AI to read.
 - Paths outside the project folder need approval. When the AI asks for one, promptpack asks Yes, Always or No. Always allows everything under that folder until promptpack is restarted. No is the default: Esc, Ctrl+S and no answer within 90 seconds all mean No. In the OpenRouter chat the question is a box; in Claude Desktop mode it is asked in the server terminal, where typing is enabled for the answer. Shell commands are only checked for the paths they name, so this is not a complete guard.
@@ -720,7 +729,7 @@ The status script outputs plain text, so it works with any desktop or bar that c
 | `promptpack_error.log` | A failed undo or reapply | Timestamped error details for debugging |
 | `promptpack_instructions.txt` | `-i` | The AI instructions on their own |
 | `mcp.json` | F6 and `--mcp` | Port, token, MCP mode and OpenRouter settings, including the API key |
-| `NAME.session` | F3 in the OpenRouter chat, then automatically after every message | A saved conversation, without the spec and the API key |
+| `NAME.session`, `NAME.compactN.session` | F3 in the OpenRouter chat, `/compact` or F5, then automatically after every message | A saved conversation, or the summary a compact started from, without the spec and the API key |
 
 `mcp.json` should stay out of git: it holds the API key. The `.session` files hold the conversation, including code and file contents the AI has read, so keep them out of git too (add `*.session` to `.gitignore`). If `patch.json` or `summary.json` is corrupt, promptpack refuses to change it and copies the unreadable file to a `.corrupt-` backup. Repair the file, or delete it to start a new history.
 
