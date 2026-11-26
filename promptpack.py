@@ -4095,7 +4095,7 @@ class _ChatView:
         if self.offset:
             status = f" ↑ scrolled up, {self.offset} rows below | End: back to the bottom"
         else:
-            status = " Esc: quit | Ctrl+S: stop | F2: attach | F3: save | F4: load | F6: model | PgUp/PgDn, Up/Down: scroll"
+            status = " Esc: quit | Ctrl+S: stop | F2: attach | F3: save | F4: load | F5: compact | F6: model | PgUp/PgDn: scroll"
         if self.busy:
             frame = SPINNER_FRAMES[self.spin % len(SPINNER_FRAMES)]
             status = f" {frame} the AI is working |" + status
@@ -4199,6 +4199,8 @@ class _ChatView:
                 self._save_session(stdscr)
             elif ch == curses.KEY_F4:
                 self._load_session(stdscr)
+            elif ch == curses.KEY_F5:
+                self._compact(stdscr, on_submit)
             elif ch == '\x13':          # Ctrl+S
                 self._stop_ai()
             elif ch in ('\x7f', '\b') or ch == curses.KEY_BACKSPACE:
@@ -4302,6 +4304,31 @@ class _ChatView:
         if pick is not None:
             self.offset = 0
             print(self.sessions['load'](files[pick]), flush=True)
+
+    def _compact(self, stdscr, on_submit):
+        """F5: ask whether to compact and, on Yes, send /compact exactly as if it had been typed.
+        The checks (saved session, finished last answer) are made by /compact itself."""
+        if self.sessions is None:
+            return
+        if self.busy:
+            print("⏳ The AI is still working: press F5 when it has answered.", flush=True)
+            return
+        stdscr.timeout(-1)            # the modal reads keys with a blocking get_wch()
+        try:
+            pick = _curses_choice(stdscr, "Do you want to compact?",
+                                  ["The AI writes a summary of this conversation.",
+                                   "The full history stays in the old session file."],
+                                  ["Yes", "No"],
+                                  "Tab or Left/Right: choose | Enter: press | Esc: No",
+                                  default=1)
+        finally:
+            stdscr.timeout(100)
+            curses.curs_set(1)
+        if pick == 0:
+            self.offset = 0
+            print("you> /compact", flush=True)
+            self.busy = True
+            threading.Thread(target=self._work, args=(on_submit, '/compact'), daemon=True).start()
 
     def _draw_attach_box(self, stdscr, width, body_h):
         """Placeholder panel over the top right of the chat that lists the files for the next
@@ -5197,6 +5224,22 @@ def _with_cached_system(messages, model):
     return [dict(first, content=[block])] + messages[1:]
 
 
+def _chat_payload(model, messages, tools, session_id=None):
+    """The body of one /chat/completions request, built in one place so a normal turn and /compact
+    send exactly the same kind of request, which prompt caching needs. For Anthropic models the
+    system message gets its own cache breakpoint and a top-level cache_control is added: OpenRouter
+    puts the breakpoint on the last cacheable block, and it moves forward as the conversation grows.
+    The start of the request is frozen by _freeze_old_rounds, so the cache can hit on everything
+    before the newest round. session_id keeps the conversation on the provider that holds its cache."""
+    payload = {'model': model, 'messages': _with_cached_system(messages, model),
+               'tools': tools, 'usage': {'include': True}}
+    if 'anthropic/' in model:
+        payload['cache_control'] = _cache_control()
+    if session_id:
+        payload['session_id'] = session_id
+    return payload
+
+
 def _openrouter_turn(key, model, tools, messages, header=None, cancel=None, session_id=None, attached=None):
     """Send the conversation, run the tool calls the model asks for and repeat until it
     answers in text. messages is extended in place. Raises RuntimeError on failure."""
@@ -5206,17 +5249,9 @@ def _openrouter_turn(key, model, tools, messages, header=None, cancel=None, sess
         used = _history_tokens(view)
         limit = header.context if header else 0
         if limit and used > limit * CONTEXT_WARN_FRACTION:
-            print(f"⚠ context {used / limit:.0%} full even with old outputs stubbed: type /new to start a fresh conversation", flush=True)
-        sent = _with_cached_system(view, model)
+            print(f"⚠ context {used / limit:.0%} full even with old outputs stubbed: type /compact to summarise it (needs a saved session, F3) or /new to start a fresh conversation", flush=True)
         mcp_log(f"→ OpenRouter ({model})" + (f" · session {session_id}" if session_id else ""))
-        payload = {'model': model, 'messages': sent, 'tools': tools, 'usage': {'include': True}}
-        if 'anthropic/' in model:
-            # OpenRouter's automatic Anthropic caching: the breakpoint sits on the last cacheable
-            # block and moves forward as the conversation grows. The start of the request is
-            # frozen by _freeze_old_rounds, so the cache can hit on everything before the newest round.
-            payload['cache_control'] = _cache_control()
-        if session_id:
-            payload['session_id'] = session_id   # keeps the conversation on the provider that holds its cache
+        payload = _chat_payload(model, view, tools, session_id)
         data = _call_cancellable(_openrouter_request, cancel, '/chat/completions', key, payload)
         choices = data.get('choices') if isinstance(data, dict) else None
         if not choices or not isinstance(choices[0], dict):
@@ -5326,6 +5361,7 @@ def run_openrouter_chat(config, instructions, marked, header=None):
         print("   Type a message and press Enter. /new starts a new conversation.")
         print("   F2 or /attach PATH attaches files (several at once) to your next message; /detach removes them.")
         print("   F3 saves the conversation as NAME.session in the project folder, F4 loads one.")
+        print("   F5 or /compact has the AI summarise the conversation into NAME.compactN.session (needs a saved session).")
         print("   Esc or Ctrl+C asks before quitting. Ctrl+S stops an AI call that is running.")
         print("   PgUp/PgDn, Up/Down or the mouse wheel scroll, Home/End jump to the top or bottom.")
         if _models_stale(config):
@@ -5345,6 +5381,12 @@ def run_openrouter_chat(config, instructions, marked, header=None):
                 session['file'] = None
             else:
                 print("↺ New conversation started.", flush=True)
+            return
+        if user_text.split()[0] == '/compact':
+            if user_text.strip() != '/compact':
+                print("✖ /compact takes no arguments.", flush=True)
+            else:
+                compact_session()
             return
         if _attach_command(user_text, attached, show=not isinstance(sys.stdout, _ChatView)):
             return
@@ -5382,9 +5424,54 @@ def run_openrouter_chat(config, instructions, marked, header=None):
                 hint = "Your message was not added to the conversation: send it again. Attached files are kept."
             else:
                 attached.clear()
+                fixed = repair_tool_pairs()
                 _collapse_attachments(messages, turn_start)
                 hint = "The work done so far is kept: type continue to go on."
+                if fixed:
+                    hint = (f"The work done so far is kept, and {fixed} tool call(s) that never ran were marked as not run: "
+                            "type continue to go on.")
             print(f"❌ {e or type(e).__name__}\n   {hint}", flush=True)
+
+    def tool_pair_problems(msgs):
+        """Problems in how tool calls and tool results pair up in a list of messages. Every call
+        needs one result before the next message that is not a result, and every result needs a
+        call. Returns a list of texts, empty when the pairing is correct."""
+        problems, pending = [], set()
+        for n, m in enumerate(msgs, start=1):
+            role = m.get('role')
+            if role == 'tool':
+                if m.get('tool_call_id') in pending:
+                    pending.discard(m.get('tool_call_id'))
+                else:
+                    problems.append(f"message {n} is a tool result without a matching tool call")
+                continue
+            if pending:
+                problems.append(f"tool calls before message {n} have no result")
+                pending = set()
+            if role == 'assistant':
+                pending = {c.get('id') for c in (m.get('tool_calls') or []) if isinstance(c, dict)}
+        if pending:
+            problems.append("the last tool calls have no result")
+        return problems
+
+    def repair_tool_pairs():
+        """After a turn that failed in the middle of its tool calls: answer every call that has no
+        result with a short note, so the conversation can go on and is never saved unpaired.
+        Returns how many notes were added."""
+        i = len(messages) - 1
+        while i > 0 and messages[i].get('role') == 'tool':
+            i -= 1
+        last = messages[i]
+        if last.get('role') != 'assistant' or not last.get('tool_calls'):
+            return 0
+        answered = {m.get('tool_call_id') for m in messages[i + 1:]}
+        added = 0
+        for call in last['tool_calls']:
+            if call.get('id') not in answered:
+                messages.append({'role': 'tool', 'tool_call_id': call.get('id'),
+                                 'content': '[not run: the turn failed before this command]'})
+                added += 1
+        return added
 
     def write_session(path):
         """Write the conversation (without the system message) to a session file, atomically.
@@ -5392,6 +5479,10 @@ def run_openrouter_chat(config, instructions, marked, header=None):
         data = {'version': 1, 'saved': datetime.now().isoformat(timespec='seconds'),
                 'model': config.get('openrouter_model'), 'messages': messages[1:]}
         _atomic_write_text(path, json.dumps(data, ensure_ascii=False) + '\n')
+        try:
+            os.chmod(path, 0o600)    # the file holds code and file contents the AI has read
+        except OSError:
+            pass
         return path.stat().st_size
 
     def save_session(name):
@@ -5430,6 +5521,13 @@ def run_openrouter_chat(config, instructions, marked, header=None):
                 or loaded[0].get('role') != 'user'):
             return f"✖ {path.name} is not a promptpack session file. The conversation was not changed."
         try:
+            problems = tool_pair_problems(loaded)
+        except Exception as e:
+            problems = [f"it cannot be checked ({e})"]
+        if problems:
+            return (f"✖ {path.name} is damaged: {problems[0]}. The API would refuse it on the next message. "
+                    "The conversation was not changed.")
+        try:
             replay = _replay_lines(loaded)
         except Exception as e:
             return f"✖ {path.name} cannot be shown ({e}). The conversation was not changed."
@@ -5460,6 +5558,109 @@ def run_openrouter_chat(config, instructions, marked, header=None):
             write_session(path)
         except (OSError, ValueError) as e:
             print(f"⚠ Auto-save to {path.name} failed: {e}", flush=True)
+
+    compact_instruction = """\
+# COMPACT
+The user typed /compact. This conversation is about to be replaced by the summary you write now, so
+everything that matters must be in it. Reply with the summary as plain text only. Do not call any
+tool: a tool call is ignored and the compact then fails.
+Write "PROMPTPACK Summary" in the language the user writes in:
+- Project description, issue, goals.
+- If the conversation starts with an earlier /compact summary (your first answer), include it unchanged, then continue the log.
+- Summarize the whole conversation as a unified log (User/AI pairs, concise, no repetition).
+- List the files worked on, with paths.
+- List the files the next part of the conversation must read again, as plain paths. You cannot run commands now, so the next turn reads them.
+- Important notes for what comes next.
+Parts of the conversation are stubs. Summarize what you know and do not guess what a stub removed.
+Never assume issues are fixed: treat the work as mid-progress.
+Start directly with the summary, without an introduction.
+"""
+
+    def compact_name(path):
+        """NAME.session or NAME.compactN.session -> the next free NAME.compactN.session (highest N plus one)."""
+        stem = path.name[:-len(SESSION_SUFFIX)]
+        found = re.match(r'^(.*)\.compact\d+$', stem)
+        base = found.group(1) if found else stem
+        pattern = re.compile(re.escape(base) + r'\.compact(\d+)' + re.escape(SESSION_SUFFIX) + r'\Z')
+        highest = 0
+        for other in path.parent.iterdir():
+            hit = pattern.match(other.name)
+            if hit:
+                highest = max(highest, int(hit.group(1)))
+        return path.parent / f"{base}.compact{highest + 1}{SESSION_SUFFIX}"
+
+    def compact_session():
+        """/compact: the model writes a summary of the conversation, and the chat continues from it
+        in a new file NAME.compactN.session. The old session file is written one last time just
+        before the summary is requested, so it is complete, and is never written again afterwards."""
+        nonlocal messages
+        key, model = config.get('openrouter_key'), config.get('openrouter_model')
+        if not key or not model:
+            print("⚠ OpenRouter needs an API key and a model: press F6 to set them.", flush=True)
+            return
+        old_path = session.get('file')
+        if old_path is None:
+            print("✖ /compact needs a saved session: press F3 and save this conversation first, so the full history is kept in that file.", flush=True)
+            return
+        if len(messages) <= 1:
+            print("✖ Nothing to compact yet: the conversation is empty.", flush=True)
+            return
+        if messages[-1].get('role') != 'assistant' or messages[-1].get('tool_calls'):
+            print("✖ The conversation does not end with a finished answer (it ends with tool calls or a tool result): type continue first, then /compact.", flush=True)
+            return
+        try:
+            new_path = compact_name(old_path)
+            write_session(old_path)     # the original must be complete on disk before anything is replaced
+        except (OSError, ValueError) as e:
+            print(f"✖ Could not prepare the compact: {e}. The conversation was not changed.", flush=True)
+            return
+        payload = _chat_payload(model, _context_view(messages) + [{'role': 'user', 'content': compact_instruction}], tools, session['id'])
+        mcp_log(f"→ OpenRouter ({model}) · compact · session {session['id']}")
+        try:
+            cancel.clear()
+            data = _call_cancellable(_openrouter_request, cancel, '/chat/completions', key, payload)
+        except _Cancelled:
+            print("⏹ Compact stopped. The conversation was not changed.", flush=True)
+            return
+        except Exception as e:
+            print(f"❌ {e or type(e).__name__}\n   The conversation was not changed.", flush=True)
+            return
+        choices = data.get('choices') if isinstance(data, dict) else None
+        if not choices or not isinstance(choices[0], dict):
+            print("❌ Unexpected answer from OpenRouter. The conversation was not changed: try /compact again.", flush=True)
+            return
+        usage = data.get('usage') or {}
+        cached, written = _cache_counts(usage)
+        mcp_log(f"← {usage.get('prompt_tokens', '?')} tokens in ({cached} cached, {written} written), "
+                f"{usage.get('completion_tokens', '?')} out")
+        if header:
+            header.add_usage(usage)
+        summary = ((choices[0].get('message') or {}).get('content') or '').strip()
+        if not summary:
+            print("❌ The model answered without a summary text (a tool call is ignored). The conversation was not changed: try /compact again.", flush=True)
+            return
+        if choices[0].get('finish_reason') == 'length':
+            print("❌ The summary was cut off at the model's output limit, so it is not used. The conversation was not changed.", flush=True)
+            return
+        new_messages = [{'role': 'user', 'content': '/compact'}, {'role': 'assistant', 'content': summary}]
+        old_messages = messages
+        messages = list(start) + new_messages
+        try:
+            size = write_session(new_path)
+        except (OSError, ValueError) as e:
+            messages = old_messages
+            print(f"✖ Could not save {new_path.name}: {e}. The conversation was not changed.", flush=True)
+            return
+        session['file'] = new_path      # the session id stays: the spec and tool block can still hit the cache
+        if header:
+            header.last_in = header.last_cached = 0
+        if isinstance(sys.stdout, _ChatView):
+            sys.stdout.clear()
+        for line in _replay_lines(new_messages):
+            print(line, flush=True)
+        print("", flush=True)
+        print(f"🗜 Compacted into {new_path.name} ({_fmt_bytes(size)}). The full history is untouched in "
+              f"{old_path.name} (F4 loads it). New messages are saved to {new_path.name}.", flush=True)
 
     def handle(user_text):
         handle_message(user_text)
