@@ -130,6 +130,8 @@ Working with an AI chat usually means pasting files back and forth and applying 
 - **Claude Desktop or OpenRouter**: run `promptpack --mcp` and let the AI call `promptpack` as a tool, with every call logged in your terminal
 - **Built-in chat for OpenRouter**: chat with any tool-capable model from the same terminal, with token and cost usage in the header
 - **Mode chosen with `F6`**: settings and API key are stored in `mcp.json` next to `promptpack.py`
+- **Attach files (`F2`)**: send text, images, PDFs and audio along with a message in the OpenRouter chat
+- **Save and load sessions (`F3`, `F4`)**: continue a conversation later from a `NAME.session` file, with automatic saving after every message
 
 ### 📄 Instruction Export
 
@@ -214,6 +216,8 @@ This writes `promptpack_instructions.txt` to the current directory.
 | `F6` | MCP menu: choose Claude Desktop or OpenRouter |
 | `F12` | Browse and toggle patch history |
 | `Esc` | Quit (in sub-screens: go back) |
+
+The tree reads folders when you open them, so startup only reads the top level. Folder sizes show a dash, because summing them would read the whole tree. Marking a folder reads everything below it first. Symlinked folders are listed in red and can be neither opened nor marked. Binary files are hidden, judged by file name only. `i` reads the whole tree once to build the import map.
 
 ---
 
@@ -625,7 +629,7 @@ OpenRouter mode turns the terminal into a chat with the model you choose. The mo
 2. Press `F6`, choose OpenRouter, press `k` and paste the key. Pick a model with `Space`.
 3. Run `promptpack --mcp` in the project folder.
 
-Type a message and press Enter. `/new` starts a fresh conversation. `PgUp`, `PgDn` and the arrow keys scroll the chat, and `Home` and `End` jump to the top and the bottom. `Esc` or `Ctrl+C` asks whether to quit, and `Ctrl+S` stops an AI call that is still running without closing the chat. `F6` opens the OpenRouter page, and a model or key changed there is used from the next message.
+Type a message and press Enter. `/new` starts a fresh conversation. `PgUp`, `PgDn` and the arrow keys scroll the chat, and `Home` and `End` jump to the top and the bottom. `Esc` or `Ctrl+C` asks whether to quit, and `Ctrl+S` stops an AI call that is still running without closing the chat. `F6` opens the OpenRouter page, and a model or key changed there is used from the next message. `F2` attaches files, `F3` saves the conversation and `F4` loads one (both are described below). `F2`, `F3`, `F4` and `F6` are refused while the AI is working.
 
 The model list shows only models that support tool calls, with prices per million tokens and cache prices (`C.rd` and `C.wr`). For Anthropic models the table also shows the cache lifetime (`TTL`), which is set by `ANTHROPIC_CACHE_TTL` at the top of `promptpack.py` (`5m` by default, or `1h`). `f` cycles through all, free and paid models, and `r` fetches the list again. The list is cached in `mcp.json`: it is fetched again automatically when you open the page and it is older than 24 hours, the status line shows its age, and the chat warns at start if it is stale.
 
@@ -635,9 +639,28 @@ The header shows the tokens sent in ("Sent in"), tokens out, the current context
 
 **Long output:** the terminal shows at most about 2 kB of each command's output, with a footer giving the full size. The model receives each command's full output up to a limit of 10 % of its context window, counted as about 4 characters per token, kept between 16 KB and 100 KB (32 KB when the window size is unknown). Output above the limit is not sent: the model gets a note telling it to narrow the command, for example with `-s`, `-fs` or `-n`. When one tool call returns several results that together pass the limit, the later large results are withheld in the same way.
 
+### Attaching files (OpenRouter)
+
+Press `F2`, or type `/attach PATH ...`, to attach files to your next message. `F2` opens a file browser over the whole disk with every file and dotfile shown. `Space` marks a file, so files from several folders can be collected. `→` opens a folder, `Enter` goes into it, `Backspace` goes up, `~` jumps to your home folder, and `Esc` or `a` is done. Files that are already attached start out marked, so unmarking one removes it. `/detach` removes them all. The attached files are listed in a panel at the top right of the chat, and they are sent with the next message and then cleared.
+
+Text files are sent as text. Images, PDFs and wav or mp3 audio are sent as data: the model must accept image or audio input, and each such file may be at most 20 MB. The text files together may take at most 90% of the free context. The browser status bar shows the share while you mark, and warns above 30%. Past the limit the message is not sent and you are told why. Other binary files cannot be sent.
+
+The model describes each attached file in the same response as its answer, with the tool `describe_attachments`. When the turn is over, the file contents are replaced by a stub with the path, size, type and modification time, plus the model's own description and keep notes. Text files can be read again with `promptpack -r`. Images, audio and PDFs can only be recovered through the description, so attach them again if it is not enough. If the model skips a description you get a warning.
+
+### Saving and loading sessions (OpenRouter)
+
+`F3` opens a box with one input line. `Enter` saves the conversation as `NAME.session` in the project folder, and `Esc` cancels. A name that already exists is refused and nothing is overwritten. `F4` lists the `.session` files in the project folder, newest first, in a box with 10 rows and its own scrollbar. `Enter` loads the selected one and `Esc` cancels. Loading clears the chat and replays the whole conversation in it: your messages, the AI's answers and one line per tool command. Tool results are not shown, because they are long and the model already has them.
+
+Once a session has been saved or loaded, it is saved again automatically after every message, also after one that was stopped with `Ctrl+S` or failed. A failed auto-save prints a warning and does not stop the chat. `/new` detaches the conversation from the file, so the old session is never overwritten. Press `F3` to save the new conversation under a name.
+
+The file holds the conversation as it is stored, including the stubs already written, so the start of the request stays identical and prompt caching keeps working after a load. Attached files are already stubs in it. The cache itself starts over on the first request after a load, and again whenever its lifetime has run out.
+
+Not saved: the project spec and the tool notices, the API key and the OpenRouter session id. The spec is rebuilt from the current `ctags.txt` on every load, so a loaded session follows the promptpack you run now and not the one that saved it. A new OpenRouter session id is created on load. The model name is recorded: if it differs from the current model when you load, you get a notice, and the current model is used. Do not edit a session file by hand. If tool calls and tool results no longer match, it may load and then be refused by the API on the next message.
+
 ### Security
 
 - The API key is stored in clear text in `mcp.json`. Where the system supports it, the file is set to be readable by you only. Keep `mcp.json` out of git.
+- Session files hold the whole conversation, including code and file contents the AI has read. They get ordinary file permissions. Keep `*.session` out of git, and delete the ones you no longer need.
 - The `-e` command lets the AI run shell commands in the project. The blacklist blocks the most destructive commands, but it is a minimal guard, not a security boundary. Only connect an AI you trust.
 - The server accepts requests only from localhost and only with the token. Still, do not start `--mcp` in a folder whose contents you would not want an AI to read.
 - Paths outside the project folder need approval. When the AI asks for one, promptpack asks Yes, Always or No. Always allows everything under that folder until promptpack is restarted. No is the default: Esc, Ctrl+S and no answer within 90 seconds all mean No. In the OpenRouter chat the question is a box; in Claude Desktop mode it is asked in the server terminal, where typing is enabled for the answer. Shell commands are only checked for the paths they name, so this is not a complete guard.
@@ -697,9 +720,9 @@ The status script outputs plain text, so it works with any desktop or bar that c
 | `promptpack_error.log` | A failed undo or reapply | Timestamped error details for debugging |
 | `promptpack_instructions.txt` | `-i` | The AI instructions on their own |
 | `mcp.json` | F6 and `--mcp` | Port, token, MCP mode and OpenRouter settings, including the API key |
-| `contextwindow.log` | `--mcp --log-context` (debug only) | The exact request of the latest model call, rewritten for each call |
+| `NAME.session` | F3 in the OpenRouter chat, then automatically after every message | A saved conversation, without the spec and the API key |
 
-`mcp.json` should stay out of git: it holds the API key. `contextwindow.log` is written only when you start `promptpack --mcp --log-context`, as a debugging aid. It holds project content the AI has read, so delete it when you are done. If `patch.json` or `summary.json` is corrupt, promptpack refuses to change it and copies the unreadable file to a `.corrupt-` backup. Repair the file, or delete it to start a new history.
+`mcp.json` should stay out of git: it holds the API key. The `.session` files hold the conversation, including code and file contents the AI has read, so keep them out of git too (add `*.session` to `.gitignore`). If `patch.json` or `summary.json` is corrupt, promptpack refuses to change it and copies the unreadable file to a `.corrupt-` backup. Repair the file, or delete it to start a new history.
 
 ### File Selection Storage
 
